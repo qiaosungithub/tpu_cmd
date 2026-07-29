@@ -1,0 +1,502 @@
+r"""Launcher for running EqR-jax on TPUs using XManager.
+
+Usage example:
+xmanager launch xm_launch.py -- \
+  --xm_resource_alloc="group:gdm-aux/brain-vasp-shared-user-xm" \
+  --tpu_type="v4-64,v5p-32" \
+  --config="remote_run" \
+  --workdir="~/logs/eqr-run"
+"""
+from absl import app
+from absl import flags
+from xmanager import xm
+from xmanager import xm_abc
+from xmanager.contrib import framework_defaults
+from xmanager.contrib.internal import xm_jax
+
+_EXP_NAME = flags.DEFINE_string(
+    'exp_name', 'eqr-jax', 'Name of the experiment.', short_name='n'
+)
+_CONFIG = flags.DEFINE_string(
+    'config', 'remote_run', 'The configs/load_config.py:<mode> to run.'
+)
+
+_BUCKET = flags.DEFINE_string(
+    'bucket', '/cns/yutulpz-d/home/qiaos/eqr_data',
+    'Durable root for checkpoints and mirrored logs. Defaults to CNS because a '
+    'Borg job runs as <user>@prod.google.com, a different IAM principal from '
+    'the <user>@google.com that owns our GCS bucket -- every gs:// write from a '
+    'TPU worker fails with ACCESS_DENIED. Pass a gs:// path only if that bucket '
+    'grants access to the prod identity.'
+)
+_WORKDIR = flags.DEFINE_string(
+    'workdir', '', 'Working directory (e.g. ~/logs/...) '
+)
+_TPU_TYPE = flags.DEFINE_string(
+    'tpu_type', 'v4-8', 'Comma-separated TPU specs e.g. v4-64,v5p-32'
+)
+_RESUME_XID = flags.DEFINE_integer(
+    'resume_xid', 0, 'If set, appends job to the given existing XManager experiment ID instead of creating a new one.'
+)
+# Failure budget shaped after //experimental/.../mesh_diffusion launch_lib.py:
+# unlimited total failures, but a tight per-task limit that decays over time.
+# The asymmetry is the point -- a long run should survive any number of
+# unrelated preemptions, while a task that keeps dying is a real bug and should
+# be declared dead quickly rather than retried forever.
+_MAX_TASK_FAILURES = flags.DEFINE_integer(
+    'borg_max_task_failures', -1,
+    'Total task failures tolerated across all tasks before the job is aborted. '
+    '-1 means unlimited. Borg default is 0, which kills the whole experiment '
+    'the first time a preempted gang tears down. Applies to PROD and BATCH: '
+    'PROD is also preemptible via equal-priority slice defragmentation.'
+)
+_MAX_PER_TASK_FAILURES = flags.DEFINE_integer(
+    'borg_max_per_task_failures', 1,
+    'Failures tolerated per individual task before that task is declared dead. '
+    'Combined with the credit period below this reads as "recover from at most '
+    'one failure per task every N seconds".'
+)
+_FAILURE_CREDIT_PERIOD = flags.DEFINE_integer(
+    'borg_failure_credit_period', 7200,
+    'Every N seconds Borg decrements each live task\'s failure count, so a run '
+    'is not killed by slow attrition of unrelated one-off failures.'
+)
+# XManager derives the Borg job name from the packaged target ('main'); naming
+# the job explicitly keeps that in sync with the BCL token built below.
+_JOB_NAME = 'main'
+
+_TMP_RAM_FS_GIB = flags.DEFINE_integer(
+    'tmp_ram_fs_gib', 16,
+    'Size of the per-task RAM disk backing /tmp, in GiB. Must exceed whatever '
+    'the job stages locally (dataset copies, scratch).'
+)
+_LOAD_FROM = flags.DEFINE_string(
+    'load_from', '',
+    'Checkpoint directory to evaluate (eval_only) or warm-start from. Accepts '
+    'a gs:// path or a local path. Exported to the job as $LOAD_FROM rather '
+    'than as a --config flag; see unified_infra infra/runjob.py:137. A value '
+    'here overrides any load_from seeded in the yaml config.'
+)
+_WANDB_RESUME_ID = flags.DEFINE_string(
+    'wandb_resume_id', '',
+    'Run id to resume experiment tracking under. Exported as $WANDB_RESUME_ID.'
+)
+_CELL = flags.DEFINE_string(
+    'cell', '',
+    'Borg cell to pin the job to (e.g. nz, pa, go), or "viglobal" to let XBorg '
+    'choose. GQM clears prices PER CELL, so pinning to a cheap cell is often '
+    'the difference between running and sitting in the '
+    'TRIGGERED_LIMIT_ORDER bucket. Empty = let the allocator decide.'
+)
+
+def main(argv) -> None:
+    exp_name = _EXP_NAME.value
+    # --- Auto-Load WandB name or fallbacks ---
+    try:
+        from configs import load_config
+        cfg = load_config.get_config(_CONFIG.value)
+        if getattr(cfg, 'wandb', None):
+            if getattr(cfg.wandb, 'notes', None):
+                exp_name = cfg.wandb.notes
+            elif getattr(cfg.wandb, 'run_name', None):
+                exp_name = cfg.wandb.run_name
+    except Exception:
+        pass
+    for arg in argv[1:]:
+        if arg.startswith('--config.wandb.notes='):
+            exp_name = arg.split('=', 1)[1]
+        elif arg.startswith('--config.wandb.run_name='):
+            exp_name = arg.split('=', 1)[1]
+            
+    experiment_context = xm_abc.get_experiment(experiment_id=_RESUME_XID.value) if _RESUME_XID.value else xm_abc.create_experiment(experiment_title=exp_name)
+    with experiment_context as experiment:
+        
+        # --- Codebase Specifics via config.sh ---
+        project_name = "unified_project"
+        package_mode = "python" # 'python' or 'bazel'
+        target_label = "."
+        
+        pkg_path = target_label.lstrip('/').split(':')[0]
+        
+        try:
+            import os
+            config_path = "config.sh"
+            if not os.path.exists(config_path):
+                config_path = f"{pkg_path}/config.sh"
+            with open(config_path, "r") as f:
+                for line in f:
+                    if line.startswith("export PROJECT_NAME="):
+                        project_name = line.split("=")[1].strip().strip('"').strip("'")
+                    elif line.startswith("export PACKAGE_MODE="):
+                        package_mode = line.split("=")[1].strip().strip('"').strip("'")
+                    elif line.startswith("export TARGET_LABEL="):
+                        target_label = line.split("=")[1].strip().strip('"').strip("'")
+                        pkg_path = target_label.lstrip('/').split(':')[0]
+        except Exception:
+            pass
+
+        executors = []
+        is_tpu_job = False
+        tpu_types = [t.strip() for t in _TPU_TYPE.value.split(',')]
+        # Borg ScalarResource codenames. Source of truth:
+        #   //depot/google3/third_party/py/xmanager/xm/resources.py (ResourceType)
+        #   //depot/google3/borg/common/scalar_resource.proto
+        # NOTE: GHOSTFISHLITE (101) is v7, NOT v5e -- v5e is VIPERLITE_POD (62).
+        FISH_MAP = {
+            "v4": "pufferfish",       # 34
+            "v4lite": "dragonfish",   # 16
+            "v5e": "viperlite_pod",   # 62
+            "v5p": "viperfish",       # 59
+            "v6e": "ghostlite_pod",   # 63
+            "v6p": "ghostfish",       # 92
+        }
+        
+        # LINT.IfChange(group_map) — keep in sync with tpu_wrapper.sh & group_utils.py.
+        _GROUP_MAP = {
+            '1': 'group:deepmind-dynamic/gdm-resources-prod-shared-users-dynamic',
+            '2': 'group:deepmind-dynamic/gdm-viscam-goflow-dynamic',
+            '3': 'group:deepmind-dynamic/gdm-viscam-interns-dynamic',
+            '4': 'group:deepmind-dynamic/viscam-interns',
+            '5': 'group:deepmind-dynamic/vqfree-xm',
+            '6': 'group:dm/deepmind-large-scale-workshop',
+            '7': 'group:dm/dm-resources-prod-shared',
+            '8': 'group:gdm-aux/brain-vasp-shared-user-xm',
+            '9': 'group:deepmind-dynamic/fr-dna-grand-challenge-team-resource',
+        }
+        # LINT.ThenChange(//depot/google3/experimental/users/qiaos/tpu_utils/group_utils.py)
+        alloc_str = None
+        for arg in argv[1:]:
+            if arg.startswith('--xm_resource_alloc='):
+                alloc_str = arg.split('=', 1)[1]
+            elif arg.startswith('--group='):
+                group_val = arg.split('=', 1)[1]
+                alloc_str = _GROUP_MAP.get(group_val, f'group:{group_val}')
+
+        for tpu_str in tpu_types:
+            if '-' in tpu_str and not '=' in tpu_str:
+                arch, cores = tpu_str.split('-', 1)
+                # Official Google3 TPU topology mappings (from learning/performance/ace/search_space_utils.py)
+                TORUS_3D_MAP = {
+                    "1": "1x1x1",
+                    "2": "1x2x1",
+                    "4": "2x2x1",
+                    "8": "2x2x2",
+                    "16": "2x2x4",
+                    "32": "2x4x4",
+                    "64": "4x4x4",
+                    "128": "4x4x8",
+                    "256": "4x8x8",
+                    "512": "4x8x16",
+                }
+                TORUS_2D_MAP = {
+                    "1": "1x1",
+                    "4": "2x2",
+                    "8": "2x4",
+                    "16": "4x4",
+                    "32": "4x8",
+                    "64": "8x8",
+                    "128": "8x16",
+                    "256": "16x16",
+                }
+                arch_lower = arch.lower()
+                
+                num_cores = int(cores) if cores.isdigit() else 0
+                is_prod_pool = alloc_str and 'deepmind-dynamic' in alloc_str
+                
+                if arch_lower in ["v4", "pufferfish", "v5p", "viperfish", "v6p", "ghostfish"]:
+                    min_allowed = 16 if is_prod_pool else 8
+                    if num_cores > 0 and num_cores < min_allowed:
+                        raise ValueError(f"[BLOCKED] In {alloc_str or 'the current resource pool'}, the minimum allowed slice for {arch} is {min_allowed} chips, but you requested {num_cores}. To avoid an instant allocator rejection, request at least {arch}-{min_allowed}.")
+                    if cores in TORUS_3D_MAP:
+                        cores = TORUS_3D_MAP[cores]
+                elif arch_lower in ["v5e", "v6e", "viperlite_pod", "ghostlite_pod"]:
+                    min_allowed = 16 if is_prod_pool else 4
+                    if num_cores > 0 and num_cores < min_allowed:
+                        raise ValueError(f"[BLOCKED] In {alloc_str or 'the current resource pool'}, the minimum allowed slice for {arch} is {min_allowed} chips, but you requested {num_cores}. To avoid an instant fragmentation rejection, request at least {arch}-{min_allowed}.")
+                    if cores in TORUS_2D_MAP:
+                        cores = TORUS_2D_MAP[cores]
+                
+                res_name = FISH_MAP.get(arch_lower, arch_lower)
+            else:
+                arch, cores = tpu_str.split('=', 1) if '=' in tpu_str else (tpu_str, "")
+                res_name = FISH_MAP.get(arch.lower(), arch.lower())
+            
+            req_kwargs = {res_name: int(cores) if cores.isdigit() else cores}
+            # /tmp on a Borg task is a RAM disk sized by this requirement, and
+            # the default is far too small to stage a dataset into. Every task
+            # of a multi-task TPU job copies its own private copy, so an
+            # under-sized value shows up as `OSError: [Errno 28] No space left
+            # on device` mid-download. 16 GiB matches what //third_party/py/maxtext
+            # requests (xm_launch.py:238).
+            req_kwargs['tmp_ram_fs'] = _TMP_RAM_FS_GIB.value * xm.GiB
+            if alloc_str:
+                req_kwargs['allocator'] = alloc_str
+            if _CELL.value:
+                req_kwargs['location'] = _CELL.value
+            tier_val = None
+            for a in argv[1:]:
+                if a.startswith('--tier='):
+                    tier_val = a.split('=', 1)[1].upper()
+                    if tier_val == 'PROD':
+                        req_kwargs['service_tier'] = xm.ServiceTier.PROD
+                    elif tier_val == 'BATCH':
+                        req_kwargs['service_tier'] = xm.ServiceTier.BATCH
+            job_requirements = xm.JobRequirements(**req_kwargs)
+            
+            # Borg's BorgScheduling defaults are max_task_failures=0 /
+            # max_per_task_failures=0, i.e. "never restart". A preemption is
+            # itself a free failure that does not count, but when a TPU gang is
+            # torn apart the non-zero task exit IS counted as a FAILURE, and
+            # CanStartTask() then declares the job dead (borg .../job.cc).
+            # Result: one preemption kills the whole experiment.
+            #
+            # This applies to PROD too -- PROD is not immune to preemption:
+            # xid 274552915 (PROD) died to SLICE_DEFRAGMENTATION, which is the
+            # EQUAL-priority defrag path, not the higher-priority one.
+            #
+            # See //depot/google3/third_party/py/xmanager/xm_abc/executors.py
+            # (class BorgScheduling) and go/borg-configure-schedule#task-failure-limits.
+            scheduling = xm_abc.BorgScheduling(
+                max_task_failures=_MAX_TASK_FAILURES.value,
+                max_per_task_failures=_MAX_PER_TASK_FAILURES.value,
+                task_failure_credit_period=_FAILURE_CREDIT_PERIOD.value,
+            )
+
+            if package_mode == "bazel":
+                executor = xm_abc.Borg(
+                    requirements=job_requirements,
+                    scheduling=scheduling,
+                    # Let colleagues (and future you) read this job's logs
+                    # without an ACL dance.
+                    logs_read_access_roles=['all'],
+                )
+            else:
+                executor = xm_abc.Gcp(requirements=job_requirements)
+            executors.append(executor)
+            # Any TPU accelerator in the request means the job is multi-task and
+            # needs the JAX coordination flags injected below.
+            if res_name in FISH_MAP.values() or res_name.startswith('tpu'):
+                is_tpu_job = True
+
+        final_executor = xm.Fallback(executors) if len(executors) > 1 else executors[0]
+    
+        xid = experiment.experiment_id
+        import time
+        time_str = time.strftime("%Y%m%d_%H%M%S")
+        folder_name = f"xid_{xid}_{time_str}_{exp_name}"
+    
+        import os
+        import json
+        import fcntl
+        mapping_file = os.path.expanduser("~/.tpu_jobs.json")
+
+        def read_mapping():
+            if not os.path.exists(mapping_file):
+                return {}
+            try:
+                with open(mapping_file, "r") as f:
+                    fcntl.flock(f, fcntl.LOCK_SH)
+                    data = json.load(f)
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                    return data
+            except Exception:
+                return {}
+
+        def update_mapping(xid, info):
+            # MERGE (do not overwrite): xm_launcher runs before tpu_wrapper.sh's
+            # own registration snippet, so we must preserve any pre-existing
+            # tier/alloc/retry_count fields that another writer might set.
+            try:
+                with open(mapping_file, "a+") as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    f.seek(0)
+                    content = f.read()
+                    data = {}
+                    if content:
+                        try:
+                            data = json.loads(content)
+                        except ValueError:
+                            data = {}
+                    key = str(xid)
+                    existing = data.get(key, {})
+                    # Only fill in fields that are missing / empty in the existing entry,
+                    # so a later writer with fresher tier/alloc info wins gracefully too.
+                    merged = dict(existing)
+                    for k, v in info.items():
+                        # Overwrite empty / missing values; keep non-empty existing.
+                        if merged.get(k) in (None, "", 0) or k not in merged:
+                            merged[k] = v
+                    data[key] = merged
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(data, f, indent=2)
+                    fcntl.flock(f, fcntl.LOCK_UN)
+            except Exception as e:
+                print(f"Warning: could not write mapping file: {e}")
+
+        if _RESUME_XID.value:
+            data = read_mapping()
+            # fallback to old format just in case
+            if str(_RESUME_XID.value) in data:
+                bucket_cp_path = data[str(_RESUME_XID.value)].get("bucket_cp_path", "")
+            else:
+                mapping_dir = os.path.expanduser("~/xm_job_to_bucket")
+                with open(os.path.join(mapping_dir, str(_RESUME_XID.value)), "r") as f:
+                    bucket_cp_path = f.read().strip()
+            vm_workdir = f"/tmp/eqr_log/resume_{xid}_{time_str}_{project_name}_{exp_name}"
+        else:
+            bucket_cp_path = f"{_BUCKET.value}/logs/{project_name}/{folder_name}"
+            vm_workdir = f"/tmp/eqr_log/{folder_name}"
+            
+        update_mapping(xid, {
+            "bucket_cp_path": bucket_cp_path,
+            "logdir": os.environ.get("TPU_LOGDIR", ""),
+            "stagedir": os.environ.get("TPU_STAGEDIR", ""),
+            "exp_name": exp_name,
+            "tpu_type": _TPU_TYPE.value,
+            # Recorded so `tpu check` can tell "preempted, will retry" from
+            # "preempted, restart budget spent".
+            "max_task_failures": _MAX_TASK_FAILURES.value,
+        })
+    
+        config_path_arg = f"configs/load_config.py:{_CONFIG.value}"
+        if package_mode == "bazel":
+            config_path_arg = f"{pkg_path}/configs/load_config.py:{_CONFIG.value}"
+
+        # NOTE: do NOT inject `--config.checkpoint_path`. `configs/default.py`
+        # has no such field and `main.py` declares the config flag with
+        # lock_config=True, so passing it makes every job die at startup.
+        # The checkpoint location travels as the LOAD_FROM env var instead
+        # (see below), matching unified_infra's convention
+        # (infra/runjob.py:137-141) and the contract main.py already
+        # implements in _ENV_CONFIG_OVERRIDES.
+        executable_args = {
+            'config': config_path_arg,
+            'workdir': vm_workdir,
+        }
+
+        # Multi-host JAX coordination. Without these every task believes it is a
+        # standalone task 0, and `jax.distributed.initialize()` blocks forever
+        # waiting for peers that never announce themselves -- a hang, not an
+        # error, so the job burns its whole deadline and dies with no useful
+        # message. xm_jax fills them from Borg tokens at runtime:
+        #   jax_controller_address -> get_job_bns_prefix() + "/0:jax"
+        #   jax_num_tasks          -> replicas
+        #   jax_task_id            -> %task%
+        # See //depot/google3/third_party/py/xmanager/contrib/internal/xm_jax.py.
+        if is_tpu_job:
+            executable_args.update(xm_jax.JaxFlags().flags())
+            # Prefer failing over running degraded: an ICI-resilient slice
+            # costs ~35% throughput, and being rescheduled onto a healthy slice
+            # beats finishing 1.5x slower. (mesh_diffusion launch_lib.py:372)
+            executable_args['deepsea_ici_resilient'] = False
+            # xm_jax's default controller address is a bare
+            # `get_job_bns_prefix()`, which is only resolvable from inside the
+            # job's own BCL scope. Qualify it with this job's name so the token
+            # resolves regardless of how the experiment is structured -- the
+            # same thing every production launcher does
+            # (e.g. //learning/brain/experimental/jax_data/.../pst_trainer_launcher.py:272,
+            # //third_party/py/scenic/google/xm/launch_xm.py:689).
+            executable_args['jax_controller_address'] = xm_abc.RESTRICTED_BorgToken(
+                f'{_JOB_NAME}.get_job_bns_prefix() + "/0:jax"'
+            )
+        
+        for arg in argv[1:]:
+            if arg.startswith('--'):
+                if 'config.wandb' in arg or 'tpu_type' in arg or 'workdir' in arg or 'resume_xid' in arg:
+                   continue
+                # Resume/eval selectors travel as env vars, not config flags.
+                if arg.startswith(('--cell=', '--load_from=', '--config.load_from=',
+                                   '--wandb_resume_id=', '--config.wandb_resume_id=',
+                                   '--borg_max_task_failures=', '--borg_max_per_task_failures=')):
+                    continue
+                key_val = arg[2:].split('=', 1)
+                if len(key_val) == 2:
+                    executable_args[key_val[0]] = key_val[1]
+                else:
+                    executable_args[key_val[0]] = ""
+
+        # Resume/eval context goes through the environment, following
+        # unified_infra (infra/runjob.py:137-141: "the training code reads
+        # $LOAD_FROM / $WANDB_RESUME_ID; env vars are easier to adopt
+        # group-wide than threading flags through every config"). main.py's
+        # _ENV_CONFIG_OVERRIDES already consumes exactly these names, and env
+        # wins over any seed value written in the yaml config.
+        job_env_vars = {'PYTHONPATH': pkg_path}
+        load_from = _LOAD_FROM.value
+        if _RESUME_XID.value and not load_from:
+            # Resuming this experiment's own run: point at the checkpoints the
+            # previous attempt uploaded, not at a cold external checkpoint.
+            load_from = f"{bucket_cp_path}/checkpoints"
+        if load_from:
+            job_env_vars['LOAD_FROM'] = load_from
+        if _WANDB_RESUME_ID.value:
+            job_env_vars['WANDB_RESUME_ID'] = _WANDB_RESUME_ID.value
+        # Where the job should persist its own checkpoints. workdir lives on
+        # the task's local disk, which is wiped on every Borg task restart, so
+        # a durable copy has to go to GCS for a restart to be able to resume.
+        job_env_vars['CHECKPOINT_BUCKET'] = bucket_cp_path
+        
+        if package_mode == "bazel":
+            (executable,) = experiment.package(
+                [xm.bazel_binary(
+                    label=target_label,
+                    bazel_args=["--define=PYTYPE=FALSE", "--norun_validations"],
+                    executor_spec=final_executor.Spec(),
+                    args=executable_args,
+                    env_vars=job_env_vars,
+                )]
+            )
+        else: # python mode default
+            base_image_accel = executors[0].requirements.accelerator
+            (executable,) = experiment.package(
+                [xm.python_container(
+                    path='.',
+                    base_image=framework_defaults.base_image('jax', base_image_accel),
+                    entrypoint=xm.ModuleName('main'),
+                    use_deep_module=True,
+                    executor_spec=final_executor.Spec(),
+                    args=executable_args,
+                    # Same LOAD_FROM / WANDB_RESUME_ID contract as the bazel
+                    # path, minus PYTHONPATH (use_deep_module handles imports).
+                    env_vars={k: v for k, v in job_env_vars.items() if k != 'PYTHONPATH'},
+                )]
+            )
+    
+        # Args must be attached to the JOB, not only to the packageable.
+        # `experiment.package(args=...)` records defaults on the executable,
+        # but what Borg actually launches is built from the Job. Flags passed
+        # only at package time can therefore go missing at runtime -- that is
+        # how the xm_jax coordination flags were silently dropped, leaving
+        # `jax.distributed.initialize()` to die with
+        # "ValueError: coordinator_address should be defined."
+        # Compare //depot/google3/third_party/py/maxtext/xm_launch.py, which
+        # passes args to xm.Job.
+        job = xm.Job(executable, final_executor, args=executable_args, name=_JOB_NAME)
+        experiment.add(job)
+
+
+if __name__ == '__main__':
+    import sys
+    # Same canonical map as in main(); duplicated here to avoid a forward ref.
+    _GROUP_MAP = {
+        '1': 'group:deepmind-dynamic/gdm-resources-prod-shared-users-dynamic',
+        '2': 'group:deepmind-dynamic/gdm-viscam-goflow-dynamic',
+        '3': 'group:deepmind-dynamic/gdm-viscam-interns-dynamic',
+        '4': 'group:deepmind-dynamic/viscam-interns',
+        '5': 'group:deepmind-dynamic/vqfree-xm',
+        '6': 'group:dm/deepmind-large-scale-workshop',
+        '7': 'group:dm/dm-resources-prod-shared',
+        '8': 'group:gdm-aux/brain-vasp-shared-user-xm',
+        '9': 'group:deepmind-dynamic/fr-dna-grand-challenge-team-resource',
+    }
+    new_argv = []
+    for arg in sys.argv:
+        if arg.startswith('--group='):
+            group_val = arg.split('=', 1)[1]
+            alloc = _GROUP_MAP.get(group_val, f'group:{group_val}')
+            new_argv.append(f'--xm_resource_alloc={alloc}')
+        else:
+            new_argv.append(arg)
+    sys.argv = new_argv
+    app.run(main, flags_parser=lambda a: flags.FLAGS(a, known_only=True))
