@@ -149,6 +149,7 @@ def main(argv) -> None:
             "v5p": "viperfish",       # 59
             "v6e": "ghostlite_pod",   # 63
             "v6p": "ghostfish",       # 92
+            "v7": "ghostfishlite",    # 101
         }
         
         # LINT.IfChange(group_map) — keep in sync with tpu_wrapper.sh & group_utils.py.
@@ -203,7 +204,12 @@ def main(argv) -> None:
                 num_cores = int(cores) if cores.isdigit() else 0
                 is_prod_pool = alloc_str and 'deepmind-dynamic' in alloc_str
                 
-                if arch_lower in ["v4", "pufferfish", "v5p", "viperfish", "v6p", "ghostfish"]:
+                # v7 (ghostfishlite) is a 3-D torus with 4 chips/host, the same
+                # geometry as v6p: ghostfishlite.gcl and ghostfish.gcl declare an
+                # identical static sub-cube list and dynamic-slice rule, differing
+                # only in the locus name. So it takes the 3-D branch below.
+                if arch_lower in ["v4", "pufferfish", "v5p", "viperfish", "v6p", "ghostfish",
+                                  "v7", "ghostfishlite"]:
                     min_allowed = 16 if is_prod_pool else 8
                     if num_cores > 0 and num_cores < min_allowed:
                         raise ValueError(f"[BLOCKED] In {alloc_str or 'the current resource pool'}, the minimum allowed slice for {arch} is {min_allowed} chips, but you requested {num_cores}. To avoid an instant allocator rejection, request at least {arch}-{min_allowed}.")
