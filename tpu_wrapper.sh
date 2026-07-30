@@ -576,8 +576,14 @@ def main():
                 lines = f.readlines()
             for line in lines:
                 clean_line = remove_ansi(line).strip()
-                if clean_line.startswith("│") and clean_line.endswith("│"):
-                    parts = [p.strip() for p in clean_line.split("│")[1:-1]]
+                # Only require a LEADING box char. Requiring a trailing one too
+                # meant that a table wider than the render width -- which clips
+                # the right edge -- matched zero rows, and every job silently
+                # fell back to "SUBMITTED". A parser for a display format must
+                # degrade, not go blank.
+                if clean_line.startswith("│"):
+                    cells = clean_line.split("│")
+                    parts = [p.strip() for p in (cells[1:-1] if clean_line.endswith("│") else cells[1:])]
                     if len(parts) >= 3:
                         xid = parts[0]
                         if xid.isdigit():
