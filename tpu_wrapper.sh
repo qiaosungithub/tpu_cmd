@@ -45,6 +45,7 @@ get_group_id_by_alloc() {
 # will still work but skip the pre-flight check with a warning.
 _PREFLIGHT_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/preflight_cli"
 _ROUTER_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/router_cli"
+_INFRA_CHECK_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/infra_check"
 
 # ---------------------------------------------------------------------------
 # Limit orders: cap what a launched job pays per chip-hour.
@@ -913,6 +914,24 @@ EOF
       return 1
     fi
     "$_ROUTER_CLI_BIN" "$@"
+
+  elif [[ "$1" == "clear" ]]; then
+    # Archive (NOT delete) jobs off the status board. The implementation lives in
+    # the google3 half -- `infra_check.py::main` branches on argv[1]=='clear' --
+    # and this branch is the only thing that reaches it. Without it, `tpu clear`
+    # fell through to the final `command tpu`, which does not exist, so the
+    # documented command died with "tpu: command not found".
+    shift
+    if [ ! -x "$_INFRA_CHECK_BIN" ]; then
+      echo -e "\033[31minfra_check binary not built. Run:\033[0m"
+      echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils:infra_check)"
+      return 1
+    fi
+    "$_INFRA_CHECK_BIN" clear "$@"
+    # `tpu check` renders from ~/.tpu_check_cache.txt, which the daemon rewrites
+    # on its own ~60s cycle, so the board does not change the instant this returns.
+    echo -e "\033[2m[tpu clear] Entries archived to ~/.tpu_jobs_legacy.json (never deleted).\033[0m"
+    echo -e "\033[2m  Allow one daemon cycle (~60s) for 'tpu check' to drop them from the board.\033[0m"
 
   elif [[ "$1" == "monitor" || "$1" == "watch" ]]; then
     shift
