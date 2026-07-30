@@ -686,14 +686,30 @@ def main():
 
         resume_s = cache_info.get("resume") or "-"
         step_s = cache_info.get("step") or "-"
-        row = [xid, status, name, tpu_type, tier, group_str, resume_s, step_s, why]
 
+        # Per-section columns, following unified_infra's `infra check`: each
+        # section answers a different question, so a shared header wastes width
+        # on cells that are structurally "-".
+        #   active  -> "is it progressing?"  WU replaces WHY, whose only value
+        #              for a live job was the work-unit count it already carries.
+        #   pending -> "why is it not running yet?"  WHY is the whole point here
+        #              (GQM_RESOURCE_DEFICIT_INFO, "Retrying in 3m20s (2/5)"),
+        #              while RESUME/STEP are always "-" before a job starts.
+        #   done    -> "how did it end?"  WHY again, but RESUME is meaningless
+        #              once terminal.
         if st_lower in ["running", "active", "starting", "submitted", "staging"]:
-            active_rows.append(row)
+            # `why` for a live job is the daemon's "<n> active" work-unit line;
+            # surface just the count, and fall back to the raw text if the
+            # daemon ever reports something else (an early-startup message).
+            m_wu = re.match(r"^\s*(\d+)\s+active\s*$", str(why or ""))
+            wu = m_wu.group(1) if m_wu else ("-" if why in ("", "-", None) else why)
+            active_rows.append([xid, status, name, tpu_type, tier, group_str,
+                                resume_s, step_s, wu])
         elif st_lower in ["pending", "queued"]:
-            pending_rows.append(row)
+            pending_rows.append([xid, status, name, tpu_type, tier, group_str, why])
         else:
-            done_rows.append(row)
+            done_rows.append([xid, status, name, tpu_type, tier, group_str,
+                              step_s, why])
 
     if dirty_jobs:
         try:
@@ -709,20 +725,31 @@ def main():
 
     name_cap = None if args.full else 30
     group_cap = None if args.full else 20
-    # One entry per header: XID STATUS NAME TPU TIER GROUP RESUME STEP WHY
-    caps = [None, None, name_cap, None, None, group_cap, None, None, None]
 
-    headers = ["XID", "STATUS", "NAME", "TPU", "TIER", "GROUP", "RESUME", "STEP", "WHY"]
+    # Each section has its own header/caps pair; see the row-building comment.
+    # WU = live work units. A running job's WHY was always just "<n> active",
+    # which is a count, not a reason -- as a column it is one char wide instead
+    # of eating the line.
+    active_headers = ["XID", "STATUS", "NAME", "TPU", "TIER", "GROUP", "RESUME", "STEP", "WU"]
+    active_caps = [None, None, name_cap, None, None, group_cap, None, None, None]
+
+    pending_headers = ["XID", "STATUS", "NAME", "TPU", "TIER", "GROUP", "WHY"]
+    pending_caps = [None, None, name_cap, None, None, group_cap, None]
+
+    done_headers = ["XID", "STATUS", "NAME", "TPU", "TIER", "GROUP", "STEP", "WHY"]
+    done_caps = [None, None, name_cap, None, None, group_cap, None, None]
 
     print(_hdr("active", len(active_rows)))
     if active_rows:
-        print_table(headers, active_rows, caps, status_idx=1)
+        # last_dim=False: WU is a live datum, not a trailing note, so it should
+        # not be dimmed the way a WHY string is.
+        print_table(active_headers, active_rows, active_caps, status_idx=1, last_dim=False)
     else:
         print(_c("  (none)", DIM))
 
     print(_hdr("pending", len(pending_rows)))
     if pending_rows:
-        print_table(headers, pending_rows, caps, status_idx=1)
+        print_table(pending_headers, pending_rows, pending_caps, status_idx=1)
     else:
         print(_c("  (none)", DIM))
 
@@ -730,7 +757,7 @@ def main():
     done_disp = done_rows[:done_limit]
     print(_hdr("recent done", len(done_rows)))
     if done_disp:
-        print_table(headers, done_disp, caps, status_idx=1)
+        print_table(done_headers, done_disp, done_caps, status_idx=1)
     else:
         print(_c("  (none)", DIM))
 
