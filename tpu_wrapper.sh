@@ -737,6 +737,102 @@ if __name__ == "__main__":
     main()
 EOF
 
+  elif [[ "$1" == "cancel" || "$1" == "stop" ]]; then
+    shift
+    local dry_run=0
+    local xids=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --dry-run|--dry_run)
+          dry_run=1
+          shift
+          ;;
+        -*)
+          echo "Error: Unsupported option '$1'"
+          echo "Usage: tpu cancel <xid> [xid...] [--dry-run]"
+          return 1
+          ;;
+        *)
+          xids+=("$1")
+          shift
+          ;;
+      esac
+    done
+    if [ ${#xids[@]} -eq 0 ]; then
+      echo "Usage: tpu cancel <xid> [xid...] [--dry-run]"
+      echo "  Stops the XManager experiment(s), i.e. all work units and their Borg jobs,"
+      echo "  then marks them CANCELLED in ~/.tpu_jobs.json so 'tpu check' reflects it"
+      echo "  immediately and the PROD auto-retry daemon cannot resubmit them."
+      echo "  --dry-run shows what xmanager would stop without stopping anything."
+      return 1
+    fi
+    local x
+    for x in "${xids[@]}"; do
+      if ! [[ "$x" =~ ^[0-9]+$ ]]; then
+        echo -e "\033[31mError: '$x' is not a numeric XID.\033[0m"
+        return 1
+      fi
+    done
+    local ids
+    ids=$(IFS=,; echo "${xids[*]}")
+    local stop_args=("--experiment_id=${ids}" "--skip_confirmation")
+    if [ "$dry_run" = "1" ]; then
+      stop_args+=("--dry_run")
+      echo -e "\033[36m[tpu cancel] DRY RUN on XID(s) ${ids}...\033[0m"
+    else
+      echo -e "\033[36m[tpu cancel] Stopping XID(s) ${ids} via 'xmanager stop'...\033[0m"
+    fi
+    local cancel_log="/tmp/tpu_cancel_$$.log"
+    xmanager stop "${stop_args[@]}" > "$cancel_log" 2>&1
+    local stop_status=$?
+    # The CLI prints ~20 lines of build/absl preamble before the result table.
+    grep -vE "^(INFO:absl|WARNING: Logging|W[0-9]{4} |Built |Build |Currently running)" "$cancel_log"
+    if [ "$stop_status" -ne 0 ]; then
+      echo -e "\033[31m[tpu cancel] xmanager stop exited with ${stop_status}; registry left untouched.\033[0m"
+      echo -e "\033[2m  Full output: $cancel_log\033[0m"
+      return "$stop_status"
+    fi
+    if [ "$dry_run" = "1" ]; then
+      return 0
+    fi
+    python3 - "${xids[@]}" << 'EOF'
+import json, os, sys, fcntl, time
+
+xids = sys.argv[1:]
+mapping_file = os.path.expanduser("~/.tpu_jobs.json")
+if not os.path.exists(mapping_file):
+    sys.exit(0)
+try:
+    with open(mapping_file, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            data = json.load(f)
+        except ValueError:
+            data = {}
+        changed = False
+        for xid in xids:
+            entry = data.get(xid)
+            if entry is None:
+                continue
+            entry["status"] = "CANCELLED"
+            entry["error"] = ""
+            entry["cancelled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            # The daemon resubmits PROD jobs whose status is FAILED with
+            # retry_count < 5; pinning the counter makes a cancelled job
+            # unresurrectable even if its cached status later reads failed.
+            entry["retry_count"] = 5
+            changed = True
+        if changed:
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f, indent=2)
+        fcntl.flock(f, fcntl.LOCK_UN)
+except Exception as e:  # never fail the cancel over bookkeeping
+    print(f"Warning: could not update {mapping_file}: {e}")
+EOF
+    echo -e "\033[32m[tpu cancel] Done. Marked ${ids} CANCELLED in ~/.tpu_jobs.json.\033[0m"
+    echo -e "\033[2m  'tpu check' shows the live XManager state after the next daemon cycle (~60s).\033[0m"
+
   elif [[ "$1" == "quota" ]]; then
     local FLAG="$2"
     local ARG="$3"

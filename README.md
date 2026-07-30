@@ -150,6 +150,42 @@ Reads two caches:
 Merged into three sections: **active**, **pending**, **recent done**.
 `WHY` column classifies failures per `xmanager.md`.
 
+### `tpu cancel` / `tpu stop` — stop a submitted/running job
+
+```
+tpu cancel <xid> [xid...]        # stop experiment(s): all work units + Borg jobs
+tpu cancel <xid> --dry-run       # show what would be stopped, stop nothing
+```
+
+Runs `xmanager stop --experiment_id=<ids> --skip_confirmation`, which tears
+down every work unit and its Borg job, then updates `~/.tpu_jobs.json`:
+`status=CANCELLED` plus `retry_count=5`, so the PROD auto-retry daemon can
+never resubmit a job you explicitly killed. The registry entry itself is kept
+(bucket, staging dir, launch log stay reachable); use `tpu clear` to archive
+it off the board afterwards.
+
+`tpu check` renders the wrapper's CANCELLED immediately; the daemon's own
+view converges on the next ~60s cycle.
+
+### `tpu clear` — archive jobs off the status board
+
+```
+tpu clear <xid> [xid...]     # archive specific jobs
+tpu clear all                # archive everything currently tracked
+```
+
+Entries are **moved** from `~/.tpu_jobs.json` to `~/.tpu_jobs_legacy.json`,
+never deleted: the record holds the checkpoint bucket, staging dir and launch
+log, which is the only route back to a finished run's artefacts. An
+`archived_at` timestamp is added. `tpu check` reads only the live file, so
+archiving is all that is needed to clean the board.
+
+`all` also sweeps the legacy `~/xm_job_to_bucket/` directory, preserving each
+file's bucket path into the archive before removing it.
+
+Allow one daemon cycle (60s) for `tpu check` to reflect the change — it renders
+from a cache, not from the file directly.
+
 ### `tpu quota` — guaranteed PROD/BATCH quotas
 
 ```
