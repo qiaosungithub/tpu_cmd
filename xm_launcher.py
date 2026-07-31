@@ -430,10 +430,25 @@ def main(argv) -> None:
         # wins over any seed value written in the yaml config.
         job_env_vars = {'PYTHONPATH': pkg_path}
         load_from = _LOAD_FROM.value
-        if _RESUME_XID.value and not load_from:
-            # Resuming this experiment's own run: point at the checkpoints the
-            # previous attempt uploaded, not at a cold external checkpoint.
-            load_from = f"{bucket_cp_path}/checkpoints"
+        # NOTE: --resume_xid deliberately does NOT set LOAD_FROM.
+        #
+        # It used to set it to f"{bucket_cp_path}/checkpoints", which is the
+        # PARENT of the per-step directories. orbax restores a single
+        # checkpoint dir, so it looked for `<...>/checkpoints/state` and died
+        # with `FileNotFoundError: Checkpoint at .../checkpoints/state not
+        # found.` (XID 275793223 attempt 2). Appending a step would be no
+        # better: the launcher would have to guess which step survived.
+        #
+        # main.py::_apply_borg_autoresume already solves this correctly from
+        # inside the job -- it enumerates $CHECKPOINT_BUCKET/checkpoints,
+        # skips any directory without extra.json (written last, so its absence
+        # marks a torn write), and resumes from the highest surviving step.
+        # Crucially it SKIPS ITSELF when LOAD_FROM is set, treating that as an
+        # explicit user request. So setting LOAD_FROM here did double damage:
+        # it passed an unusable path AND disabled the mechanism that would have
+        # picked the right one. Since --resume_xid reuses the same XID, and
+        # CHECKPOINT_BUCKET is derived from the XID, the job lands on the same
+        # prefix and rediscovery just works.
         if load_from:
             job_env_vars['LOAD_FROM'] = load_from
         if _WANDB_RESUME_ID.value:
