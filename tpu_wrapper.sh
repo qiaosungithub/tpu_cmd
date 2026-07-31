@@ -526,7 +526,14 @@ STATUS_COLOR = {
 BOLD = "\033[1m"
 DIM = "\033[2m"
 
-def print_table(headers, rows, caps, status_idx=None, last_dim=True):
+def print_table(headers, rows, caps, status_idx=None, last_dim=True, tails=None):
+    """`tails` maps a row's index to extra dim lines printed beneath it.
+
+    A running job gets its log tail this way: the status word only says Borg is
+    happy, so the line the job actually last printed is what tells you whether
+    training is moving. Indented under the NAME column and dimmed, so the table
+    still scans vertically.
+    """
     disp = [[_trunc(c, caps[i]) for i, c in enumerate(r)] for r in rows]
     n = len(headers)
     width = [len(h) for h in headers]
@@ -534,7 +541,9 @@ def print_table(headers, rows, caps, status_idx=None, last_dim=True):
         for i in range(n):
             width[i] = max(width[i], len(r[i]))
     print(_c("  " + "  ".join(h.ljust(width[i]) for i, h in enumerate(headers)), DIM))
-    for r in disp:
+    # Line the continuation up with NAME (col 2), which is where the eye already is.
+    tail_indent = 2 + sum(width[i] + 2 for i in range(min(2, n)))
+    for idx, r in enumerate(disp):
         parts = []
         for i, cell in enumerate(r):
             last = i == n - 1
@@ -545,6 +554,8 @@ def print_table(headers, rows, caps, status_idx=None, last_dim=True):
                 padded = _c(padded, DIM)
             parts.append(padded)
         print("  " + "  ".join(parts))
+        for extra in (tails or {}).get(idx, []):
+            print(_c(" " * tail_indent + "│ " + extra, DIM))
 
 def _hdr(title, n):
     bar = _c(f"━━ {title} ", BOLD)
@@ -574,6 +585,7 @@ def main():
         try:
             with open(cache_file, "r") as f:
                 lines = f.readlines()
+            last_xid = None
             for line in lines:
                 clean_line = remove_ansi(line).strip()
                 # Only require a LEADING box char. Requiring a trailing one too
@@ -598,13 +610,28 @@ def main():
                             why = parts[-1] if len(parts) >= 4 else ""
                             cached_status[xid] = {"status": status, "name": name,
                                                   "why": why, "resume": resume,
-                                                  "step": step}
+                                                  "step": step, "tail": []}
+                            last_xid = xid
+                        elif not xid and last_xid:
+                            # CONTINUATION ROW. infra_check prints a running
+                            # job's log tail as extra rows whose ID column is
+                            # blank (see infra_check.py::_log_tail). Requiring a
+                            # numeric ID dropped every one of them, which is why
+                            # the tail was invisible here while being present in
+                            # the cache file. Attribute the row to the job whose
+                            # header we last saw.
+                            text = next((p for p in parts[2:] if p), "")
+                            text = text.lstrip("│ ").strip()
+                            if text:
+                                cached_status[last_xid].setdefault("tail", []).append(text)
         except Exception:
             pass
 
     all_xids = sorted(list(set(tpu_jobs.keys()) | set(cached_status.keys())), key=lambda x: int(x) if x.isdigit() else x, reverse=True)
 
     active_rows, pending_rows, done_rows = [], [], []
+    # row index in active_rows -> its log-tail continuation lines
+    active_tails = {}
 
     dirty_jobs = False
     for xid in all_xids:
@@ -709,6 +736,9 @@ def main():
             # daemon ever reports something else (an early-startup message).
             m_wu = re.match(r"^\s*(\d+)\s+active\s*$", str(why or ""))
             wu = m_wu.group(1) if m_wu else ("-" if why in ("", "-", None) else why)
+            tail = cache_info.get("tail") or []
+            if tail:
+                active_tails[len(active_rows)] = tail
             active_rows.append([xid, status, name, tpu_type, tier, group_str,
                                 resume_s, step_s, wu])
         elif st_lower in ["pending", "queued"]:
@@ -749,7 +779,8 @@ def main():
     if active_rows:
         # last_dim=False: WU is a live datum, not a trailing note, so it should
         # not be dimmed the way a WHY string is.
-        print_table(active_headers, active_rows, active_caps, status_idx=1, last_dim=False)
+        print_table(active_headers, active_rows, active_caps, status_idx=1,
+                    last_dim=False, tails=active_tails)
     else:
         print(_c("  (none)", DIM))
 
