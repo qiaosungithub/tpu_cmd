@@ -46,6 +46,51 @@ get_group_id_by_alloc() {
 _PREFLIGHT_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/preflight_cli"
 _ROUTER_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/router_cli"
 _INFRA_CHECK_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/infra_check"
+_MACH_LOCALITY="/usr/local/bin/mach_locality"
+# Default must track xm_launcher.py's --bucket default; only used to work out
+# which continent the data is in when the caller does not pass --bucket.
+_DEFAULT_BUCKET="/cns/yutulpz-d/home/qiaos/eqr_data"
+
+_continent_of() {
+  # Borg cell -> continent ('na', 'eu', 'ap'), or empty when unknown.
+  [ -z "$1" ] && return 0
+  [ -x "$_MACH_LOCALITY" ] || return 0
+  "$_MACH_LOCALITY" -k continent "$1" 2>/dev/null | awk '{print $2}'
+}
+
+_check_locality() {
+  # $1 = explicitly requested cell (may be empty), $2 = the passthrough args,
+  # searched for --bucket. Warns; never blocks. Placement is a tradeoff the
+  # caller may be making deliberately, and a guard that refuses to submit would
+  # be worse than the stall it prevents.
+  local cell="$1" args="$2"
+  [ -z "$cell" ] && return 0
+
+  local bucket="$_DEFAULT_BUCKET"
+  case "$args" in
+    *--bucket=*) bucket="${args##*--bucket=}"; bucket="${bucket%% *}" ;;
+  esac
+  # /cns/<cell>-d/... -> <cell>
+  local data_cell="${bucket#/cns/}"; data_cell="${data_cell%%-d/*}"
+  [ "$data_cell" = "$bucket" ] && return 0   # not a /cns/ path; nothing to compare
+
+  local c_compute c_data
+  c_compute=$(_continent_of "$cell")
+  c_data=$(_continent_of "$data_cell")
+  [ -z "$c_compute" ] && return 0
+  [ -z "$c_data" ] && return 0
+
+  if [ "$c_compute" != "$c_data" ]; then
+    echo -e "\033[31m[locality] WARNING: compute and data are on different continents.\033[0m"
+    echo -e "\033[31m  compute cell : $cell ($c_compute)\033[0m"
+    echo -e "\033[31m  data bucket  : $data_cell ($c_data)\033[0m"
+    echo -e "\033[33m  Every restart re-reads the checkpoint across an ocean. XID 275793223\033[0m"
+    echo -e "\033[33m  was killed and restarted 26 times this way without training a step.\033[0m"
+    echo -e "\033[33m  Pick a cell in '$c_data', or point --bucket at a '$c_compute' mirror.\033[0m"
+  else
+    echo -e "\033[2m[locality] ok: compute $cell and data $data_cell are both in $c_data\033[0m"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Limit orders: cap what a launched job pays per chip-hour.
@@ -417,6 +462,18 @@ print(d['group'], d['tpu_type'], d['status'],
       
       # Append remaining arguments (e.g. override --config)
       xm_args+=("${passthrough_args[@]}")
+
+      # LOCALITY GUARD. A job whose compute lands on a different continent from
+      # its checkpoint bucket re-reads state across an ocean on every restart.
+      # XID 275793223 did exactly that -- compute ske/eu, bucket tul/na, a 4 MB
+      # checkpoint taking 223 s -- and Borg killed it for being slow to start,
+      # 26 times in a row, without training a single step. The failure is
+      # invisible: the job reports `running` the whole time.
+      #
+      # Only checks an EXPLICIT --cell, because that is the only placement known
+      # before submit; the allocator's own choice is caught after the fact by
+      # `tpu check`'s REGION column.
+      _check_locality "$user_cell" "${passthrough_args[*]}"
 
       echo "================================"
       echo "Submitting into group: $alloc"
