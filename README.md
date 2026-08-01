@@ -137,7 +137,8 @@ Router recommendations for power=v5p-32 @ PROD
 ```
 tpu check              # active + pending + last 10 done
 tpu check -a           # all done
-tpu check -f           # do not truncate long names
+tpu check -l           # long: do not truncate the NAME / GROUP columns
+tpu check -f           # same switch (--full / --long are also accepted)
 tpu check -d 30        # last 30 done
 ```
 

@@ -621,7 +621,13 @@ def _hdr(title, n):
 def main():
     parser = argparse.ArgumentParser(description="Rich status view for TPU jobs (like infra check).")
     parser.add_argument("-a", "--all", action="store_true", help="Show all completed/failed jobs.")
-    parser.add_argument("-f", "--full", action="store_true", help="Do not truncate long strings.")
+    # -l is the alias people reach for ("long"), -f the original. Same switch:
+    # an experiment name is chosen to be read, and 30 characters of it plus an
+    # ellipsis routinely hides the very thing that distinguishes two runs --
+    # "...50k scaleup" vs "...50k scaleup lr2x" truncate identically.
+    parser.add_argument("-f", "-l", "--full", "--long", action="store_true",
+                        dest="full",
+                        help="Do not truncate the NAME / GROUP columns.")
     parser.add_argument("-d", "--done", type=int, default=10, help="Number of done jobs to display.")
     args, _ = parser.parse_known_args()
 
