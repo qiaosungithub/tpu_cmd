@@ -43,6 +43,21 @@ _CELL_BUCKETS = {
 }
 
 
+def _read_legacy_mapping():
+    """Archived job registry (`tpu clear` moves entries here). {} if absent.
+
+    `os`/`json` are imported locally to match this module's existing style --
+    they are function-local everywhere else here, not module-level.
+    """
+    import os
+    import json
+    try:
+        with open(os.path.expanduser("~/.tpu_jobs_legacy.json"), "r") as handle:
+            return json.load(handle)
+    except Exception:  # noqa: BLE001 - the archive is optional
+        return {}
+
+
 def _local_bucket() -> str:
     """The durable root nearest the cell this job will run in."""
     # An explicitly passed --bucket is authoritative.
@@ -368,13 +383,31 @@ def main(argv) -> None:
                 print(f"Warning: could not write mapping file: {e}")
 
         if _RESUME_XID.value:
-            data = read_mapping()
-            # fallback to old format just in case
-            if str(_RESUME_XID.value) in data:
-                bucket_cp_path = data[str(_RESUME_XID.value)].get("bucket_cp_path", "")
-            else:
-                mapping_dir = os.path.expanduser("~/xm_job_to_bucket")
-                with open(os.path.join(mapping_dir, str(_RESUME_XID.value)), "r") as f:
+            # LOOK IN THE ARCHIVE TOO. `tpu clear` advertises itself as archiving
+            # rather than deleting -- it moves entries to ~/.tpu_jobs_legacy.json --
+            # but resume only consulted the live registry, so clearing a finished
+            # run quietly made it un-resumable. The failure was not even a clear
+            # message: it fell through to the long-dead ~/xm_job_to_bucket/ path
+            # and raised FileNotFoundError on a file nothing has written since
+            # 2026-07-26.
+            want = str(_RESUME_XID.value)
+            bucket_cp_path = ""
+            for source in (read_mapping(), _read_legacy_mapping()):
+                if want in source:
+                    bucket_cp_path = source[want].get("bucket_cp_path", "")
+                    if bucket_cp_path:
+                        break
+            if not bucket_cp_path:
+                # Last resort: the pre-2026-07-26 one-file-per-xid layout.
+                legacy_file = os.path.join(
+                    os.path.expanduser("~/xm_job_to_bucket"), want)
+                if not os.path.exists(legacy_file):
+                    raise SystemExit(
+                        f"--resume_xid={want}: no checkpoint bucket recorded for that "
+                        f"experiment.\nLooked in ~/.tpu_jobs.json, "
+                        f"~/.tpu_jobs_legacy.json and {legacy_file}.\n"
+                        f"Pass --bucket=<its bucket_cp_path> explicitly if you know it.")
+                with open(legacy_file, "r") as f:
                     bucket_cp_path = f.read().strip()
             vm_workdir = f"/tmp/eqr_log/resume_{xid}_{time_str}_{project_name}_{exp_name}"
         else:
