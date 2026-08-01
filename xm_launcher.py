@@ -29,6 +29,33 @@ _BUCKET = flags.DEFINE_string(
     'TPU worker fails with ACCESS_DENIED. Pass a gs:// path only if that bucket '
     'grants access to the prod identity.'
 )
+# Checkpoints are written from the TPU workers, so the bucket has to be near
+# THEM, not near wherever the default happens to point. Getting this wrong is
+# not a mild slowdown: XID 275990419 ran on `yuskedq` (metro ske, continent EU)
+# while writing to `yutulpz` (metro tul, NA), and orbax reported 10 MiB/s, ~10s
+# of BLOCKED TPU per save plus 33-56s of background flush. Its duty cycle fell
+# to 0.082, below the 0.20 WIM pruning threshold, and the job was deleted.
+#
+# Map each compute cell to a bucket in the same metro. An unlisted cell keeps
+# the default, and an explicit --bucket always wins.
+_CELL_BUCKETS = {
+    'yuskedq': '/cns/yuskedq-d/home/qiaos/eqr_data',
+}
+
+
+def _local_bucket() -> str:
+    """The durable root nearest the cell this job will run in."""
+    # An explicitly passed --bucket is authoritative.
+    if _BUCKET.present:
+        return _BUCKET.value
+    cell = (_CELL.value or '').strip()
+    for name, bucket in _CELL_BUCKETS.items():
+        if name == cell:
+            print(f"[locality] cell={cell}: using co-located bucket {bucket}")
+            return bucket
+    return _BUCKET.value
+
+
 _WORKDIR = flags.DEFINE_string(
     'workdir', '', 'Working directory (e.g. ~/logs/...) '
 )
@@ -351,7 +378,7 @@ def main(argv) -> None:
                     bucket_cp_path = f.read().strip()
             vm_workdir = f"/tmp/eqr_log/resume_{xid}_{time_str}_{project_name}_{exp_name}"
         else:
-            bucket_cp_path = f"{_BUCKET.value}/logs/{project_name}/{folder_name}"
+            bucket_cp_path = f"{_local_bucket()}/logs/{project_name}/{folder_name}"
             vm_workdir = f"/tmp/eqr_log/{folder_name}"
             
         update_mapping(xid, {
