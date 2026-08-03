@@ -272,11 +272,15 @@ tpu() {
         #   "QUEUED: Not enough cell-wide shared resources for Best Effort
         #    paying batch collection. Resources exceeded by 16.12GiB RAM."
         # (XID 276768092, cell go). The ask, not the alloc, was the blocker.
-        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--tmp_ram_fs_gib=*)
+        # --ram_gib sizes the per-task memory requirement. It is NOT the same
+        # thing as --tmp_ram_fs_gib (the RAM disk behind /tmp). Omitted by
+        # default, so Borg's own default still applies and no existing job
+        # changes behaviour.
+        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--tmp_ram_fs_gib=*|--ram_gib=*)
           passthrough_args+=("$1")
           shift
           ;;
-        --load_from|--wandb_resume_id|--borg_max_task_failures|--borg_max_per_task_failures|--tmp_ram_fs_gib)
+        --load_from|--wandb_resume_id|--borg_max_task_failures|--borg_max_per_task_failures|--tmp_ram_fs_gib|--ram_gib)
           passthrough_args+=("$1=$2")
           shift 2
           ;;

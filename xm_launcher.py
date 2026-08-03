@@ -107,6 +107,20 @@ _FAILURE_CREDIT_PERIOD = flags.DEFINE_integer(
 # the job explicitly keeps that in sync with the BCL token built below.
 _JOB_NAME = 'main'
 
+# Borg applies its own default RAM when the requirements block names none, and
+# that default is sized for a small server, not for a job holding several
+# copy buffers at once. There was no way to ask for more: the launcher builds
+# JobRequirements from the accelerator string alone, and `--tpu_type=cpu=1,...`
+# is parsed as a SECOND accelerator (one executor per comma-separated entry),
+# not as a second resource. Hence this flag. 0 keeps today's behaviour exactly
+# -- no `ram` is emitted and Borg's default applies -- so no existing job moves.
+_RAM_GIB = flags.DEFINE_float(
+    'ram_gib', 0.0,
+    'Per-task RAM requirement in GiB. 0 (default) omits it and lets Borg '
+    'choose, which is what every job did before this flag existed. Distinct '
+    'from --tmp_ram_fs_gib: that sizes the RAM DISK backing /tmp, this sizes '
+    'the memory the process may allocate.'
+)
 _TMP_RAM_FS_GIB = flags.DEFINE_integer(
     'tmp_ram_fs_gib', 16,
     'Size of the per-task RAM disk backing /tmp, in GiB. Must exceed whatever '
@@ -277,6 +291,8 @@ def main(argv) -> None:
             # on device` mid-download. 16 GiB matches what //third_party/py/maxtext
             # requests (xm_launch.py:238).
             req_kwargs['tmp_ram_fs'] = _TMP_RAM_FS_GIB.value * xm.GiB
+            if _RAM_GIB.value > 0:
+                req_kwargs['ram'] = int(_RAM_GIB.value * xm.GiB)
             if alloc_str:
                 req_kwargs['allocator'] = alloc_str
             if _CELL.value:
@@ -480,7 +496,7 @@ def main(argv) -> None:
                 if arg.startswith(('--cell=', '--load_from=', '--config.load_from=',
                                    '--wandb_resume_id=', '--config.wandb_resume_id=',
                                    '--borg_max_task_failures=', '--borg_max_per_task_failures=',
-                                   '--tmp_ram_fs_gib=')):
+                                   '--tmp_ram_fs_gib=', '--ram_gib=')):
                     continue
                 key_val = arg[2:].split('=', 1)
                 if len(key_val) == 2:
