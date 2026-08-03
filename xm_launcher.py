@@ -472,9 +472,15 @@ def main(argv) -> None:
                 if 'config.wandb' in arg or 'tpu_type' in arg or 'workdir' in arg or 'resume_xid' in arg:
                    continue
                 # Resume/eval selectors travel as env vars, not config flags.
+                # --tmp_ram_fs_gib is consumed HERE (it sizes the Borg RAM
+                # disk in req_kwargs above); forwarding it on would hand the
+                # application a flag it never declares. Harmless only if the
+                # binary parses with known_only=True -- a job with a locked
+                # config schema dies at startup instead.
                 if arg.startswith(('--cell=', '--load_from=', '--config.load_from=',
                                    '--wandb_resume_id=', '--config.wandb_resume_id=',
-                                   '--borg_max_task_failures=', '--borg_max_per_task_failures=')):
+                                   '--borg_max_task_failures=', '--borg_max_per_task_failures=',
+                                   '--tmp_ram_fs_gib=')):
                     continue
                 key_val = arg[2:].split('=', 1)
                 if len(key_val) == 2:

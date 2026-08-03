@@ -264,11 +264,19 @@ tpu() {
           passthrough_args+=("$1=$2")
           shift 2
           ;;
-        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*)
+        # --tmp_ram_fs_gib sizes the per-task RAM disk backing /tmp. The
+        # launcher has always accepted it; it just had no route through here,
+        # so every job silently took the 16 GiB TPU-training default. On a
+        # BATCH submit that default is charged as cell-wide shared RAM, and a
+        # CPU-only job that needs kilobytes gets stuck behind it:
+        #   "QUEUED: Not enough cell-wide shared resources for Best Effort
+        #    paying batch collection. Resources exceeded by 16.12GiB RAM."
+        # (XID 276768092, cell go). The ask, not the alloc, was the blocker.
+        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--tmp_ram_fs_gib=*)
           passthrough_args+=("$1")
           shift
           ;;
-        --load_from|--wandb_resume_id|--borg_max_task_failures|--borg_max_per_task_failures)
+        --load_from|--wandb_resume_id|--borg_max_task_failures|--borg_max_per_task_failures|--tmp_ram_fs_gib)
           passthrough_args+=("$1=$2")
           shift 2
           ;;
