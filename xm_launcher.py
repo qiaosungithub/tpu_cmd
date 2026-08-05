@@ -7,6 +7,8 @@ xmanager launch xm_launch.py -- \
   --config="remote_run" \
   --workdir="~/logs/eqr-run"
 """
+import re
+
 from absl import app
 from absl import flags
 from xmanager import xm
@@ -366,7 +368,29 @@ def main(argv) -> None:
         xid = experiment.experiment_id
         import time
         time_str = time.strftime("%Y%m%d_%H%M%S")
-        folder_name = f"xid_{xid}_{time_str}_{exp_name}"
+
+        # SANITISE THE NAME BEFORE IT BECOMES A PATH. `-n` is free text and it
+        # lands verbatim in a CNS directory name, where Colossus treats
+        # * ? [ ] as glob metacharacters and REJECTS them: a title containing
+        # brackets makes the job's own `ensure_dir` fail with INVALID_ARGUMENT.
+        #
+        # XID 277172543 died exactly this way, and the shape of that failure is
+        # why this is worth guarding rather than remembering: it ran for twelve
+        # minutes first, and it produced NO log at all, because the log mirror
+        # is itself created under the same directory and its failure path is a
+        # bare `except: return None`. So the symptom was a silent burn of a
+        # v7-16 allocation with an empty status message -- indistinguishable at
+        # a glance from an infrastructure fault. It was relaunched by hand with
+        # the brackets removed, which fixed that job and left the trap armed.
+        #
+        # Replace rather than strip, so two titles differing only in punctuation
+        # cannot collide on one checkpoint prefix.
+        safe_exp_name = re.sub(r"[\*\?\[\]]", "_", exp_name)
+        if safe_exp_name != exp_name:
+            print(f"[launcher] NOTE: the experiment title contains characters CNS reserves "
+                  f"for globbing (* ? [ ]); the checkpoint directory will use "
+                  f"{safe_exp_name!r}. The experiment title itself is unchanged.")
+        folder_name = f"xid_{xid}_{time_str}_{safe_exp_name}"
     
         import os
         import json
