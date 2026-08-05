@@ -449,7 +449,10 @@ def main(argv) -> None:
             bucket_cp_path = f"{_local_bucket()}/logs/{project_name}/{folder_name}"
             vm_workdir = f"/tmp/eqr_log/{folder_name}"
             
-        update_mapping(xid, {
+        # The registry entry is written AFTER `experiment.add(job)`, at the end
+        # of this function -- see the comment there. Building it here, where the
+        # values are in scope, keeps that move a pure reordering.
+        registry_entry = {
             "bucket_cp_path": bucket_cp_path,
             "logdir": os.environ.get("TPU_LOGDIR", ""),
             "stagedir": os.environ.get("TPU_STAGEDIR", ""),
@@ -458,7 +461,7 @@ def main(argv) -> None:
             # Recorded so `tpu check` can tell "preempted, will retry" from
             # "preempted, restart budget spent".
             "max_task_failures": _MAX_TASK_FAILURES.value,
-        })
+        }
     
         config_path_arg = f"configs/load_config.py:{_CONFIG.value}"
         if package_mode == "bazel":
@@ -596,6 +599,27 @@ def main(argv) -> None:
         # passes args to xm.Job.
         job = xm.Job(executable, final_executor, args=executable_args, name=_JOB_NAME)
         experiment.add(job)
+
+        # REGISTER ONLY ONCE THE WORK UNIT EXISTS. This used to run ~150 lines
+        # earlier, right after the bucket path was computed, which made the
+        # entry a PRE-registration: written before `experiment.package()` (the
+        # slow part, 1-4 minutes) and before `experiment.add(job)`.
+        #
+        # That is a real failure mode, not a theoretical one. The launcher runs
+        # as a ~3.75 GB PAR executed straight off BinFS, and `binfsd` panics on
+        # a schedule (`image_cache.go` logs "Failed to stat" during cache
+        # eviction and then dies -- a missing `continue`). When it restarts,
+        # /google/bin is remounted and every process holding an mmap of it takes
+        # SIGBUS on its next page fault. SIGBUS is not a Python exception: there
+        # is no traceback, no `finally`, and nothing cleans up. Six launches on
+        # 2026-08-04 left an XID in the registry with no experiment behind it,
+        # each carrying EXACTLY the six keys written above, and `tpu check`
+        # showed them forever as "unknown ... No WorkUnits (config error?)".
+        #
+        # Nothing between the old site and here reads the registry, so moving
+        # the write is a pure reordering. The invariant it buys: an entry exists
+        # only if a work unit was actually added.
+        update_mapping(xid, registry_entry)
 
 
 if __name__ == '__main__':

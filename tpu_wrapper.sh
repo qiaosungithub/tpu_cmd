@@ -492,9 +492,76 @@ print(d['group'], d['tpu_type'], d['status'],
       echo "Running: ${xm_args[*]}"
       local log_file="${logdir}/xm_launch.log"
       "${xm_args[@]}" 2>&1 | tee "$log_file"
-      
-      # Extract XID
+
+      # THE LAUNCH IS NOT DONE UNTIL XMANAGER SAYS SO. `tee` makes `$?` the exit
+      # status of tee, not of the launcher, so the only trustworthy evidence
+      # that an experiment was created is this line in the log. Six launches on
+      # 2026-08-04 got as far as a successful build and then died between
+      # `experiment.package()` and `experiment.add(job)` -- no traceback, no
+      # work unit, and (before the launcher was reordered) a half-written
+      # registry entry that `tpu check` showed forever as "unknown ... No
+      # WorkUnits". Cause: the launcher is a ~3.75 GB PAR executed off BinFS,
+      # and `binfsd` panics on a ~6h cycle during cache eviction; the remount
+      # SIGBUSes every process holding an mmap of /google/bin. Nothing in the
+      # launcher can catch that, so the check belongs out here.
       local xid=$(grep -oP 'Launched experiment \K\d+' "$log_file" | head -n 1)
+
+      if [ -z "$xid" ]; then
+        echo -e "\033[31m[launch] No 'Launched experiment' line -- the launcher died before creating the experiment.\033[0m"
+        if grep -qiE 'SIGBUS|Signal 7|bad local file header|FailureSignalHandler' "$log_file"; then
+          echo -e "\033[33m  Signature matches the BinFS remount fault (binfsd restarts ~every 6h during cache eviction).\033[0m"
+        fi
+        # Drop any entry the launcher pre-registered before dying, so a corpse
+        # never reaches the status board. Harmless once the launcher registers
+        # last; kept because a staged snapshot may still hold the old order.
+        python3 - "$log_file" <<'PYEOF'
+import json, os, re, sys, fcntl
+log = sys.argv[1]
+try:
+    text = open(log, errors="replace").read()
+except OSError:
+    sys.exit(0)
+# The launcher prints the XID it reserved even when it dies later.
+m = re.search(r'https?://xids?/(\d+)|experiment_id[\'":= ]+(\d+)', text)
+xid = next((g for g in (m.groups() if m else ()) if g), None)
+if not xid:
+    sys.exit(0)
+path = os.path.expanduser("~/.tpu_jobs.json")
+if not os.path.exists(path):
+    sys.exit(0)
+with open(path, "r") as f:
+    fcntl.flock(f, fcntl.LOCK_SH)
+    try:
+        data = json.load(f)
+    except Exception:
+        sys.exit(0)
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+entry = data.get(xid)
+# Only remove a CORPSE: an entry with no tier/alloc/status is one the launcher
+# pre-registered and never finished. Never touch a healthy entry.
+if entry is not None and not any(k in entry for k in ("tier", "alloc", "status")):
+    data.pop(xid, None)
+    with open(path, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        json.dump(data, f, indent=2)
+        fcntl.flock(f, fcntl.LOCK_UN)
+    print(f"  [launch] removed the orphaned registry entry for XID {xid}")
+PYEOF
+        if [ "${_TPU_LAUNCH_RETRIED:-0}" != "1" ]; then
+          echo -e "\033[33m[launch] Retrying once (a fresh process re-mmaps /google/bin).\033[0m"
+          export _TPU_LAUNCH_RETRIED=1
+          "${xm_args[@]}" 2>&1 | tee "$log_file"
+          xid=$(grep -oP 'Launched experiment \K\d+' "$log_file" | head -n 1)
+          unset _TPU_LAUNCH_RETRIED
+          [ -n "$xid" ] && echo -e "\033[32m[launch] Retry succeeded: XID $xid\033[0m"
+        fi
+        if [ -z "$xid" ]; then
+          echo -e "\033[31m[launch] Still no experiment after a retry. Nothing was submitted.\033[0m"
+          echo -e "\033[2m  If the BinFS signature appeared, the cache is likely over its limit:\033[0m"
+          echo -e "\033[2m    grep 'bigger than desired size' /usr/local/google/tmp/binfsd.INFO | tail -1\033[0m"
+        fi
+      fi
       if [ -n "$xid" ]; then
           python3 - "$xid" "${tpu_type}" "${tier}" "${alloc}" "${logdir}" "${stagedir}" "${log_file}" << 'EOF'
 import json, os, re, sys, fcntl
