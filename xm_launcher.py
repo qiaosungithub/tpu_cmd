@@ -38,7 +38,26 @@ _BUCKET = flags.DEFINE_string(
 #
 # Map each compute cell to a bucket in the same metro. An unlisted cell keeps
 # the default, and an explicit --bucket always wins.
+#
+# A cell whose metro has no team storage quota is listed with its own -d cell,
+# which is only the 500 GiB personal ceiling -- fine for a smoke test, not for a
+# real run. Cells whose metro DOES have group quota point at that neighbour.
 _CELL_BUCKETS = {
+    # metro has PiB-scale group quota (charged to deepmind-resources-colossus)
+    'yucbfiv': '/cns/is-d/home/qiaos/eqr_data',   # cbf -> is-d  69.1 PiB sp50
+    'yucbful': '/cns/is-d/home/qiaos/eqr_data',   # cbf
+    'yucbfwv': '/cns/is-d/home/qiaos/eqr_data',   # cbf
+    'je':      '/cns/is-d/home/qiaos/eqr_data',   # cbf
+    'yutulpz': '/cns/nm-d/home/qiaos/eqr_data',   # tul -> nm-d  44.0 PiB sp50
+    'yulpptr': '/cns/li-d/home/qiaos/eqr_data',   # lpp -> li-d  85.2 PiB sp50
+    'sk':      '/cns/si-d/home/qiaos/eqr_data',   # sin -> si-d  9.69 PiB sp50
+    'sn':      '/cns/si-d/home/qiaos/eqr_data',   # sin
+    'so':      '/cns/si-d/home/qiaos/eqr_data',   # sin
+    'yumrnel': '/cns/qo-d/home/qiaos/eqr_data',   # mrn -> qo-d  8.80 PiB sp50
+    'el':      '/cns/el-d/home/qiaos/eqr_data',   # grq, same cell 95.4 PiB sp50
+    'mb':      '/cns/mb-d/home/qiaos/eqr_data',   # ckv, same cell 10.7 PiB sp50
+    'yudfwra': '/cns/rs-d/home/qiaos/eqr_data',   # dfw -> rs-d  49.3 PiB sp50
+    # no group quota in the metro -- personal 500 GiB only
     'yuskedq': '/cns/yuskedq-d/home/qiaos/eqr_data',
 }
 

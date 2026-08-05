@@ -262,7 +262,7 @@ Understanding the output:
   everyone in the group (resolution order SCU > XID > MDB).
 - **BATCH admission is combinatorial**, not `bp ≥ price`. `bp ≥ price ×
   chips` is a necessary-but-not-sufficient sanity check. See
-  `wiki_agents/xmanager.md § GQM Bidding Power`.
+  `wiki_agents/infra/quota_market.md`.
 - **Free pool BATCH is still preemptible**. Only Churn Protection (~8h
   window) provides any stability shield.
 
@@ -408,7 +408,7 @@ so this is usually only needed when `gcert` credentials just expired.
 
 ## Under the hood
 
-Read `~/work/wiki_agents/xmanager.md` for:
+Read `~/work/wiki_agents/jobs.md` (and `infra/` for allocator internals) for:
 
 - The full PROD vs BATCH admission model
 - GQM market-cycle mechanics (1-minute uniform clearing auction,
