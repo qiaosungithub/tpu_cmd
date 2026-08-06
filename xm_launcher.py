@@ -166,6 +166,86 @@ _CELL = flags.DEFINE_string(
     'TRIGGERED_LIMIT_ORDER bucket. Empty = let the allocator decide.'
 )
 
+def _warn_if_work_units_still_active(experiment, xid: str) -> None:
+    """A resume APPENDS a work unit; it does not stop the ones already there.
+
+    Two live work units on one XID share `$CHECKPOINT_BUCKET`, because the
+    prefix is derived from the experiment id. That is two trainers writing one
+    checkpoint series and two mirrors appending to one log -- exactly the
+    collision this launcher spends real effort avoiding everywhere else.
+
+    Only a WARNING: an already-terminal experiment is the normal case, the API
+    may decline to answer, and refusing a legitimate resume would be worse than
+    saying so loudly.
+    """
+    try:
+        active = [
+            wu for wu in experiment.get_work_units()
+            if str(getattr(getattr(wu, "status", None), "name", "")).upper()
+            in ("RUNNING", "PENDING", "SCHEDULING")
+        ]
+    except Exception as exc:  # noqa: BLE001 - cannot tell is not a failure
+        print(f"[resume] could not check XID {xid} for live work units "
+              f"({type(exc).__name__}: {exc}); proceeding.")
+        return
+    if not active:
+        return
+    print(
+        f"\n[resume] WARNING: XID {xid} still has {len(active)} work unit(s) in a "
+        f"live state.\n"
+        "[resume]   A resume APPENDS a work unit and does not stop those. Both "
+        "would write\n"
+        "[resume]   the SAME checkpoint prefix (it is derived from the XID) and "
+        "the same\n"
+        "[resume]   log files -- two trainers on one series. Stop the old one "
+        f"first:\n[resume]       tpu stop {xid}\n"
+    )
+
+
+def _preflight_resume_config(bucket_cp_path: str, xid: str) -> None:
+    """Abort a `--resume_xid` whose config describes a different model.
+
+    Best effort by design: this runs on the workstation, where the project's
+    checkpoint helpers may not be importable and the bucket may not be readable.
+    Any of that means "cannot tell", and cannot-tell must not block a launch --
+    the job re-checks the same thing at startup. It only ever aborts on a
+    DIFFERENCE IT CAN PROVE.
+    """
+    import os
+    import sys
+
+    try:
+        sys.path.insert(0, os.getcwd())
+        from configs import load_config
+        from utils.ckpt_util import (
+            assert_config_matches_checkpoint,
+            join_path,
+            latest_checkpoint,
+        )
+
+        cfg = load_config.get_config(_CONFIG.value)
+        resume_from = latest_checkpoint(join_path(bucket_cp_path, "checkpoints"))
+    except Exception as exc:  # noqa: BLE001 - cannot tell is not a failure
+        print(f"[resume] pre-flight config check skipped ({type(exc).__name__}: {exc})")
+        return
+
+    if not resume_from:
+        print(f"[resume] no complete checkpoint under {bucket_cp_path}/checkpoints yet; "
+              "the job will start fresh on this prefix.")
+        return
+
+    try:
+        assert_config_matches_checkpoint(
+            resume_from, cfg, context=f" (--resume_xid={xid})"
+        )
+    except Exception as exc:  # noqa: BLE001 - this one IS the answer
+        raise SystemExit(
+            f"\n=== REFUSING TO RESUME XID {xid} ===\n{exc}\n"
+            f"\nNothing was packaged or queued.\n"
+        )
+    print(f"[resume] config matches {resume_from}")
+
+
 def main(argv) -> None:
     exp_name = _EXP_NAME.value
     # --- Auto-Load WandB name or fallbacks ---
@@ -469,6 +549,19 @@ def main(argv) -> None:
                 with open(legacy_file, "r") as f:
                     bucket_cp_path = f.read().strip()
             vm_workdir = f"/tmp/eqr_log/resume_{xid}_{time_str}_{project_name}_{exp_name}"
+            # PRE-FLIGHT: does the config we are about to package actually
+            # describe the checkpoint we are about to resume?
+            #
+            # A resume packages the CURRENT checkout and reads the project's
+            # single shared run config. That file is overwritten by every
+            # launch, so resuming a run from days ago routinely ships the wrong
+            # experiment's config -- two 150k-step sudoku runs were resumed
+            # against a maze config and died on arrival, after ten minutes of
+            # packaging and queueing. Checking here costs one small read of the
+            # checkpoint's `extra.json` and fails in seconds instead.
+            _preflight_resume_config(bucket_cp_path, xid)
+            # And a resume does not stop what is already running on this XID.
+            _warn_if_work_units_still_active(experiment, xid)
         else:
             bucket_cp_path = f"{_local_bucket()}/logs/{project_name}/{folder_name}"
             vm_workdir = f"/tmp/eqr_log/{folder_name}"
