@@ -147,6 +147,26 @@ _TMP_RAM_FS_GIB = flags.DEFINE_integer(
     'Size of the per-task RAM disk backing /tmp, in GiB. Must exceed whatever '
     'the job stages locally (dataset copies, scratch).'
 )
+# Every job this launcher has ever submitted ran as exactly ONE task, because
+# `xm.JobRequirements` defaults `replicas` to 1 and nothing here ever set it.
+# That is right for a TPU trainer -- one work unit drives the whole slice -- and
+# wrong for an embarrassingly-parallel CPU job, where the task count IS the
+# parallelism: a 4,800 core-hour corpus at one task is 200 days.
+#
+# Kept as a separate flag rather than folded into --tpu_type because they are
+# different axes: --tpu_type sizes ONE task, this says how many of them. Note
+# `replicas` is NOT validated by JobRequirements (0 silently becomes 1, -1 and
+# 1.5 survive intact), so the int() conversion below is the only guard there is.
+# 1 (default) omits the kwarg entirely, so no existing job changes shape.
+_REPLICAS = flags.DEFINE_integer(
+    'replicas', 1,
+    'Number of Borg tasks for this job. 1 (default) emits no `replicas` '
+    'requirement at all, which is exactly what every job did before this flag '
+    'existed. Each task gets the full --tpu_type/--ram_gib requirement, and a '
+    'CPU job trickles in as capacity appears rather than gang-scheduling. '
+    'Remember Borg caps tasks per user per priority tier per CELL (2000 at '
+    'priority 0, 400 at priority 25), so a wider run needs more than one job.'
+)
 _LOAD_FROM = flags.DEFINE_string(
     'load_from', '',
     'Checkpoint directory to evaluate (eval_only) or warm-start from. Accepts '
@@ -394,6 +414,14 @@ def main(argv) -> None:
             req_kwargs['tmp_ram_fs'] = _TMP_RAM_FS_GIB.value * xm.GiB
             if _RAM_GIB.value > 0:
                 req_kwargs['ram'] = int(_RAM_GIB.value * xm.GiB)
+            # `replicas` is the task count. Emitted only above 1, so a job that
+            # does not ask for it keeps the exact requirements block it had
+            # before this flag existed. int() is deliberate: JobRequirements
+            # does NOT validate this kwarg (measured -- 0 becomes 1, -1 and 1.5
+            # pass straight through into the BCL), so a float or a string would
+            # travel all the way to Borg unexamined.
+            if _REPLICAS.value > 1:
+                req_kwargs['replicas'] = int(_REPLICAS.value)
             if alloc_str:
                 req_kwargs['allocator'] = alloc_str
             if _CELL.value:
@@ -406,6 +434,38 @@ def main(argv) -> None:
                         req_kwargs['service_tier'] = xm.ServiceTier.PROD
                     elif tier_val == 'BATCH':
                         req_kwargs['service_tier'] = xm.ServiceTier.BATCH
+                    # A NUMERIC tier is a raw Borg priority. JobRequirements
+                    # accepts `priority=` directly and DERIVES the service tier
+                    # from it, so this one branch reaches every band -- p0 and
+                    # p25 (free, charged to the USER) as well as the two named
+                    # tiers -- with no new flag and no enum table to keep in
+                    # sync. `priority=` and `service_tier=` are mutually
+                    # exclusive (resources.py raises if both are given), which
+                    # is why this is elif and not a second assignment.
+                    #
+                    # Two traps worth naming, because both are counter-intuitive
+                    # and both cost money:
+                    #  * BATCH (p100) is a PAYING best-effort tier and it charges
+                    #    the GROUP, not you. It is not the free option; p0/p25
+                    #    are (borg.py: at priority <= 25 the BCL carries
+                    #    `accounting.charged_user = "<user>"`).
+                    #  * The task-per-cell cap is per PRIORITY TIER: 2000 at p0
+                    #    but only 400 at p25, so the lower number is the roomier
+                    #    one. See //production/borg/usermaps/setup/
+                    #    default_allocation.gcl and //borg/control/g3doc/limits.md.
+                    #
+                    # WITHOUT this branch `--tier=0` matched neither string,
+                    # left service_tier unset, and silently took the
+                    # JobRequirements default -- which is PROD. Asking for the
+                    # free tier and being given the most expensive one is the
+                    # worst possible failure for a flag like this.
+                    elif tier_val.isdigit():
+                        req_kwargs['priority'] = int(tier_val)
+                    else:
+                        raise ValueError(
+                            f"--tier={tier_val!r} is neither PROD, BATCH, nor a "
+                            "numeric Borg priority. Refusing to submit: an "
+                            "unrecognised tier used to fall through to PROD.")
             job_requirements = xm.JobRequirements(**req_kwargs)
             
             # Borg's BorgScheduling defaults are max_task_failures=0 /
@@ -635,7 +695,7 @@ def main(argv) -> None:
                 if arg.startswith(('--cell=', '--load_from=', '--config.load_from=',
                                    '--wandb_resume_id=', '--config.wandb_resume_id=',
                                    '--borg_max_task_failures=', '--borg_max_per_task_failures=',
-                                   '--tmp_ram_fs_gib=', '--ram_gib=')):
+                                   '--tmp_ram_fs_gib=', '--ram_gib=', '--replicas=')):
                     continue
                 key_val = arg[2:].split('=', 1)
                 if len(key_val) == 2:

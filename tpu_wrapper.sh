@@ -245,6 +245,18 @@ tpu() {
           skip_preflight=1
           shift
           ;;
+        # --app.<flag>=<v> forwards <flag> to the packaged binary verbatim.
+        # The rest of this parser is an allowlist on purpose -- a mistyped flag
+        # should be refused here, not silently ignored on Borg. But an allowlist
+        # cannot know the flags of every binary this wrapper launches, and the
+        # alternative (extend the list per job) means editing shared tooling for
+        # a one-off. The `app.` prefix keeps the property that matters: a name
+        # is only forwarded when it was ASKED to be forwarded, so a typo in a
+        # wrapper flag still errors instead of vanishing.
+        --app.*)
+          passthrough_args+=("--${1#--app.}")
+          shift
+          ;;
         --exp_name=*|--config=*|--bucket=*|--workdir=*|--resume_xid=*|--config.*)
           passthrough_args+=("$1")
           shift
@@ -276,11 +288,16 @@ tpu() {
         # thing as --tmp_ram_fs_gib (the RAM disk behind /tmp). Omitted by
         # default, so Borg's own default still applies and no existing job
         # changes behaviour.
-        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--tmp_ram_fs_gib=*|--ram_gib=*)
+        # --replicas is the Borg TASK COUNT. Every job before it ran as exactly
+        # one task, which is right for a TPU trainer (one work unit drives the
+        # whole slice) and useless for an embarrassingly-parallel CPU job, where
+        # the task count IS the parallelism. Absent => the launcher emits no
+        # `replicas` requirement at all, so no existing job changes shape.
+        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--tmp_ram_fs_gib=*|--ram_gib=*|--replicas=*)
           passthrough_args+=("$1")
           shift
           ;;
-        --load_from|--wandb_resume_id|--borg_max_task_failures|--borg_max_per_task_failures|--tmp_ram_fs_gib|--ram_gib)
+        --load_from|--wandb_resume_id|--borg_max_task_failures|--borg_max_per_task_failures|--tmp_ram_fs_gib|--ram_gib|--replicas)
           passthrough_args+=("$1=$2")
           shift 2
           ;;
@@ -1138,6 +1155,15 @@ EOF
     # on its own ~60s cycle, so the board does not change the instant this returns.
     echo -e "\033[2m[tpu clear] Entries archived to ~/.tpu_jobs_legacy.json (never deleted).\033[0m"
     echo -e "\033[2m  Allow one daemon cycle (~60s) for 'tpu check' to drop them from the board.\033[0m"
+
+  elif [[ "$1" == "gc" ]]; then
+    # Prune checkpoints nothing will read again. `save_checkpoint` uses orbax's
+    # StandardCheckpointer, which has no `max_to_keep` -- so before this existed
+    # NOTHING ever deleted a checkpoint, and 1850 of them across one cell put a
+    # personal 500 GiB CNS quota over its ceiling, poisoning every later write.
+    # Dry run by default; --go deletes. See scripts/ckpt_gc.py for the policy.
+    shift
+    python3 "$(dirname "${BASH_SOURCE[0]}")/scripts/ckpt_gc.py" "$@"
 
   elif [[ "$1" == "monitor" || "$1" == "watch" ]]; then
     shift
