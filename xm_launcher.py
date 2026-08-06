@@ -167,6 +167,31 @@ _REPLICAS = flags.DEFINE_integer(
     'Remember Borg caps tasks per user per priority tier per CELL (2000 at '
     'priority 0, 400 at priority 25), so a wider run needs more than one job.'
 )
+# Autopilot resizes a job's CPU/RAM from observed usage. XManager turns it ON
+# for every job (the generated BCL calls `autopilot_utils.enable_autopilot`),
+# which is right for a server whose footprint is unknown and wrong for a batch
+# job whose footprint was measured -- because the resize is not a cap, it is a
+# REQUEST. Measured on a 1-cpu / 2 GiB CPU job: enabling Autopilot rewrites the
+# ask to `min_milligcu = 1024, max_milligcu = 40000`, and the scheduler then
+# looks for a machine with 40 cores free at best-effort priority. It does not
+# find one, and the job sits in DISABLED / WAITING_FOR_AUTOPILOT reporting
+# "Not enough best effort resources available in the cell" -- a message that
+# reads like a capacity problem in the cell and is actually the size of the ask.
+#
+# With `--autopilot=false` the requirements block is exactly what was asked for
+# (`milligcu = 1000`, `ram = 2147483648`) and the BCL calls disable_autopilot.
+#
+# Default None = leave XManager's behaviour alone, so no existing job changes.
+# Turn it off when the per-task footprint is known; keep it on when it is not,
+# because then Autopilot is what stops a 2000-task job from OOM-killing itself.
+_AUTOPILOT = flags.DEFINE_bool(
+    'autopilot', None,
+    'Whether Borg Autopilot may resize this job. Unset (default) keeps '
+    "XManager's own behaviour, which is ON. Pass --noautopilot for a batch job "
+    'whose per-task CPU/RAM is already measured: Autopilot widens the request '
+    'to a range (measured: 1 cpu -> min 1024 / max 40000 milligcu) and a '
+    'best-effort job then cannot be placed at all.'
+)
 _LOAD_FROM = flags.DEFINE_string(
     'load_from', '',
     'Checkpoint directory to evaluate (eval_only) or warm-start from. Accepts '
@@ -487,6 +512,15 @@ def main(argv) -> None:
                 task_failure_credit_period=_FAILURE_CREDIT_PERIOD.value,
             )
 
+            # Only construct AutopilotParams when the flag was actually given.
+            # An all-default AutopilotParams is not inert: the executor treats
+            # `enabled=None` plus any other field as "parameters you set that I
+            # will ignore" and prints a warning, and passing the object at all
+            # is a change in shape for every existing job.
+            borg_kwargs = {}
+            if _AUTOPILOT.value is not None:
+                borg_kwargs['autopilot_params'] = xm_abc.AutopilotParams(
+                    enabled=_AUTOPILOT.value)
             if package_mode == "bazel":
                 executor = xm_abc.Borg(
                     requirements=job_requirements,
@@ -494,6 +528,7 @@ def main(argv) -> None:
                     # Let colleagues (and future you) read this job's logs
                     # without an ACL dance.
                     logs_read_access_roles=['all'],
+                    **borg_kwargs,
                 )
             else:
                 executor = xm_abc.Gcp(requirements=job_requirements)
@@ -695,7 +730,8 @@ def main(argv) -> None:
                 if arg.startswith(('--cell=', '--load_from=', '--config.load_from=',
                                    '--wandb_resume_id=', '--config.wandb_resume_id=',
                                    '--borg_max_task_failures=', '--borg_max_per_task_failures=',
-                                   '--tmp_ram_fs_gib=', '--ram_gib=', '--replicas=')):
+                                   '--tmp_ram_fs_gib=', '--ram_gib=', '--replicas=',
+                                   '--autopilot=', '--noautopilot', '--autopilot')):
                     continue
                 key_val = arg[2:].split('=', 1)
                 if len(key_val) == 2:

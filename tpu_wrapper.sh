@@ -293,7 +293,17 @@ tpu() {
         # whole slice) and useless for an embarrassingly-parallel CPU job, where
         # the task count IS the parallelism. Absent => the launcher emits no
         # `replicas` requirement at all, so no existing job changes shape.
-        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--tmp_ram_fs_gib=*|--ram_gib=*|--replicas=*)
+        # --autopilot / --noautopilot decides whether Borg Autopilot may resize
+        # the job. It is ON by default in XManager, and for a batch job with a
+        # MEASURED footprint that is actively harmful: it widens a 1-core ask to
+        # min 1024 / max 40000 milligcu, and a best-effort job then finds no
+        # machine and sits in DISABLED reporting what looks like a cell capacity
+        # problem. Absent => XManager's own behaviour, unchanged.
+        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--tmp_ram_fs_gib=*|--ram_gib=*|--replicas=*|--autopilot=*)
+          passthrough_args+=("$1")
+          shift
+          ;;
+        --autopilot|--noautopilot)
           passthrough_args+=("$1")
           shift
           ;;
