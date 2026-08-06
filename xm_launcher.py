@@ -142,10 +142,18 @@ _RAM_GIB = flags.DEFINE_float(
     'from --tmp_ram_fs_gib: that sizes the RAM DISK backing /tmp, this sizes '
     'the memory the process may allocate.'
 )
-_TMP_RAM_FS_GIB = flags.DEFINE_integer(
+# FLOAT, not int, and the reason is a scheduling one rather than a tidiness one.
+# This RAM disk is real RAM and it is counted in the job's memory request. For a
+# batch job the size of the request IS the queue wait: a task that stages one
+# ~18 MB shard was asking for a whole GiB, which at 4 tasks was 74% of a 5.4 GiB
+# ask and put the job 824-deep in a best-effort queue. An integer flag has 1 GiB
+# as its floor, so there was no way to ask for the ~64 MiB actually needed.
+_TMP_RAM_FS_GIB = flags.DEFINE_float(
     'tmp_ram_fs_gib', 16,
     'Size of the per-task RAM disk backing /tmp, in GiB. Must exceed whatever '
-    'the job stages locally (dataset copies, scratch).'
+    'the job stages locally (dataset copies, scratch). Fractional values are '
+    'allowed and matter: this is RAM, it is charged to the job\'s memory '
+    'request, and on a best-effort tier an oversized request is queue time.'
 )
 # Every job this launcher has ever submitted ran as exactly ONE task, because
 # `xm.JobRequirements` defaults `replicas` to 1 and nothing here ever set it.
@@ -436,7 +444,9 @@ def main(argv) -> None:
             # under-sized value shows up as `OSError: [Errno 28] No space left
             # on device` mid-download. 16 GiB matches what //third_party/py/maxtext
             # requests (xm_launch.py:238).
-            req_kwargs['tmp_ram_fs'] = _TMP_RAM_FS_GIB.value * xm.GiB
+            # int(): a fractional GiB must still lower to a whole number of
+            # bytes, or the BCL carries a float and Borg rejects it.
+            req_kwargs['tmp_ram_fs'] = int(_TMP_RAM_FS_GIB.value * xm.GiB)
             if _RAM_GIB.value > 0:
                 req_kwargs['ram'] = int(_RAM_GIB.value * xm.GiB)
             # `replicas` is the task count. Emitted only above 1, so a job that
