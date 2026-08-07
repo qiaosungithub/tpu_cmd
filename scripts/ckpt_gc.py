@@ -14,26 +14,40 @@ WHAT IT KEEPS, per run directory:
   1. the LATEST checkpoint -- ALWAYS, no exceptions
   2. the newest COMPLETE checkpoint, when the latest is a torn write
   3. every step that is a multiple of --milestone (default 50000)
-  4. every COMPLETE `checkpoint_best_<N>` -- the run's peak
+  4. every COMPLETE best-checkpoint copy -- the run's peaks
   5. anything that is not a `step_<N>` directory
 
 Everything else goes. Quota counts bytes AFTER replication, so the space
 recovered is roughly 2.9x the payload deleted under `r=3.2` (see
 wiki_agents/storage.md).
 
-`checkpoint_best_<N>` IS ALREADY SAFE FROM RULE 5 -- the name is deliberately
-outside the `step_<N>` namespace `_STEP_RE` matches, precisely so no step-based
-GC has to be taught about it. It is called out anyway because a peak is the one
+A PEAK HAS TWO NAMES, AND BOTH ARE PERMANENT:
+
+    checkpoint_best_<slug>_<N>   one per tracked metric, e.g.
+                                 `checkpoint_best_D16_ema_acc_95000`
+    checkpoint_best_<N>          LEGACY, from when retention tracked a single
+                                 metric. Still on CNS, and for several FINISHED
+                                 runs it is the ONLY surviving peak.
+
+The training job keeps the best under EACH tracked metric because a
+single-metric policy inherits that metric's bugs irreversibly: `solution_acc`
+scored only the painted cells, and three of four completed runs therefore
+retained a step that was not the peak while ordinary retention deleted the real
+one. Both shapes are matched here, and neither is ever swept.
+
+BOTH ARE ALREADY SAFE FROM RULE 5 -- the names are deliberately outside the
+`step_<N>` namespace `_STEP_RE` matches, precisely so no step-based GC has to be
+taught about them. They are called out anyway because a peak is the one
 checkpoint that cannot be re-created: it survives its own run's retention, so
 the only thing left that could delete it is a human sweeping a cell by hand.
-The plan therefore REPORTS the space it occupies rather than hiding it -- one
-extra checkpoint per run is real when a cell holds a thousand of them, and a
+The plan therefore REPORTS the space they occupy rather than hiding it -- two
+extra checkpoints per run is real when a cell holds a thousand of them, and a
 number nobody can see is a number nobody can decide about.
 
-The ONE it does delete is a `checkpoint_best_<N>` with no `extra.json`: the
-training job writes that marker last, so its absence means a promotion was
-preempted mid-copy. Nothing else will ever clean that up -- the very
-invisibility that protects a good peak protects a torn one.
+The ONE it does delete is a best copy with no `extra.json`: the training job
+writes that marker last, so its absence means a promotion was preempted
+mid-copy. Nothing else will ever clean that up -- the very invisibility that
+protects a good peak protects a torn one.
 
 SAFETY. Dry-run is the default: it prints the plan and touches nothing; `--go`
 is required to delete. Keeping the latest unconditionally is what makes this
@@ -59,10 +73,17 @@ import subprocess
 import sys
 
 _STEP_RE = re.compile(r"^step_(\d+)(?:_.*)?$")
-# The promoted peak. NOT matched by `_STEP_RE` by design -- see the module
-# docstring; the training job (`utils/ckpt_util.py::promote_best_checkpoint`)
-# picks the name for exactly that reason.
-_BEST_RE = re.compile(r"^checkpoint_best_(\d+)$")
+# The promoted peaks, BOTH SHAPES: `checkpoint_best_<slug>_<N>` and the legacy
+# `checkpoint_best_<N>` (the optional group). Neither is matched by `_STEP_RE`,
+# by design -- see the module docstring; the training job
+# (`utils/ckpt_util.py::promote_best_checkpoint`) picks the names for exactly
+# that reason.
+#
+# The step is read unambiguously even out of a slug full of underscores and
+# digits (`D16_ema_acc`): `\d+$` is anchored, so the separator can only be an `_`
+# whose entire tail is digits, and a digits-only tail contains no `_` -- exactly
+# one position qualifies.
+_BEST_RE = re.compile(r"^checkpoint_best_(?:.+?_)?(\d+)$")
 _DEFAULT_ROOT = f"/cns/yuskedq-d/home/{os.environ.get('USER', 'qiaos')}"
 _PARALLEL = 24
 
@@ -116,12 +137,16 @@ def find_ckpt_dir(root: str, run: str) -> str | None:
 def plan_for(ckpt_dir: str, milestone: int) -> tuple[list[str], list[str], str | None, list[str]]:
     """(keep, delete, skip_reason, best) for one checkpoints/ directory.
 
-    `best` is the COMPLETE `checkpoint_best_<N>` directories, reported so the
-    space they hold is visible; they are never in `delete`. A `checkpoint_best_`
+    `best` is the COMPLETE best-checkpoint copies, in either naming shape,
+    reported so the space they hold is visible; they are never in `delete`. One
     with no `extra.json` IS in `delete` -- see the module docstring.
+
+    Keyed by NAME and not by step, because a run tracking two metrics has two
+    peaks and they need not agree on a step; keying by step would silently drop
+    one of them from the report and from the retained set.
     """
     steps: dict[int, str] = {}
-    bests: dict[int, str] = {}
+    bests: dict[str, int] = {}
     extras: list[str] = []
     for name in _ls(ckpt_dir):
         m = _STEP_RE.match(name)
@@ -130,7 +155,7 @@ def plan_for(ckpt_dir: str, milestone: int) -> tuple[list[str], list[str], str |
             continue
         b = _BEST_RE.match(name)
         if b:
-            bests[int(b.group(1))] = name
+            bests[name] = int(b.group(1))
         else:
             extras.append(name)
     if not steps and not bests:
@@ -154,8 +179,8 @@ def plan_for(ckpt_dir: str, milestone: int) -> tuple[list[str], list[str], str |
     # part-way; nothing else will ever collect that, because the name is outside
     # every step-based sweep's namespace -- the same property that keeps a good
     # peak safe from this script.
-    best = [bests[s] for s in sorted(bests) if _has_extra(bests[s])]
-    torn_best = [bests[s] for s in sorted(bests) if bests[s] not in set(best)]
+    best = [n for n in sorted(bests, key=lambda n: (bests[n], n)) if _has_extra(n)]
+    torn_best = [n for n in sorted(bests, key=lambda n: (bests[n], n)) if n not in set(best)]
     if not steps:
         # A run swept down to just its peak. `best` still travels back, and the
         # caller prints it before honouring the skip.
@@ -228,7 +253,7 @@ def main() -> int:
         print(f"No run directories under {args.root} (or it is unreadable).")
         return 1
 
-    print(f"{'DELETING' if args.go else 'DRY RUN'} | root={args.root} | keep: latest + every {args.milestone} steps + every checkpoint_best_")
+    print(f"{'DELETING' if args.go else 'DRY RUN'} | root={args.root} | keep: latest + every {args.milestone} steps + every checkpoint_best_* (both naming shapes)")
     print(f"Scanning {len(runs)} run director{'y' if len(runs)==1 else 'ies'}...\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=_PARALLEL) as pool:
@@ -254,7 +279,7 @@ def main() -> int:
         victims += [f"{live[run]}/{d}" for d in delete]
         if delete and not args.quiet:
             kept = ", ".join(k.replace("step_", "") for k in keep[:6]) + (" ..." if len(keep) > 6 else "")
-            peak = "".join(f" +peak {b.replace('checkpoint_best_', '')}" for b in best)
+            peak = "".join(f" +peak {b[len('checkpoint_best_'):]}" for b in best)
             print(f"  {run}: delete {len(delete)}, keep {len(keep)} ({kept}){peak}")
 
     for run, why in skipped:
