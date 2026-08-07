@@ -14,11 +14,26 @@ WHAT IT KEEPS, per run directory:
   1. the LATEST checkpoint -- ALWAYS, no exceptions
   2. the newest COMPLETE checkpoint, when the latest is a torn write
   3. every step that is a multiple of --milestone (default 50000)
-  4. anything that is not a `step_<N>` directory
+  4. every COMPLETE `checkpoint_best_<N>` -- the run's peak
+  5. anything that is not a `step_<N>` directory
 
 Everything else goes. Quota counts bytes AFTER replication, so the space
 recovered is roughly 2.9x the payload deleted under `r=3.2` (see
 wiki_agents/storage.md).
+
+`checkpoint_best_<N>` IS ALREADY SAFE FROM RULE 5 -- the name is deliberately
+outside the `step_<N>` namespace `_STEP_RE` matches, precisely so no step-based
+GC has to be taught about it. It is called out anyway because a peak is the one
+checkpoint that cannot be re-created: it survives its own run's retention, so
+the only thing left that could delete it is a human sweeping a cell by hand.
+The plan therefore REPORTS the space it occupies rather than hiding it -- one
+extra checkpoint per run is real when a cell holds a thousand of them, and a
+number nobody can see is a number nobody can decide about.
+
+The ONE it does delete is a `checkpoint_best_<N>` with no `extra.json`: the
+training job writes that marker last, so its absence means a promotion was
+preempted mid-copy. Nothing else will ever clean that up -- the very
+invisibility that protects a good peak protects a torn one.
 
 SAFETY. Dry-run is the default: it prints the plan and touches nothing; `--go`
 is required to delete. Keeping the latest unconditionally is what makes this
@@ -44,6 +59,10 @@ import subprocess
 import sys
 
 _STEP_RE = re.compile(r"^step_(\d+)(?:_.*)?$")
+# The promoted peak. NOT matched by `_STEP_RE` by design -- see the module
+# docstring; the training job (`utils/ckpt_util.py::promote_best_checkpoint`)
+# picks the name for exactly that reason.
+_BEST_RE = re.compile(r"^checkpoint_best_(\d+)$")
 _DEFAULT_ROOT = f"/cns/yuskedq-d/home/{os.environ.get('USER', 'qiaos')}"
 _PARALLEL = 24
 
@@ -94,18 +113,53 @@ def find_ckpt_dir(root: str, run: str) -> str | None:
     return None
 
 
-def plan_for(ckpt_dir: str, milestone: int) -> tuple[list[str], list[str], str | None]:
-    """(keep, delete, skip_reason) for one checkpoints/ directory."""
+def plan_for(ckpt_dir: str, milestone: int) -> tuple[list[str], list[str], str | None, list[str]]:
+    """(keep, delete, skip_reason, best) for one checkpoints/ directory.
+
+    `best` is the COMPLETE `checkpoint_best_<N>` directories, reported so the
+    space they hold is visible; they are never in `delete`. A `checkpoint_best_`
+    with no `extra.json` IS in `delete` -- see the module docstring.
+    """
     steps: dict[int, str] = {}
+    bests: dict[int, str] = {}
     extras: list[str] = []
     for name in _ls(ckpt_dir):
         m = _STEP_RE.match(name)
         if m:
             steps[int(m.group(1))] = name
+            continue
+        b = _BEST_RE.match(name)
+        if b:
+            bests[int(b.group(1))] = name
         else:
             extras.append(name)
+    if not steps and not bests:
+        return [], [], "no step_ dirs", []
+
+    # ONE recursive listing, not one per directory. Probing each `step_<N>/` for
+    # its extra.json serially cost ~4 minutes on a 60-checkpoint run: the round
+    # trips dominate, and there are `len(steps)` of them. `ls -R` pays a single
+    # round trip for the whole tree (see wiki_agents/storage.md: "cost is round
+    # trips, not bytes").
+    rc, out = _run(["fileutil", "ls", "-R", ckpt_dir], timeout=600)
+    listed = rc == 0 and bool(out.strip())
+
+    def _has_extra(name: str) -> bool:
+        if listed:
+            return f"/{name}/extra.json" in out
+        return "extra.json" in _ls(f"{ckpt_dir}/{name}")  # slow probe, never a guess
+
+    # THE PEAK IS NEVER DELETED, and a torn one always is. `extra.json` is
+    # written last by the promotion, so its absence means the copy was preempted
+    # part-way; nothing else will ever collect that, because the name is outside
+    # every step-based sweep's namespace -- the same property that keeps a good
+    # peak safe from this script.
+    best = [bests[s] for s in sorted(bests) if _has_extra(bests[s])]
+    torn_best = [bests[s] for s in sorted(bests) if bests[s] not in set(best)]
     if not steps:
-        return [], [], "no step_ dirs"
+        # A run swept down to just its peak. `best` still travels back, and the
+        # caller prints it before honouring the skip.
+        return [], torn_best, None if torn_best else "no step_ dirs", best
 
     # THE LATEST STEP IS ALWAYS KEPT, unconditionally.
     #
@@ -118,24 +172,40 @@ def plan_for(ckpt_dir: str, milestone: int) -> tuple[list[str], list[str], str |
     # recoverable at any price. Keep the newest COMPLETE step too, so a run
     # whose latest is a torn write still retains something restorable.
     latest = max(steps)
-    # ONE recursive listing, not one per step. Probing each `step_<N>/` for its
-    # extra.json serially cost ~4 minutes on a 60-checkpoint run: the round
-    # trips dominate, and there are `len(steps)` of them. `ls -R` pays a single
-    # round trip for the whole tree (see wiki_agents/storage.md: "cost is round
-    # trips, not bytes").
-    rc, out = _run(["fileutil", "ls", "-R", ckpt_dir], timeout=600)
-    if rc == 0 and out.strip():
-        complete = [s for s in steps if f"/{steps[s]}/extra.json" in out]
-    else:  # fall back to the slow probe rather than guessing wrong
-        complete = [s for s in steps if "extra.json" in _ls(f"{ckpt_dir}/{steps[s]}")]
+    complete = [s for s in steps if _has_extra(steps[s])]
 
     keep_steps = {latest}
     if complete:
         keep_steps.add(max(complete))
     keep_steps |= {s for s in steps if milestone > 0 and s % milestone == 0}
     keep = [steps[s] for s in sorted(keep_steps)]
-    delete = [steps[s] for s in sorted(steps) if s not in keep_steps]
-    return keep, delete, None
+    delete = [steps[s] for s in sorted(steps) if s not in keep_steps] + torn_best
+    return keep, delete, None, best
+
+
+def _report_best(bests: list[str], *, measure: bool) -> None:
+    """Print the retained peaks and what they cost. Never deletes anything.
+
+    Separate from the delete plan on purpose: these are RETAINED, and printing
+    them beside the victims would read as a deletion list.
+    """
+    if not bests:
+        return
+    print(f"\nRETAINED PEAKS ({len(bests)}) -- never deleted, and no run's own retention removes them either:")
+    held = 0
+    if measure:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_PARALLEL) as pool:
+            sizes = list(pool.map(_du_bytes, bests))
+        held = sum(sizes)
+        for path, size in zip(bests, sizes):
+            print(f"  {_gib(size):6.1f} GiB  {path}")
+        print(f"  payload {_gib(held):.1f} GiB  ->  about {_gib(held) * 2.89:.0f} GiB of quota at r=3.2")
+    else:
+        for path in bests:
+            print(f"  {path}")
+        print("  (size not measured; drop --no-size to price them)")
+    print("  Delete one only by hand, and only knowingly: it is the peak-scoring")
+    print("  checkpoint of its run, and its step is off the retention ladder.")
 
 
 def main() -> int:
@@ -158,7 +228,7 @@ def main() -> int:
         print(f"No run directories under {args.root} (or it is unreadable).")
         return 1
 
-    print(f"{'DELETING' if args.go else 'DRY RUN'} | root={args.root} | keep: latest + every {args.milestone} steps")
+    print(f"{'DELETING' if args.go else 'DRY RUN'} | root={args.root} | keep: latest + every {args.milestone} steps + every checkpoint_best_")
     print(f"Scanning {len(runs)} run director{'y' if len(runs)==1 else 'ies'}...\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=_PARALLEL) as pool:
@@ -168,9 +238,14 @@ def main() -> int:
 
     total_del = total_keep = 0
     victims: list[str] = []
+    bests: list[str] = []
     skipped: list[tuple[str, str]] = []
     for run in sorted(plans):
-        keep, delete, skip = plans[run]
+        keep, delete, skip, best = plans[run]
+        # BEFORE the skip, deliberately. A run whose steps have all been swept
+        # already still holds its peak, and that is exactly the run whose peak
+        # would otherwise be invisible -- there is nothing else left to print.
+        bests += [f"{live[run]}/{b}" for b in best]
         if skip:
             skipped.append((run, skip))
             continue
@@ -179,10 +254,18 @@ def main() -> int:
         victims += [f"{live[run]}/{d}" for d in delete]
         if delete and not args.quiet:
             kept = ", ".join(k.replace("step_", "") for k in keep[:6]) + (" ..." if len(keep) > 6 else "")
-            print(f"  {run}: delete {len(delete)}, keep {len(keep)} ({kept})")
+            peak = "".join(f" +peak {b.replace('checkpoint_best_', '')}" for b in best)
+            print(f"  {run}: delete {len(delete)}, keep {len(keep)} ({kept}){peak}")
 
     for run, why in skipped:
         print(f"  SKIP {run}: {why}")
+
+    # THE PEAKS ARE REPORTED EVEN WHEN THERE IS NOTHING TO DELETE. They are the
+    # one class of checkpoint this script will not touch and no run's own
+    # retention will either, so a cell fills with them quietly. Someone sweeping
+    # a cell needs to see the space before deciding, and "invisible to the GC"
+    # must not also mean invisible to the human.
+    _report_best(bests, measure=not args.no_size)
 
     if not victims:
         print("\nNothing to delete.")
