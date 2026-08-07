@@ -63,6 +63,55 @@ _CELL_BUCKETS = {
     'yuskedq': '/cns/yuskedq-d/home/qiaos/eqr_data',
 }
 
+# WHERE A v7 JOB SHOULD PREFER TO LAND, best tier first.
+#
+# The scheduler ranks on capacity and price, and knows nothing about where our
+# storage is -- which is how jobs kept landing in `ske`: most chips in the
+# fleet, and the only metro of the four with NO team storage at all, so every
+# byte lands on the personal 500 GiB ceiling. Exhausting that ceiling poisons
+# every write in the cell, including the log mirror, which is how one run
+# trained 130k steps and produced four 0-byte logs.
+#
+# So we express a PREFERENCE, not a ban. `ske` stays usable -- it is real
+# capacity and the personal quota is fine as long as `tpu gc` keeps it swept --
+# it just goes last.
+#
+# Tier 1: the three metros datasets are actually mirrored into
+#         (research/v7_storage_placement.md). Compute, data and checkpoints all
+#         local, charged to the group's PiB.
+# Tier 2: other metros with PiB-scale group quota. Safe for checkpoints, but the
+#         dataset may need staging first.
+# Tier 3: no team storage in the metro; personal ceiling only. Last resort.
+_CELL_TIERS = (
+    ('cbf/tul/lpp (mirrored data, group quota)',
+     ('yucbfiv', 'yucbful', 'yucbfwv', 'je', 'yutulpz', 'yulpptr')),
+    ('other metros with group quota',
+     ('sk', 'sn', 'so', 'yumrnel', 'el', 'mb', 'yudfwra')),
+    ('no team storage -- personal 500 GiB only',
+     ('yuskedq',)),
+)
+
+
+def _preferred_cells(spec: str) -> list[str]:
+    """Cells to allow, best-first. `spec` is 'auto', 'off', or a cell list."""
+    spec = (spec or '').strip()
+    if not spec or spec.lower() == 'off':
+        return []
+    if spec.lower() != 'auto':
+        return [c.strip() for c in spec.split(',') if c.strip()]
+    cells: list[str] = []
+    for _, tier in _CELL_TIERS:
+        cells.extend(tier)
+    return cells
+
+
+def _describe_cell_choice(cells: list[str]) -> None:
+    """Print which tier each allowed cell came from, so the choice is auditable."""
+    for label, tier in _CELL_TIERS:
+        present = [c for c in cells if c in tier]
+        if present:
+            print(f"[locality]   {label}: {' '.join(present)}")
+
 
 def _read_legacy_mapping():
     """Archived job registry (`tpu clear` moves entries here). {} if absent.
@@ -89,6 +138,16 @@ def _local_bucket() -> str:
         if name == cell:
             print(f"[locality] cell={cell}: using co-located bucket {bucket}")
             return bucket
+    # NO PINNED CELL. Under --cell_prefer the scheduler picks from a whole tier,
+    # so the landing cell is not knowable here and the bucket cannot be matched
+    # to it. That is a real hazard rather than a cosmetic one: a checkpoint
+    # prefix a metro away costs 4-5x throughput and gets the job pruned
+    # mid-run (storage.md). Say so, rather than letting the default look
+    # deliberate. Pin --cell, or pass --bucket for a location you have chosen.
+    if _CELL_PREFER.value and _CELL_PREFER.value.lower() not in ('off',):
+        print(f"[locality] NOTE: no --cell pinned, so the bucket cannot be matched "
+              f"to the landing cell; using {_BUCKET.value!r}. If that is not in the "
+              f"metro this job lands in, pass --bucket or --cell explicitly.")
     return _BUCKET.value
 
 
@@ -210,6 +269,14 @@ _LOAD_FROM = flags.DEFINE_string(
 _WANDB_RESUME_ID = flags.DEFINE_string(
     'wandb_resume_id', '',
     'Run id to resume experiment tracking under. Exported as $WANDB_RESUME_ID.'
+)
+_CELL_PREFER = flags.DEFINE_string(
+    'cell_prefer', 'auto',
+    "Where the scheduler may place this job, best-first. 'auto' (default) uses "
+    "the storage-aware tiers in _CELL_TIERS: the mirrored-data metros first, "
+    "other group-quota metros next, and cells with no team storage last. "
+    "'off' disables the constraint entirely. A comma-separated cell list "
+    "overrides the tiers. IGNORED when --cell pins one cell explicitly."
 )
 _CELL = flags.DEFINE_string(
     'cell', '',
@@ -460,7 +527,46 @@ def main(argv) -> None:
             if alloc_str:
                 req_kwargs['allocator'] = alloc_str
             if _CELL.value:
+                # An explicit cell wins outright: pin it, and do not also send
+                # spatial-flexibility constraints, which are only read when the
+                # location is 'viglobal' and would be silently ignored anyway.
                 req_kwargs['location'] = _CELL.value
+            else:
+                # NO EXPLICIT CELL -> let XBorg choose, but only from cells we
+                # have storage in, best tier first.
+                #
+                # `allowed_locations` is read ONLY when location == 'viglobal'
+                # ("Unused if the job location is not viglobal",
+                # xm/resources.py), so the two have to be set together -- which
+                # is also what rs.Location does internally
+                # (resource_selector/constraints.py::add_viglobal_requirement).
+                #
+                # FAIL-OPEN on purpose. The xmanager constraint classes cannot
+                # be imported or exercised from a workstation, so this path is
+                # only ever executed for real at submit time. If anything about
+                # it is wrong, the job must still launch the way it did before
+                # this feature existed -- placement is an optimisation, and a
+                # launcher that refuses to submit is worse than one that places
+                # a job suboptimally.
+                cells = _preferred_cells(_CELL_PREFER.value)
+                if cells:
+                    try:
+                        from xmanager.xm_abc import constraints as _abc_constraints
+
+                        req_kwargs['location'] = 'viglobal'
+                        req_kwargs['spatial_flexibility_constraints'] = (
+                            _abc_constraints.SpatialFlexibilityConstraints(
+                                allowed_locations=list(cells)
+                            )
+                        )
+                        print(f"[locality] no --cell given; allowing {len(cells)} cell(s) "
+                              f"via viglobal (--cell_prefer={_CELL_PREFER.value}):")
+                        _describe_cell_choice(list(cells))
+                    except Exception as exc:  # noqa: BLE001 - placement must never block a launch
+                        req_kwargs.pop('spatial_flexibility_constraints', None)
+                        req_kwargs.pop('location', None)
+                        print(f"[locality] could not apply cell preference ({exc}); "
+                              "letting the allocator choose, as before.")
             tier_val = None
             for a in argv[1:]:
                 if a.startswith('--tier='):

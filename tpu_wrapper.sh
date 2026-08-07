@@ -183,6 +183,7 @@ tpu() {
     local lo_price=""
     local no_limit_order=0
     local user_cell=""
+    local resume_xid=""
     local passthrough_args=()
     
     while [[ $# -gt 0 ]]; do
@@ -257,7 +258,14 @@ tpu() {
           passthrough_args+=("--${1#--app.}")
           shift
           ;;
-        --exp_name=*|--config=*|--bucket=*|--workdir=*|--resume_xid=*|--config.*)
+        --resume_xid=*)
+          # Remembered, not just forwarded: a resume must re-run the ORIGINAL
+          # snapshot, so the staging step below has to know this is one.
+          resume_xid="${1#*=}"
+          passthrough_args+=("$1")
+          shift
+          ;;
+        --exp_name=*|--config=*|--bucket=*|--workdir=*|--config.*)
           passthrough_args+=("$1")
           shift
           ;;
@@ -452,6 +460,55 @@ print(d['group'], d['tpu_type'], d['status'],
     
     local stagedir="experimental/qiaos/eqr_jax_final_stages/eqr_run_${now}"
     local abs_stagedir="/google/src/cloud/qiaos/EqR-jax/google3/${stagedir}"
+
+    # A RESUME RE-RUNS THE ORIGINAL SNAPSHOT. NEVER THE CURRENT CHECKOUT.
+    #
+    # Packaging the working tree instead is how a resume ends up running code
+    # the checkpoint has never seen. Two ways it bites, both observed:
+    #
+    #   * the config dialect moves on. `training.epochs` / `max_steps` /
+    #     `train_epochs_per_iter` were retired in favour of `total_steps`, and
+    #     the new validator REFUSES the old spelling -- so recovering a run's
+    #     own config out of its snapshot and feeding it to today's binary dies
+    #     at flag-parse time, after a full packaging round.
+    #   * the parameter tree moves on. A new default that adds or renames a
+    #     module makes the checkpoint unrestorable, which surfaces as a
+    #     CheckpointMismatchError minutes into the job.
+    #
+    # The snapshot is immutable and already built, so reusing it is also
+    # strictly cheaper. Deliberate code changes belong in a NEW experiment,
+    # where the comparison is honest, not smuggled in through a resume.
+    if [ -n "$resume_xid" ]; then
+      local prior_stagedir
+      prior_stagedir=$(python3 -c "import json,os
+d={}
+for f in ('~/.tpu_jobs.json','~/.tpu_jobs_legacy.json'):
+    try:
+        d.update(json.load(open(os.path.expanduser(f))))
+    except Exception:
+        pass
+print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
+      if [ -z "$prior_stagedir" ]; then
+        echo -e "\033[31m[resume] No stagedir recorded for XID $resume_xid.\033[0m"
+        echo -e "\033[31m  Looked in ~/.tpu_jobs.json and ~/.tpu_jobs_legacy.json.\033[0m"
+        echo -e "\033[31m  Refusing to package the current checkout: a resume must re-run the\033[0m"
+        echo -e "\033[31m  original snapshot. Pass --stagedir=<path> if you know it.\033[0m"
+        return 1
+      fi
+      stagedir="$prior_stagedir"
+      abs_stagedir="/google/src/cloud/qiaos/EqR-jax/google3/${stagedir}"
+      if [ ! -d "$abs_stagedir" ]; then
+        echo -e "\033[31m[resume] Recorded stagedir is gone: $abs_stagedir\033[0m"
+        echo -e "\033[31m  Cannot resume XID $resume_xid without the code it ran.\033[0m"
+        return 1
+      fi
+      echo -e "\033[32m[resume] Re-using the ORIGINAL snapshot (not the working tree):\033[0m"
+      echo -e "\033[32m  $abs_stagedir\033[0m"
+      echo -e "\033[2m  Local edits are deliberately NOT packaged. Launch a new experiment for those.\033[0m"
+      export TPU_STAGEDIR="$abs_stagedir"
+      export TPU_LOGDIR="$logdir"
+      cd "$abs_stagedir"
+    else
     mkdir -p "$abs_stagedir"
     echo "Snapshotting source codebase to CitC stagedir: $abs_stagedir"
     rsync -aL --exclude={'bazel-*','.citc','.git','__pycache__','*.npy','*.npz','*.ckpt','*.pth','*.pt','*.safetensors','data','logs','wandb'} ./ "$abs_stagedir/"
@@ -468,7 +525,8 @@ print(d['group'], d['tpu_type'], d['status'],
     export TPU_STAGEDIR="$abs_stagedir"
     export TPU_LOGDIR="$logdir"
     cd "$abs_stagedir"
-    
+    fi
+
     # Process multiple groups (e.g. 1,2)
     IFS=',' read -ra GROUP_ARRAY <<< "$group"
     if [ ${#GROUP_ARRAY[@]} -gt 1 ]; then
