@@ -7,7 +7,10 @@ xmanager launch xm_launch.py -- \
   --config="remote_run" \
   --workdir="~/logs/eqr-run"
 """
+import os
 import re
+import subprocess
+import sys
 
 from absl import app
 from absl import flags
@@ -208,12 +211,127 @@ _RAM_GIB = flags.DEFINE_float(
 # ask and put the job 824-deep in a best-effort queue. An integer flag has 1 GiB
 # as its floor, so there was no way to ask for the ~64 MiB actually needed.
 _TMP_RAM_FS_GIB = flags.DEFINE_float(
-    'tmp_ram_fs_gib', 16,
-    'Size of the per-task RAM disk backing /tmp, in GiB. Must exceed whatever '
-    'the job stages locally (dataset copies, scratch). Fractional values are '
-    'allowed and matter: this is RAM, it is charged to the job\'s memory '
-    'request, and on a best-effort tier an oversized request is queue time.'
+    'tmp_ram_fs_gib', 0,
+    'Size of the per-task RAM disk backing /tmp, in GiB. 0 (default) MEASURES '
+    'the dataset the config names and sizes the disk to fit it; any positive '
+    'value overrides that. Must exceed whatever the job stages locally '
+    '(dataset copies, scratch). Fractional values are allowed and matter: this '
+    'is RAM, it is charged to the job\'s memory request, and on a best-effort '
+    'tier an oversized request is queue time.'
 )
+
+# What `tmp_ram_fs_gib: 0` resolves to when the dataset cannot be measured --
+# an unreadable path, a config the launcher cannot parse, a corpus generated on
+# the fly. The historical default, so a job that measures nothing behaves
+# exactly as it did before auto-sizing existed.
+_TMP_RAM_FS_FALLBACK_GIB = 16.0
+# Multiplied onto the measured payload. The job writes the bytes it read plus
+# scratch, and a RAM disk that is exactly the payload fails on the last chunk.
+_TMP_RAM_FS_HEADROOM = 1.35
+# Never ask for less than this even for a tiny corpus: the runfiles tree, logs
+# and orbax scratch all live in the same /tmp.
+_TMP_RAM_FS_FLOOR_GIB = 4.0
+# Refuse to auto-size beyond this; past it something is wrong with the estimate
+# and a silent 500 GiB memory request would never schedule. An explicit
+# --tmp_ram_fs_gib still goes through, because the operator has looked.
+_TMP_RAM_FS_CEILING_GIB = 96.0
+
+
+def _measure_remote_dataset_gib(path: str) -> float:
+    """GiB the job will stage from `path`, or 0.0 if it cannot be measured.
+
+    RETURNS 0.0 RATHER THAN RAISING, and every caller treats 0.0 as "unknown"
+    and falls back. This runs on the submit path of every job: a sizing helper
+    that can abort a launch has negative value, exactly like the in-job metric
+    guards (`wiki_agents/engineering.md`: do not let a diagnostic kill the thing
+    it watches).
+
+    Only `/cns/` is measured. A local path is not staged at all (the reader
+    mmaps it in place), and `gs://` needs a different CLI that the submit path
+    should not be shelling out to.
+
+    `ls -l` PER SPLIT, NOT `du -s` ON THE ROOT. These corpora keep their
+    generation shards beside the merged payload -- 90,002 directories holding
+    450,010 files for one corpus -- and `du` walks all of it: measured, it had
+    not returned after 90s and was killed, which would stall every launch by
+    that much. The merged `.npy` files sit flat in each split, so a non-recursive
+    listing that sums the file column is both complete and ~4s. Directories are
+    skipped by the leading-`d` test, which is exactly what excludes `shards/`.
+    """
+    if not path or not path.startswith('/cns/'):
+        return 0.0
+    total = 0
+    seen_any = False
+    for split in ('train', 'test'):
+        try:
+            out = subprocess.run(
+                ['fileutil', 'ls', '-l', f'{path}/{split}'],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception:  # noqa: BLE001 -- never fail a launch on a size estimate
+            continue
+        if out.returncode != 0:
+            continue
+        for line in out.stdout.splitlines():
+            if not line or line.startswith('d'):
+                continue  # a directory -- `shards/`, which is not staged
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            try:
+                total += int(parts[4])
+                seen_any = True
+            except ValueError:
+                continue
+    return total / float(1 << 30) if seen_any else 0.0
+
+
+def _resolve_tmp_ram_fs_gib(config_obj) -> float:
+    """The RAM disk this job needs, in GiB.
+
+    WHY THIS IS MEASURED RATHER THAN RAISED FOR EVERYONE. The disk is real RAM
+    charged to the job's memory request, and the request is the queue wait --
+    one measured case put a job 824-deep in a best-effort queue for asking a
+    whole GiB to stage an 18 MB shard. So "just make the default big" trades a
+    rare crash for a permanent scheduling tax on every job. Measuring costs one
+    `fileutil du` at submit time and charges each job for what it actually
+    stages.
+
+    The failure this replaces: staging a 36 GB corpus into the old fixed 16 GiB
+    default dies with `OSError: [Errno 28] No space left on device` inside
+    `data_util._copy_file`, mid-download, after the slice is already allocated.
+    Borg retries it, so it burns the restart budget and reads as a hardware
+    fault -- the surface errors were `Fish chip setup` and `Job terminated in
+    state FAILURE`, neither of which names the disk.
+    """
+    explicit = _TMP_RAM_FS_GIB.value
+    if explicit and explicit > 0:
+        return float(explicit)
+
+    dataset_path = ''
+    try:
+        sys.path.insert(0, os.getcwd())
+        from dataset import data_util  # noqa: PLC0415 -- optional, project-local
+        name = str(config_obj.dataset.name)
+        dataset_path = data_util.DATASET_PATHS.get(name, name)
+    except Exception:  # noqa: BLE001 -- not every project has this module
+        dataset_path = ''
+
+    measured = _measure_remote_dataset_gib(dataset_path)
+    if measured <= 0.0:
+        print(f"[ramdisk] dataset not measurable ({dataset_path or 'unknown'}); "
+              f"using {_TMP_RAM_FS_FALLBACK_GIB:g} GiB")
+        return _TMP_RAM_FS_FALLBACK_GIB
+
+    want = max(measured * _TMP_RAM_FS_HEADROOM, _TMP_RAM_FS_FLOOR_GIB)
+    if want > _TMP_RAM_FS_CEILING_GIB:
+        print(f"[ramdisk] measured {measured:.1f} GiB at {dataset_path}, which "
+              f"wants {want:.1f} GiB -- above the {_TMP_RAM_FS_CEILING_GIB:g} GiB "
+              f"auto-size ceiling. Capping; pass --tmp_ram_fs_gib to override.")
+        want = _TMP_RAM_FS_CEILING_GIB
+    print(f"[ramdisk] {dataset_path} measures {measured:.1f} GiB -> "
+          f"/tmp sized {want:.1f} GiB (x{_TMP_RAM_FS_HEADROOM} headroom)")
+    return want
 # Every job this launcher has ever submitted ran as exactly ONE task, because
 # `xm.JobRequirements` defaults `replicas` to 1 and nothing here ever set it.
 # That is right for a TPU trainer -- one work unit drives the whole slice -- and
@@ -369,6 +487,7 @@ def _preflight_resume_config(bucket_cp_path: str, xid: str) -> None:
 def main(argv) -> None:
     exp_name = _EXP_NAME.value
     # --- Auto-Load WandB name or fallbacks ---
+    cfg = None
     try:
         from configs import load_config
         cfg = load_config.get_config(_CONFIG.value)
@@ -379,6 +498,11 @@ def main(argv) -> None:
                 exp_name = cfg.wandb.run_name
     except Exception:
         pass
+    # ONCE, not per tpu_type: `--tpu_type=a,b` builds one executor per entry and
+    # the answer is a property of the DATASET, so measuring inside that loop
+    # would shell out to `fileutil du` once per candidate for one identical
+    # number.
+    tmp_ram_fs_gib = _resolve_tmp_ram_fs_gib(cfg)
     for arg in argv[1:]:
         if arg.startswith('--config.wandb.notes='):
             exp_name = arg.split('=', 1)[1]
@@ -513,7 +637,7 @@ def main(argv) -> None:
             # requests (xm_launch.py:238).
             # int(): a fractional GiB must still lower to a whole number of
             # bytes, or the BCL carries a float and Borg rejects it.
-            req_kwargs['tmp_ram_fs'] = int(_TMP_RAM_FS_GIB.value * xm.GiB)
+            req_kwargs['tmp_ram_fs'] = int(tmp_ram_fs_gib * xm.GiB)
             if _RAM_GIB.value > 0:
                 req_kwargs['ram'] = int(_RAM_GIB.value * xm.GiB)
             # `replicas` is the task count. Emitted only above 1, so a job that
