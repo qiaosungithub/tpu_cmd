@@ -286,6 +286,65 @@ def _measure_remote_dataset_gib(path: str) -> float:
     return total / float(1 << 30) if seen_any else 0.0
 
 
+def _dataset_name_from_yaml() -> str:
+    """`dataset.name` read TEXTUALLY out of the run's yaml, or ''.
+
+    DELIBERATELY NOT `from configs import load_config`. This launcher is executed
+    by `xmanager launch`, which runs it under a HERMETIC interpreter that has
+    none of the project's dependencies -- so importing the project's config
+    loader raises, the caller's `except` swallows it, and auto-sizing silently
+    falls back to the default. That is exactly how the first version of this
+    feature failed: it worked in every hand-run test (a conda python, in the
+    stagedir, where the import succeeds) and did nothing at all under the real
+    launcher, which is the only place it matters.
+
+    A five-line scan of the yaml has no dependencies and cannot fail that way.
+    It only has to find one key, and if the file is templated or absent the
+    caller falls back exactly as before.
+    """
+    for candidate in (f'configs/{_CONFIG.value}_config.yml',
+                      f'configs/{_CONFIG.value}_config.yaml'):
+        try:
+            with open(candidate, 'r') as handle:
+                in_dataset = False
+                for raw in handle:
+                    line = raw.rstrip('\n')
+                    if not line.strip() or line.lstrip().startswith('#'):
+                        continue
+                    if not line[:1].isspace():           # a top-level key
+                        in_dataset = line.startswith('dataset:')
+                        continue
+                    if in_dataset and line.strip().startswith('name:'):
+                        return line.split(':', 1)[1].strip().strip('\'"')
+        except OSError:
+            continue
+    return ''
+
+
+# Dataset alias -> CNS root, for sizing ONLY. A DUPLICATE of the project's own
+# `dataset/data_util.py::DATASET_PATHS`, and duplicated on purpose: see
+# `_dataset_name_from_yaml` for why this file cannot import that module.
+#
+# Drift here is SAFE BY CONSTRUCTION -- an alias this map does not know simply
+# measures nothing and falls back to the default, which is what every job did
+# before auto-sizing existed. It can never point a job at the wrong data: only
+# the RAM disk size is derived from it.
+_SIZING_DATASET_ROOTS = {
+    'Maze-period-easy': '/cns/is-d/home/qiaos/eqr_maze_settingA/maze-period-easy',
+    'Maze-period-hard': '/cns/is-d/home/qiaos/eqr_maze_settingA/maze-period-hard',
+}
+
+
+def _dataset_path_from_project() -> str:
+    """The CNS root of the configured dataset, or '' when it cannot be resolved."""
+    name = _dataset_name_from_yaml()
+    if not name:
+        return ''
+    if name.startswith('/cns/'):     # a literal path in the yaml
+        return name
+    return _SIZING_DATASET_ROOTS.get(name, '')
+
+
 def _resolve_tmp_ram_fs_gib(config_obj) -> float:
     """The RAM disk this job needs, in GiB.
 
@@ -308,14 +367,7 @@ def _resolve_tmp_ram_fs_gib(config_obj) -> float:
     if explicit and explicit > 0:
         return float(explicit)
 
-    dataset_path = ''
-    try:
-        sys.path.insert(0, os.getcwd())
-        from dataset import data_util  # noqa: PLC0415 -- optional, project-local
-        name = str(config_obj.dataset.name)
-        dataset_path = data_util.DATASET_PATHS.get(name, name)
-    except Exception:  # noqa: BLE001 -- not every project has this module
-        dataset_path = ''
+    dataset_path = _dataset_path_from_project()
 
     measured = _measure_remote_dataset_gib(dataset_path)
     if measured <= 0.0:
