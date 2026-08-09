@@ -589,10 +589,18 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       # and `binfsd` panics on a ~6h cycle during cache eviction; the remount
       # SIGBUSes every process holding an mmap of /google/bin. Nothing in the
       # launcher can catch that, so the check belongs out here.
-      local xid=$(grep -oP 'Launched experiment \K\d+' "$log_file" | head -n 1)
+      #
+      # ACCEPT BOTH LINES. XManager prints "Launched experiment" only when it
+      # CREATES one; a --resume_xid launch goes through get_experiment() and
+      # prints "Added N work unit(s) to experiment" instead. Matching only the
+      # first read every resume as a dead launch and re-ran the identical
+      # command, --resume_xid included, so a second work unit joined the same
+      # experiment and the two raced for one checkpoint path -- and, because
+      # registration sits under this same test, neither reached `tpu check`.
+      local xid=$(grep -oP '(?:Launched experiment|work unit\(s\) to experiment) \K\d+' "$log_file" | head -n 1)
 
       if [ -z "$xid" ]; then
-        echo -e "\033[31m[launch] No 'Launched experiment' line -- the launcher died before creating the experiment.\033[0m"
+        echo -e "\033[31m[launch] No experiment line -- the launcher died before creating or joining the experiment.\033[0m"
         if grep -qiE 'SIGBUS|Signal 7|bad local file header|FailureSignalHandler' "$log_file"; then
           echo -e "\033[33m  Signature matches the BinFS remount fault (binfsd restarts ~every 6h during cache eviction).\033[0m"
         fi
@@ -636,8 +644,10 @@ PYEOF
         if [ "${_TPU_LAUNCH_RETRIED:-0}" != "1" ]; then
           echo -e "\033[33m[launch] Retrying once (a fresh process re-mmaps /google/bin).\033[0m"
           export _TPU_LAUNCH_RETRIED=1
-          "${xm_args[@]}" 2>&1 | tee "$log_file"
-          xid=$(grep -oP 'Launched experiment \K\d+' "$log_file" | head -n 1)
+          # -a: the retry must not overwrite the first attempt's log. It used
+          # to, which erased the evidence of whatever killed attempt one.
+          "${xm_args[@]}" 2>&1 | tee -a "$log_file"
+          xid=$(grep -oP '(?:Launched experiment|work unit\(s\) to experiment) \K\d+' "$log_file" | head -n 1)
           unset _TPU_LAUNCH_RETRIED
           [ -n "$xid" ] && echo -e "\033[32m[launch] Retry succeeded: XID $xid\033[0m"
         fi
