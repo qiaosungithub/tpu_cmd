@@ -329,9 +329,22 @@ def _dataset_name_from_yaml() -> str:
 # measures nothing and falls back to the default, which is what every job did
 # before auto-sizing existed. It can never point a job at the wrong data: only
 # the RAM disk size is derived from it.
+#
+# UNLISTED IS NOT HARMLESS WHEN THE CORPUS IS HUGE. The fallback is 16 GiB, so
+# an alias missing here hands a 51 GiB corpus a 16 GiB RAM disk and the job dies
+# mid-copy in `data_util._copy_file` with `[Errno 28] No space left on device`
+# -- measured, xid 278952152. `[ramdisk] dataset not measurable` in the launch
+# log IS that failure, printed 20 minutes before it happens: read it.
 _SIZING_DATASET_ROOTS = {
     'Maze-period-easy': '/cns/is-d/home/qiaos/eqr_maze_settingA/maze-period-easy',
     'Maze-period-hard': '/cns/is-d/home/qiaos/eqr_maze_settingA/maze-period-hard',
+    # Setting B-v3 open-loop. Measured staged sizes (payload only, `seeds.npy`
+    # and `provenance.json` skipped by data_util._UNUSED_BY_TRAINING):
+    # easy 50.9 GiB / mid 58.3 GiB / adv 68.8 GiB -- so adv x1.35 lands at
+    # 92.8 GiB, just under the 96 GiB auto-size ceiling.
+    'Maze-b3-easy': '/cns/is-d/home/qiaos/eqr_maze_settingB_v3/maze-b3-easy',
+    'Maze-b3-mid': '/cns/is-d/home/qiaos/eqr_maze_settingB_v3/maze-b3-mid',
+    'Maze-b3-adv': '/cns/is-d/home/qiaos/eqr_maze_settingB_v3/maze-b3-adv',
 }
 
 
