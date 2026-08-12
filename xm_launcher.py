@@ -26,6 +26,16 @@ _CONFIG = flags.DEFINE_string(
     'config', 'remote_run', 'The configs/load_config.py:<mode> to run.'
 )
 
+_PUBLISH_GCS = flags.DEFINE_bool(
+    'publish_gcs', None,
+    'Publish this run (code snapshot + checkpoints) to the GCS rendezvous '
+    'bucket so the close-loop evaluator on the GPU VM can read it. UNSET '
+    '(default) auto-detects: on when the config sets `dataset.task`, i.e. a '
+    'RoboTwin run. Pass --publish_gcs / --nopublish_gcs to force either way. '
+    'The primary checkpoint stream still goes to --bucket (CNS) regardless; '
+    'this only adds a copy for a reader that cannot reach CNS.'
+)
+
 _BUCKET = flags.DEFINE_string(
     'bucket', '/cns/yutulpz-d/home/qiaos/eqr_data',
     'Durable root for checkpoints and mirrored logs. Defaults to CNS because a '
@@ -356,6 +366,130 @@ def _dataset_path_from_project() -> str:
     if name.startswith('/cns/'):     # a literal path in the yaml
         return name
     return _SIZING_DATASET_ROOTS.get(name, '')
+
+
+# --------------------------------------------------------------------------
+# RoboTwin close-loop eval: publish the run to a GCS rendezvous bucket.
+#
+# WHY A BUCKET AT ALL. The close-loop evaluator runs on a GCP A100 VM in
+# project `viscam-cloud`. That VM cannot read CNS -- no LOAS credential and no
+# `fileutil` (MEASURED on the box) -- and Borg cannot call the VM either: a
+# Borg task cannot even CREATE an IPv4 socket (`AF_INET` -> OSError errno 97,
+# MEASURED from inside a real task, XID 279103266), while the VM's public IP is
+# IPv4-only. The one channel proven from both ends is GCS: 0.3 ms from Borg
+# over IPv6, 120.8 MB/s to the VM. CNS stays the primary store; this is one
+# extra copy for the single reader that cannot reach it.
+#
+# THE MAPPING RULE, in one place (`utils/gcs_publish.py` repeats it for the
+# job side, and its tests pin it):
+#
+#     gs://<bucket>/runs/<xid>/
+#         stagedir/      the immutable CitC snapshot this job was built from,
+#                        uploaded ONCE here at launch
+#         checkpoints/   step_<n>/... mirrored by the job after each save,
+#                        `extra.json` LAST so a reader never sees a
+#                        complete-looking checkpoint with weights in flight
+#         meta.json      xid, exp_name, task, cns path, timestamps
+#
+# `stagedir/` and `checkpoints/` are SIBLINGS on purpose: the snapshot is
+# immutable and the checkpoint stream is append-only, and nesting them makes
+# "has the code changed?" unanswerable from a listing.
+# --------------------------------------------------------------------------
+
+#: us-east4 == the GPU VM's zone, so the VM reads without cross-region egress.
+_ROBOTWIN_EVAL_BUCKET = 'gs://qiaos-robotwin-eval-us-east4'
+
+
+def _robotwin_task_from_yaml() -> str:
+    """`dataset.task` read TEXTUALLY out of the run's yaml, or ''.
+
+    Same constraint as `_dataset_name_from_yaml`, and the same reason: this
+    launcher runs under `xmanager launch`'s HERMETIC interpreter, which has
+    none of the project's dependencies, so `from configs import load_config`
+    raises and any auto-detection built on it silently does nothing. A textual
+    scan cannot fail that way.
+
+    A non-empty `dataset.task` IS the RoboTwin marker: `configs/dp_default.py`
+    documents it as "the RoboTwin task to train on (e.g. click_bell)", and no
+    maze or sudoku config sets it.
+    """
+    for candidate in (f'configs/{_CONFIG.value}_config.yml',
+                      f'configs/{_CONFIG.value}_config.yaml'):
+        try:
+            with open(candidate, 'r') as handle:
+                in_dataset = False
+                for raw in handle:
+                    line = raw.rstrip('\n')
+                    if not line.strip() or line.lstrip().startswith('#'):
+                        continue
+                    if not line[:1].isspace():           # a top-level key
+                        in_dataset = line.startswith('dataset:')
+                        continue
+                    if in_dataset and line.strip().startswith('task:'):
+                        return line.split(':', 1)[1].strip().strip('\'"')
+        except OSError:
+            continue
+    return ''
+
+
+def _should_publish_to_gcs() -> bool:
+    """True when this run should be published for close-loop eval.
+
+    `--publish_gcs` is tri-state on purpose: unset means "decide from the
+    config" (RoboTwin runs publish, nothing else does), and an explicit
+    true/false overrides that -- so a one-off can publish without editing a
+    config, and a RoboTwin run can opt OUT without the launcher arguing.
+    """
+    if _PUBLISH_GCS.value is not None:
+        return bool(_PUBLISH_GCS.value)
+    return bool(_robotwin_task_from_yaml())
+
+
+def _publish_stagedir(xid: str, meta: dict) -> None:
+    """Upload the CitC snapshot + meta.json once, at launch. Never raises.
+
+    Runs on the WORKSTATION (which can read CitC and reach GCS), not in the
+    job -- the job's container has neither the snapshot nor a reason to upload
+    it. Failure is reported and ignored: a publish problem must not abort a
+    launch that is otherwise fine, and the evaluator simply finds no run.
+    """
+    import subprocess
+    stagedir = os.environ.get('TPU_STAGEDIR', '')
+    root = f'{_ROBOTWIN_EVAL_BUCKET}/runs/{xid}'
+    if not stagedir or not os.path.isdir(stagedir):
+        print(f'[gcs-publish] no readable TPU_STAGEDIR ({stagedir!r}); '
+              f'skipping the code snapshot upload for {xid}')
+    else:
+        print(f'[gcs-publish] {stagedir} -> {root}/stagedir')
+        try:
+            # `rsync -r` not `cp -r`: a relaunch onto the same XID re-uploads
+            # only what changed, and the snapshot is typically unchanged.
+            p = subprocess.run(
+                ['gcloud', 'storage', '-q', 'rsync', '-r',
+                 '-x', r'(^|/)(\.git|bazel-.*|__pycache__|wandb|logs)(/|$)',
+                 stagedir, f'{root}/stagedir'],
+                capture_output=True, text=True, timeout=900)
+            if p.returncode != 0:
+                print(f'[gcs-publish] WARNING: stagedir upload rc={p.returncode}: '
+                      f'{(p.stderr or "").strip()[-400:]}')
+            else:
+                print('[gcs-publish] stagedir uploaded')
+        except Exception as exc:  # noqa: BLE001 -- a publish must not fail a launch
+            print(f'[gcs-publish] WARNING: stagedir upload failed: '
+                  f'{type(exc).__name__}: {exc}')
+    try:
+        import json as _json
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as handle:
+            _json.dump(meta, handle, indent=2, sort_keys=True, default=str)
+            tmp = handle.name
+        subprocess.run(['gcloud', 'storage', '-q', 'cp', tmp, f'{root}/meta.json'],
+                       capture_output=True, text=True, timeout=120)
+        os.unlink(tmp)
+        print(f'[gcs-publish] meta.json -> {root}/meta.json')
+    except Exception as exc:  # noqa: BLE001
+        print(f'[gcs-publish] WARNING: meta.json upload failed: '
+              f'{type(exc).__name__}: {exc}')
 
 
 def _resolve_tmp_ram_fs_gib(config_obj) -> float:
@@ -1079,7 +1213,16 @@ def main(argv) -> None:
         # the task's local disk, which is wiped on every Borg task restart, so
         # a durable copy has to go to GCS for a restart to be able to resume.
         job_env_vars['CHECKPOINT_BUCKET'] = bucket_cp_path
+
+        # RoboTwin close-loop eval: tell the job where to mirror checkpoints.
+        # The job reads these in `utils/gcs_publish.py`; their ABSENCE is what
+        # disables publishing, so a non-RoboTwin run cannot upload by accident.
+        if _should_publish_to_gcs():
+            job_env_vars['ROBOTWIN_EVAL_BUCKET'] = _ROBOTWIN_EVAL_BUCKET
+            job_env_vars['ROBOTWIN_EVAL_XID'] = str(xid)
+            print(f'[gcs-publish] enabled: {_ROBOTWIN_EVAL_BUCKET}/runs/{xid}')
         
+
         if package_mode == "bazel":
             (executable,) = experiment.package(
                 [xm.bazel_binary(
@@ -1138,6 +1281,22 @@ def main(argv) -> None:
         # the write is a pure reordering. The invariant it buys: an entry exists
         # only if a work unit was actually added.
         update_mapping(xid, registry_entry)
+
+        # Publish the code snapshot LAST, for the same reason the registry
+        # write moved here: only a launch that actually produced a work unit
+        # should leave anything behind. This runs on the workstation (the only
+        # place that can read CitC and reach GCS) and cannot fail the launch.
+        if _should_publish_to_gcs():
+            _publish_stagedir(str(xid), {
+                'xid': str(xid),
+                'exp_name': exp_name,
+                'robotwin_task': _robotwin_task_from_yaml(),
+                'config': _CONFIG.value,
+                'cns_checkpoint_path': bucket_cp_path,
+                'stagedir': os.environ.get('TPU_STAGEDIR', ''),
+                'tpu_type': _TPU_TYPE.value,
+                'published_at': __import__('datetime').datetime.utcnow().isoformat() + 'Z',
+            })
 
 
 if __name__ == '__main__':
