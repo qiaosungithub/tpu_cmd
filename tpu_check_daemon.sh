@@ -1,7 +1,22 @@
 #!/bin/bash
-CACHE_FILE="$HOME/.tpu_check_cache.txt"
-TMP_FILE="$HOME/.tpu_check_cache.txt.tmp"
-TIME_FILE="$HOME/.tpu_check_time.txt"
+# Which operator's board this daemon maintains. Unset = sqa's own files, which
+# is exactly how this behaved before the variables existed. A second operator
+# on the same Unix account (lyy, via the `npu` function in tpu_wrapper.sh)
+# needs a SECOND daemon process started with these pointed at their files —
+# `npu check` renders from $TPU_CHECK_CACHE_FILE, and with nobody writing it
+# every job on that board reads SUBMITTED forever.
+#
+#   TPU_JOBS_FILE=~/lyy-work/.npu_jobs.json \
+#   TPU_CHECK_CACHE_FILE=~/lyy-work/.npu_check_cache.txt \
+#   TPU_CHECK_TIME_FILE=~/lyy-work/.npu_check_time.txt \
+#     bash tpu_check_daemon.sh
+: "${TPU_JOBS_FILE:=$HOME/.tpu_jobs.json}"
+: "${TPU_CHECK_CACHE_FILE:=$HOME/.tpu_check_cache.txt}"
+: "${TPU_CHECK_TIME_FILE:=$HOME/.tpu_check_time.txt}"
+export TPU_JOBS_FILE TPU_CHECK_CACHE_FILE
+CACHE_FILE="$TPU_CHECK_CACHE_FILE"
+TMP_FILE="$TPU_CHECK_CACHE_FILE.tmp"
+TIME_FILE="$TPU_CHECK_TIME_FILE"
 
 cd /google/src/cloud/qiaos/xm_test/google3 || {
     echo "Directory not found!"
@@ -183,7 +198,7 @@ while true; do
   python3 - << 'EOF'
 import json, os, fcntl, time, re, sys, subprocess, traceback
 
-mapping_file = os.path.expanduser('~/.tpu_jobs.json')
+mapping_file = os.environ.get('TPU_JOBS_FILE') or os.path.expanduser('~/.tpu_jobs.json')
 if os.path.exists(mapping_file):
     try:
         with open(mapping_file, 'r') as f:
@@ -194,7 +209,7 @@ if os.path.exists(mapping_file):
         changed = False
 
         # Parse cache for why
-        cache_file = os.path.expanduser('~/.tpu_check_cache.txt')
+        cache_file = os.environ.get('TPU_CHECK_CACHE_FILE') or os.path.expanduser('~/.tpu_check_cache.txt')
         cached_status = {}
         if os.path.exists(cache_file):
             try:
@@ -284,7 +299,7 @@ if os.path.exists(mapping_file):
                 fcntl.flock(f, fcntl.LOCK_EX)
                 json.dump(data, f, indent=2)
                 fcntl.flock(f, fcntl.LOCK_UN)
-            print("Successfully updated ~/.tpu_jobs.json")
+            print(f"Successfully updated {mapping_file}")
             
         for xid, cmd in cmds_to_run:
             print(f"RETRYING JOB {xid}: {cmd}")

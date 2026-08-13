@@ -276,6 +276,47 @@ Ctrl-C to quit.
 
 ---
 
+## `npu` — the same tool on lyy's job registry
+
+lyy is a collaborator who works on this machine (web UI + web terminal) under
+the SAME Unix account. `npu` is `tpu` with a different set of files, not a
+second implementation:
+
+| | `tpu` (sqa) | `npu` (lyy) |
+|---|---|---|
+| Registry | `~/.tpu_jobs.json` | `~/lyy-work/.npu_jobs.json` |
+| `clear` archive | `~/.tpu_jobs_legacy.json` | `~/lyy-work/.npu_jobs_legacy.json` |
+| `check` board cache | `~/.tpu_check_cache.txt` | `~/lyy-work/.npu_check_cache.txt` |
+| XM experiment title | as given | `lyy-` + as given |
+| Board header | `tpu check (qiaos)` | `npu check (lyy)` |
+
+Every subcommand works the same way — `npu queue`, `npu check`, `npu cancel`,
+`npu clear`, `npu monitor`. Neither board shows the other's jobs, so use `npu
+check` to see lyy's.
+
+It is implemented by four environment variables (`TPU_JOBS_FILE`,
+`TPU_JOBS_LEGACY_FILE`, `TPU_CHECK_CACHE_FILE`, `TPU_JOB_NAME_PREFIX`) that
+every consumer — the shell sites, the embedded python snippets, the launcher,
+and the daemon — reads with the old hardcoded path as its default. **Unset,
+everything behaves byte-for-byte as it did before `npu` existed**; `npu` sets
+them with `local -x`, so the override lives exactly as long as the call and a
+later `tpu` in the same shell is unaffected.
+
+**`npu check` needs its own daemon.** The board renders from the cache file,
+and nothing writes lyy's cache unless a second daemon runs:
+
+```bash
+tmux new-session -d -s npu-daemon -c ~/work/tpu_cmd \
+  'while true; do bash run-npu-daemon.sh; echo restarting in 5s; sleep 5; done'
+```
+
+Without it every one of lyy's jobs reads `SUBMITTED` forever regardless of
+what it is really doing.
+
+**This is bookkeeping, not a security boundary.** Both operators are the same
+Unix user, jobs run under the same account, and they spend the same quota;
+either can read or run the other's everything.
+
 ## File layout
 
 ```
@@ -285,8 +326,10 @@ Ctrl-C to quit.
 └── xm_launcher.py         (XM entry: parses --tpu_type, --tier, --config, etc,
                             builds JobRequirements, calls experiment.package())
 
-~/work/tpu_check_daemon.sh (60s poll loop: infra_check + quota_check +
-                            money_check + PROD auto-retry driver)
+├── tpu_check_daemon.sh    (60s poll loop: infra_check + quota_check +
+│                          money_check + PROD auto-retry driver; symlinked
+│                          as ~/work/tpu_check_daemon.sh)
+└── run-npu-daemon.sh      (the same daemon pointed at lyy's files)
 
 /google/src/cloud/qiaos/xm_test/google3/experimental/users/qiaos/tpu_utils/
 ├── BUILD

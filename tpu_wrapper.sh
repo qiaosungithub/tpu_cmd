@@ -1,5 +1,26 @@
 #!/bin/bash
 
+# --- Per-operator job registry -------------------------------------------
+# Everything about a job that this workstation remembers lives in ONE file.
+# It is a variable, not a constant, so a second operator on the same Unix
+# account (see the `npu` function at the end of this file) gets their own
+# registry, their own `check` board, and their own `clear` archive without a
+# second copy of this script. Unset means sqa's own files, byte-identical to
+# how this behaved before the variable existed.
+#
+# Consumers: the shell sites below AND every embedded python snippet, which
+# read $TPU_JOBS_FILE from the environment. `npu` exports them with `local -x`
+# so the override lives exactly as long as the call.
+: "${TPU_JOBS_FILE:=$HOME/.tpu_jobs.json}"
+: "${TPU_JOBS_LEGACY_FILE:=$HOME/.tpu_jobs_legacy.json}"
+: "${TPU_CHECK_CACHE_FILE:=$HOME/.tpu_check_cache.txt}"
+# Prepended to the XManager experiment title of every job launched through
+# this shell, so ownership is visible in the XM UI where the registry is not.
+: "${TPU_JOB_NAME_PREFIX:=}"
+# What to call this tool in its own messages (`tpu` vs `npu`).
+: "${TPU_CMD_NAME:=tpu}"
+export TPU_JOBS_FILE TPU_JOBS_LEGACY_FILE TPU_CHECK_CACHE_FILE TPU_JOB_NAME_PREFIX
+
 # Centralized Group Mappings (Single Source of Truth)
 # LINT.IfChange(group_map)
 # Keep in sync with experimental/users/qiaos/tpu_utils/group_utils.py::GROUP_MAP.
@@ -482,7 +503,8 @@ print(d['group'], d['tpu_type'], d['status'],
       local prior_stagedir
       prior_stagedir=$(python3 -c "import json,os
 d={}
-for f in ('~/.tpu_jobs.json','~/.tpu_jobs_legacy.json'):
+for f in (os.environ.get('TPU_JOBS_FILE') or '~/.tpu_jobs.json',
+          os.environ.get('TPU_JOBS_LEGACY_FILE') or '~/.tpu_jobs_legacy.json'):
     try:
         d.update(json.load(open(os.path.expanduser(f))))
     except Exception:
@@ -490,7 +512,7 @@ for f in ('~/.tpu_jobs.json','~/.tpu_jobs_legacy.json'):
 print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       if [ -z "$prior_stagedir" ]; then
         echo -e "\033[31m[resume] No stagedir recorded for XID $resume_xid.\033[0m"
-        echo -e "\033[31m  Looked in ~/.tpu_jobs.json and ~/.tpu_jobs_legacy.json.\033[0m"
+        echo -e "\033[31m  Looked in $TPU_JOBS_FILE and $TPU_JOBS_LEGACY_FILE.\033[0m"
         echo -e "\033[31m  Refusing to package the current checkout: a resume must re-run the\033[0m"
         echo -e "\033[31m  original snapshot. Pass --stagedir=<path> if you know it.\033[0m"
         return 1
@@ -619,7 +641,7 @@ m = re.search(r'https?://xids?/(\d+)|experiment_id[\'":= ]+(\d+)', text)
 xid = next((g for g in (m.groups() if m else ()) if g), None)
 if not xid:
     sys.exit(0)
-path = os.path.expanduser("~/.tpu_jobs.json")
+path = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
 if not os.path.exists(path):
     sys.exit(0)
 with open(path, "r") as f:
@@ -663,7 +685,7 @@ import json, os, re, sys, fcntl
 
 xid, tpu_type, tier, alloc, logdir, stagedir, log_file = sys.argv[1:8]
 
-mapping_file = os.path.expanduser("~/.tpu_jobs.json")
+mapping_file = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
 data = {}
 if os.path.exists(mapping_file):
     try:
@@ -713,7 +735,7 @@ with open(mapping_file, "w") as f:
     json.dump(data, f, indent=2)
     fcntl.flock(f, fcntl.LOCK_UN)
 EOF
-          echo "Successfully registered XID $xid in ~/.tpu_jobs.json"
+          echo "Successfully registered XID $xid in $TPU_JOBS_FILE"
 
           # Cap this XID's price. Per-XID scope: does not affect teammates and
           # survives the periodic group-wide push (SCU > XID > MDB).
@@ -806,7 +828,7 @@ def main():
     args, _ = parser.parse_known_args()
 
     tpu_jobs = {}
-    mapping_file = os.path.expanduser("~/.tpu_jobs.json")
+    mapping_file = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
     if os.path.exists(mapping_file):
         try:
             with open(mapping_file, "r") as f:
@@ -817,7 +839,7 @@ def main():
             pass
 
     cached_status = {}
-    cache_file = os.path.expanduser("~/.tpu_check_cache.txt")
+    cache_file = os.environ.get("TPU_CHECK_CACHE_FILE") or os.path.expanduser("~/.tpu_check_cache.txt")
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
@@ -993,8 +1015,12 @@ def main():
         except Exception:
             pass
 
-    user = os.environ.get("USER", "qiaos")
-    print(_c("tpu check", BOLD) + _c(f"  ({user})", DIM))
+    # Name the board after the tool that drew it and the operator it belongs
+    # to, not the Unix account: `npu check` on a shared account must not look
+    # like `tpu check`, or a screenshot of one gets read as the other.
+    cmd_name = os.environ.get("TPU_CMD_NAME") or "tpu"
+    user = os.environ.get("TPU_OPERATOR") or os.environ.get("USER", "qiaos")
+    print(_c(f"{cmd_name} check", BOLD) + _c(f"  ({user})", DIM))
 
     name_cap = None if args.full else 30
     group_cap = None if args.full else 20
@@ -1063,7 +1089,7 @@ EOF
     if [ ${#xids[@]} -eq 0 ]; then
       echo "Usage: tpu cancel <xid> [xid...] [--dry-run]"
       echo "  Stops the XManager experiment(s), i.e. all work units and their Borg jobs,"
-      echo "  then marks them CANCELLED in ~/.tpu_jobs.json so 'tpu check' reflects it"
+      echo "  then marks them CANCELLED in $TPU_JOBS_FILE so '$TPU_CMD_NAME check' reflects it"
       echo "  immediately and the PROD auto-retry daemon cannot resubmit them."
       echo "  --dry-run shows what xmanager would stop without stopping anything."
       return 1
@@ -1101,7 +1127,7 @@ EOF
 import json, os, sys, fcntl, time
 
 xids = sys.argv[1:]
-mapping_file = os.path.expanduser("~/.tpu_jobs.json")
+mapping_file = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
 if not os.path.exists(mapping_file):
     sys.exit(0)
 try:
@@ -1132,7 +1158,7 @@ try:
 except Exception as e:  # never fail the cancel over bookkeeping
     print(f"Warning: could not update {mapping_file}: {e}")
 EOF
-    echo -e "\033[32m[tpu cancel] Done. Marked ${ids} CANCELLED in ~/.tpu_jobs.json.\033[0m"
+    echo -e "\033[32m[tpu cancel] Done. Marked ${ids} CANCELLED in $TPU_JOBS_FILE.\033[0m"
     echo -e "\033[2m  'tpu check' shows the live XManager state after the next daemon cycle (~60s).\033[0m"
 
   elif [[ "$1" == "quota" ]]; then
@@ -1231,8 +1257,8 @@ EOF
     "$_INFRA_CHECK_BIN" clear "$@"
     # `tpu check` renders from ~/.tpu_check_cache.txt, which the daemon rewrites
     # on its own ~60s cycle, so the board does not change the instant this returns.
-    echo -e "\033[2m[tpu clear] Entries archived to ~/.tpu_jobs_legacy.json (never deleted).\033[0m"
-    echo -e "\033[2m  Allow one daemon cycle (~60s) for 'tpu check' to drop them from the board.\033[0m"
+    echo -e "\033[2m[tpu clear] Entries archived to $TPU_JOBS_LEGACY_FILE (never deleted).\033[0m"
+    echo -e "\033[2m  Allow one daemon cycle (~60s) for '$TPU_CMD_NAME check' to drop them from the board.\033[0m"
 
   elif [[ "$1" == "gc" ]]; then
     # Prune checkpoints nothing will read again. `save_checkpoint` uses orbax's
@@ -1256,4 +1282,26 @@ EOF
   else
     command tpu "$@"
   fi
+}
+
+# --- npu: the same tool, on lyy's job registry ----------------------------
+# lyy is a collaborator who works on this machine through the web UI and web
+# terminal under the SAME Unix account. `npu` is not a second implementation:
+# it is `tpu` with lyy's registry, archive, check board and an `lyy-` title
+# prefix, so neither operator's `check` shows the other's jobs and the XM UI
+# still says whose a job is.
+#
+# `local -x` (not a plain export) keeps the override scoped to the call, so a
+# shell that runs `npu check` and then `tpu check` gets two different boards.
+#
+# NOT a security boundary: both operators are the same Unix user, and either
+# can read or run the other's everything. It is bookkeeping.
+npu() {
+  local -x TPU_JOBS_FILE="${NPU_JOBS_FILE:-$HOME/lyy-work/.npu_jobs.json}"
+  local -x TPU_JOBS_LEGACY_FILE="${NPU_JOBS_LEGACY_FILE:-$HOME/lyy-work/.npu_jobs_legacy.json}"
+  local -x TPU_CHECK_CACHE_FILE="${NPU_CHECK_CACHE_FILE:-$HOME/lyy-work/.npu_check_cache.txt}"
+  local -x TPU_JOB_NAME_PREFIX="${NPU_JOB_NAME_PREFIX:-lyy-}"
+  local -x TPU_CMD_NAME="npu"
+  local -x TPU_OPERATOR="lyy"
+  tpu "$@"
 }

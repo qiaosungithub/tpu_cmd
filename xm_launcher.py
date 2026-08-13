@@ -708,6 +708,13 @@ def main(argv) -> None:
         elif arg.startswith('--config.wandb.run_name='):
             exp_name = arg.split('=', 1)[1]
             
+    # Mark whose job this is in the XManager UI. The job registry already
+    # separates operators on this workstation (TPU_JOBS_FILE), but XM shows
+    # one shared account, so without this a collaborator's experiment is
+    # indistinguishable from the owner's in the only view other people see.
+    _title_prefix = os.environ.get("TPU_JOB_NAME_PREFIX", "")
+    if _title_prefix and not exp_name.startswith(_title_prefix):
+        exp_name = f"{_title_prefix}{exp_name}"
     experiment_context = xm_abc.get_experiment(experiment_id=_RESUME_XID.value) if _RESUME_XID.value else xm_abc.create_experiment(experiment_title=exp_name)
     with experiment_context as experiment:
         
@@ -1009,7 +1016,7 @@ def main(argv) -> None:
         import os
         import json
         import fcntl
-        mapping_file = os.path.expanduser("~/.tpu_jobs.json")
+        mapping_file = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
 
         def read_mapping():
             if not os.path.exists(mapping_file):
@@ -1077,7 +1084,7 @@ def main(argv) -> None:
                 if not os.path.exists(legacy_file):
                     raise SystemExit(
                         f"--resume_xid={want}: no checkpoint bucket recorded for that "
-                        f"experiment.\nLooked in ~/.tpu_jobs.json, "
+                        f"experiment.\nLooked in {os.environ.get('TPU_JOBS_FILE') or '~/.tpu_jobs.json'}, "
                         f"~/.tpu_jobs_legacy.json and {legacy_file}.\n"
                         f"Pass --bucket=<its bucket_cp_path> explicitly if you know it.")
                 with open(legacy_file, "r") as f:
