@@ -189,6 +189,25 @@ _tpu_set_limit_order() {
   return 0
 }
 
+# Restart the daemon behind the SHARED quota/money cache.
+#
+# That daemon belongs to the account owner: one tmux session `tpu-daemon`,
+# writing ~/.tpu_quota_cache_dir. A scoped operator (`npu`) READS that cache --
+# one account, one quota, so sharing it is right -- but must never manage the
+# process behind it. The four auto-recovery sites below used to
+# `tmux kill-session -t tpu-daemon` unconditionally, so a stale cache plus one
+# `npu quota` from the second operator would kill the first operator's daemon:
+# precisely the frozen board this recovery exists to repair, caused by it.
+_tpu_restart_check_daemon() {
+  if [ -n "${TPU_JOB_NAME_PREFIX:-}" ]; then
+    echo -e "\033[33m  The shared quota/money cache is refreshed by the account owner's daemon.\033[0m"
+    echo -e "\033[33m  '$TPU_CMD_NAME' will not restart it — ask sqa to run 'tmux attach -t tpu-daemon'.\033[0m"
+    return 1
+  fi
+  tmux kill-session -t tpu-daemon 2>/dev/null || true
+  tmux new-session -d -s tpu-daemon 'bash -c "while true; do /usr/local/google/home/qiaos/work/tpu_check_daemon.sh; echo Daemon crashed, restarting in 5s...; sleep 5; done"'
+}
+
 # Intercepts 'tpu queue' and forwards everything else to the check/quota logic or original tpu system command.
 tpu() {
   if [ "$1" = "queue" ] || [ "$1" = "q" ]; then
@@ -366,7 +385,7 @@ tpu() {
         echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:router_cli)"
         return 1
       fi
-      echo -e "\033[36m[tpu queue] Router mode: --power=$power. Probing candidates...\033[0m"
+      echo -e "\033[36m[$TPU_CMD_NAME queue] Router mode: --power=$power. Probing candidates...\033[0m"
       local rtier="${tier:-PROD}"
       local reco_json
       # --explain so limit-order-blocked combos are still reported (flagged)
@@ -446,26 +465,26 @@ print(d['group'], d['tpu_type'], d['status'],
       # Auto-apply the tier-inference rule (mirrors what happens later).
       local first_g="${group%%,*}"
       if [ "$first_g" = "5" ] && [ -z "$tier" ]; then pf_tier="PROD"; fi
-      echo -e "\033[36m[tpu queue] Running preflight check on ${first_g}/${tpu_type} @ ${pf_tier}...\033[0m"
+      echo -e "\033[36m[$TPU_CMD_NAME queue] Running preflight check on ${first_g}/${tpu_type} @ ${pf_tier}...\033[0m"
       "$_PREFLIGHT_CLI_BIN" --tpu_type="$tpu_type" --group="$first_g" --tier="$pf_tier"
       local pf_status=$?
       if [ "$pf_status" -eq 1 ]; then
         if [ "$force" = "1" ]; then
-          echo -e "\033[33m[tpu queue] Preflight said RED but --force is set; continuing anyway.\033[0m"
+          echo -e "\033[33m[$TPU_CMD_NAME queue] Preflight said RED but --force is set; continuing anyway.\033[0m"
         else
-          echo -e "\033[31m[tpu queue] REFUSING to submit: preflight verdict = RED.\033[0m"
+          echo -e "\033[31m[$TPU_CMD_NAME queue] REFUSING to submit: preflight verdict = RED.\033[0m"
           echo -e "\033[31m  If you believe this is a false alarm, re-run with --force to override.\033[0m"
           echo -e "\033[31m  Or use --skip-preflight to bypass the check entirely.\033[0m"
           return 1
         fi
       elif [ "$pf_status" -eq 2 ]; then
-        echo -e "\033[33m[tpu queue] Preflight crashed (exit=2); proceeding without pre-check.\033[0m"
+        echo -e "\033[33m[$TPU_CMD_NAME queue] Preflight crashed (exit=2); proceeding without pre-check.\033[0m"
       else
         # exit 0 covers both GREEN and YELLOW; the CLI already printed the warnings
         :
       fi
     elif [ "$skip_preflight" != "1" ]; then
-      echo -e "\033[33m[tpu queue] Preflight binary not built at $_PREFLIGHT_CLI_BIN — skipping.\033[0m"
+      echo -e "\033[33m[$TPU_CMD_NAME queue] Preflight binary not built at $_PREFLIGHT_CLI_BIN — skipping.\033[0m"
       echo -e "\033[33m  Build with: (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:preflight_cli)\033[0m"
     fi
     
@@ -706,7 +725,11 @@ if not exp_name and os.path.exists(log_file):
         if m_note:
             exp_name = m_note.group(1).strip()
         else:
-            m_cfg = re.search(r"--config=['\"]?([^'\"]+)", log_content)
+            # A FLAG VALUE ENDS AT WHITESPACE. `[^'\"]+` runs across newlines,
+            # so a launch that printed a traceback after the flag recorded the
+            # entire blob as the experiment name -- six such entries in one
+            # registry, each tearing the check table apart.
+            m_cfg = re.search(r"--config=['\"]?([^'\"\s]+)", log_content)
             if m_cfg:
                 exp_name = m_cfg.group(1).strip()
             else:
@@ -886,7 +909,30 @@ def main():
         except Exception:
             pass
 
-    all_xids = sorted(list(set(tpu_jobs.keys()) | set(cached_status.keys())), key=lambda x: int(x) if x.isdigit() else x, reverse=True)
+    # WHOSE BOARD IS THIS? The XID set unions two sources with very different
+    # scopes. The registry file is per-OPERATOR. The infra_check cache is
+    # per-UNIX-ACCOUNT: it lists every experiment `qiaos` owns, whoever
+    # launched it. Unioned blind, the second operator's board showed all 33 of
+    # sqa's runs beside their own four -- the registry split alone isolates
+    # writes, not the view.
+    #
+    # A scoped board (TPU_JOB_NAME_PREFIX non-empty, i.e. `npu`) keeps a job
+    # only if this operator's registry knows it, or its name carries their
+    # prefix. The second clause matters: a job launched outside the registry
+    # still belongs to whoever's prefix it wears, and the prefix survives the
+    # cache's name truncation because it is at the front.
+    #
+    # sqa's board leaves the prefix empty and keeps the union untouched, so it
+    # remains the one place where everything charged to this account is
+    # visible -- the operator paying for the quota should not be the one with
+    # the partial view.
+    xids = set(tpu_jobs.keys()) | set(cached_status.keys())
+    scope_prefix = os.environ.get("TPU_JOB_NAME_PREFIX", "")
+    if scope_prefix:
+        xids = {x for x in xids
+                if x in tpu_jobs
+                or cached_status.get(x, {}).get("name", "").startswith(scope_prefix)}
+    all_xids = sorted(xids, key=lambda x: int(x) if x.isdigit() else x, reverse=True)
 
     active_rows, pending_rows, done_rows = [], [], []
     # row index in active_rows -> its log-tail continuation lines
@@ -909,7 +955,7 @@ def main():
                     if m_note:
                         name = m_note.group(1).strip()
                     else:
-                        m_cfg = re.search(r"--config=['\"]?([^'\"]+)", content)
+                        m_cfg = re.search(r"--config=['\"]?([^'\"\s]+)", content)
                         if m_cfg:
                             name = m_cfg.group(1).strip()
                         else:
@@ -918,6 +964,12 @@ def main():
                                 name = m_exp.group(1).strip()
                 except Exception:
                     pass
+        # A NAME IS ONE LINE. Sanitize on the way OUT as well as at
+        # registration: entries written before the regex above was fixed still
+        # hold a multi-line blob, and a table whose NAME cell contains \n puts
+        # every later column on its own line. Rendering must degrade, not
+        # explode, on data it did not write.
+        name = re.split(r"[\r\n]", name)[0].strip()
         if not name:
             name = "-"
         elif xid in tpu_jobs and not tpu_jobs[xid].get("exp_name"):
@@ -1101,14 +1153,62 @@ EOF
         return 1
       fi
     done
+    # OWNERSHIP. Both operators share one Unix account, so `xmanager stop`
+    # will cheerfully kill the other one's experiment -- one mistyped digit is
+    # enough, and the registry split protects the bookkeeping, not the job.
+    #
+    # The rule matches the board exactly: a scoped operator may cancel what
+    # their own `check` shows them, i.e. what their registry records or what
+    # wears their name prefix. Nothing else is theirs to stop.
+    #
+    # sqa is unscoped and keeps full control, lyy's jobs included: whoever
+    # pays for the quota has to be able to stop anything running on it.
+    if [ -n "${TPU_JOB_NAME_PREFIX:-}" ]; then
+      local unknown
+      unknown=$(python3 - "${xids[@]}" << 'EOF'
+import json, os, re, sys
+
+owned = set()
+try:
+    with open(os.path.expanduser(
+            os.environ.get("TPU_JOBS_FILE") or "~/.tpu_jobs.json")) as f:
+        owned |= set(json.load(f).keys())
+except Exception:
+    pass
+
+prefix = os.environ.get("TPU_JOB_NAME_PREFIX", "")
+try:
+    with open(os.path.expanduser(
+            os.environ.get("TPU_CHECK_CACHE_FILE") or "~/.tpu_check_cache.txt"),
+              errors="replace") as f:
+        for line in f:
+            line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if not line.startswith("│"):
+                continue
+            parts = [p.strip() for p in line.split("│")[1:]]
+            if len(parts) >= 3 and parts[0].isdigit() and parts[2].startswith(prefix):
+                owned.add(parts[0])
+except Exception:
+    pass
+
+print(" ".join(x for x in sys.argv[1:] if x not in owned))
+EOF
+)
+      if [ -n "$unknown" ]; then
+        echo -e "\033[31m[$TPU_CMD_NAME cancel] Refusing: XID(s) $unknown are not yours.\033[0m"
+        echo -e "\033[2m  They appear in neither $TPU_JOBS_FILE nor your board, so they belong\033[0m"
+        echo -e "\033[2m  to another operator sharing this account. Check '$TPU_CMD_NAME check'.\033[0m"
+        return 1
+      fi
+    fi
     local ids
     ids=$(IFS=,; echo "${xids[*]}")
     local stop_args=("--experiment_id=${ids}" "--skip_confirmation")
     if [ "$dry_run" = "1" ]; then
       stop_args+=("--dry_run")
-      echo -e "\033[36m[tpu cancel] DRY RUN on XID(s) ${ids}...\033[0m"
+      echo -e "\033[36m[$TPU_CMD_NAME cancel] DRY RUN on XID(s) ${ids}...\033[0m"
     else
-      echo -e "\033[36m[tpu cancel] Stopping XID(s) ${ids} via 'xmanager stop'...\033[0m"
+      echo -e "\033[36m[$TPU_CMD_NAME cancel] Stopping XID(s) ${ids} via 'xmanager stop'...\033[0m"
     fi
     local cancel_log="/tmp/tpu_cancel_$$.log"
     xmanager stop "${stop_args[@]}" > "$cancel_log" 2>&1
@@ -1116,7 +1216,7 @@ EOF
     # The CLI prints ~20 lines of build/absl preamble before the result table.
     grep -vE "^(INFO:absl|WARNING: Logging|W[0-9]{4} |Built |Build |Currently running)" "$cancel_log"
     if [ "$stop_status" -ne 0 ]; then
-      echo -e "\033[31m[tpu cancel] xmanager stop exited with ${stop_status}; registry left untouched.\033[0m"
+      echo -e "\033[31m[$TPU_CMD_NAME cancel] xmanager stop exited with ${stop_status}; registry left untouched.\033[0m"
       echo -e "\033[2m  Full output: $cancel_log\033[0m"
       return "$stop_status"
     fi
@@ -1158,7 +1258,7 @@ try:
 except Exception as e:  # never fail the cancel over bookkeeping
     print(f"Warning: could not update {mapping_file}: {e}")
 EOF
-    echo -e "\033[32m[tpu cancel] Done. Marked ${ids} CANCELLED in $TPU_JOBS_FILE.\033[0m"
+    echo -e "\033[32m[$TPU_CMD_NAME cancel] Done. Marked ${ids} CANCELLED in $TPU_JOBS_FILE.\033[0m"
     echo -e "\033[2m  'tpu check' shows the live XManager state after the next daemon cycle (~60s).\033[0m"
 
   elif [[ "$1" == "quota" ]]; then
@@ -1170,21 +1270,19 @@ EOF
     if [ -f "$CACHE_DIR/default.txt" ]; then
         local AGE=$(($(date +%s) - $(stat -c %Y "$CACHE_DIR/default.txt")))
         if [ "$AGE" -gt 180 ]; then
-            echo -e "\033[31m[tpu quota] 🚨 ALERT: quota data is stale (last updated ${AGE}s ago, over the 3-minute limit)!\033[0m"
+            echo -e "\033[31m[$TPU_CMD_NAME quota] 🚨 ALERT: quota data is stale (last updated ${AGE}s ago, over the 3-minute limit)!\033[0m"
             echo -e "\033[33mLikely cause: LOAS / gcert credentials expired, or the background poller died.\033[0m"
             echo -e "\033[36m[auto-recovery] Restarting the tpu-daemon background tmux session...\033[0m"
             
-            tmux kill-session -t tpu-daemon 2>/dev/null || true
-            tmux new-session -d -s tpu-daemon 'bash -c "while true; do /usr/local/google/home/qiaos/work/tpu_check_daemon.sh; echo Daemon crashed, restarting in 5s...; sleep 5; done"'
+            _tpu_restart_check_daemon
             
             echo -e "\033[33m👉 Make sure gcert is valid (run 'gcert' to re-authenticate if it expired), then re-run 'tpu quota'.\033[0m"
             return 1
         fi
-        echo -e "\033[36m[tpu quota] ⚡ Zero-latency offline read (background refresh ${AGE}s ago)\033[0m"
+        echo -e "\033[36m[$TPU_CMD_NAME quota] ⚡ Zero-latency offline read (background refresh ${AGE}s ago)\033[0m"
     else
-        echo -e "\033[31m[tpu quota] 🚨 Cache not initialized! Starting the tpu-daemon background tmux poller...\033[0m"
-        tmux kill-session -t tpu-daemon 2>/dev/null || true
-        tmux new-session -d -s tpu-daemon 'bash -c "while true; do /usr/local/google/home/qiaos/work/tpu_check_daemon.sh; echo Daemon crashed, restarting in 5s...; sleep 5; done"'
+        echo -e "\033[31m[$TPU_CMD_NAME quota] 🚨 Cache not initialized! Starting the tpu-daemon background tmux poller...\033[0m"
+        _tpu_restart_check_daemon
         return 1
     fi
     
@@ -1205,22 +1303,20 @@ EOF
     if [ -f "$CACHE_DIR/money.txt" ]; then
         local AGE=$(($(date +%s) - $(stat -c %Y "$CACHE_DIR/money.txt")))
         if [ "$AGE" -gt 180 ]; then
-            echo -e "\033[31m[tpu money] 🚨 ALERT: bidding power / price data is stale (last updated ${AGE}s ago, over the 3-minute limit)!\033[0m"
+            echo -e "\033[31m[$TPU_CMD_NAME money] 🚨 ALERT: bidding power / price data is stale (last updated ${AGE}s ago, over the 3-minute limit)!\033[0m"
             echo -e "\033[33mLikely cause: LOAS / gcert credentials expired, or the background poller died.\033[0m"
             echo -e "\033[36m[auto-recovery] Restarting the tpu-daemon background tmux session...\033[0m"
             
-            tmux kill-session -t tpu-daemon 2>/dev/null || true
-            tmux new-session -d -s tpu-daemon 'bash -c "while true; do /usr/local/google/home/qiaos/work/tpu_check_daemon.sh; echo Daemon crashed, restarting in 5s...; sleep 5; done"'
+            _tpu_restart_check_daemon
             
             echo -e "\033[33m👉 Make sure gcert is valid (run 'gcert' to re-authenticate if it expired), then re-run 'tpu money'.\033[0m"
             return 1
         fi
-        echo -e "\033[36m[tpu money] ⚡ Zero-latency offline read (background refresh ${AGE}s ago)\033[0m"
+        echo -e "\033[36m[$TPU_CMD_NAME money] ⚡ Zero-latency offline read (background refresh ${AGE}s ago)\033[0m"
         cat "$CACHE_DIR/money.txt"
     else
-        echo -e "\033[31m[tpu money] 🚨 Cache not initialized! Starting the tpu-daemon background tmux poller...\033[0m"
-        tmux kill-session -t tpu-daemon 2>/dev/null || true
-        tmux new-session -d -s tpu-daemon 'bash -c "while true; do /usr/local/google/home/qiaos/work/tpu_check_daemon.sh; echo Daemon crashed, restarting in 5s...; sleep 5; done"'
+        echo -e "\033[31m[$TPU_CMD_NAME money] 🚨 Cache not initialized! Starting the tpu-daemon background tmux poller...\033[0m"
+        _tpu_restart_check_daemon
         return 1
     fi
 
@@ -1257,7 +1353,7 @@ EOF
     "$_INFRA_CHECK_BIN" clear "$@"
     # `tpu check` renders from ~/.tpu_check_cache.txt, which the daemon rewrites
     # on its own ~60s cycle, so the board does not change the instant this returns.
-    echo -e "\033[2m[tpu clear] Entries archived to $TPU_JOBS_LEGACY_FILE (never deleted).\033[0m"
+    echo -e "\033[2m[$TPU_CMD_NAME clear] Entries archived to $TPU_JOBS_LEGACY_FILE (never deleted).\033[0m"
     echo -e "\033[2m  Allow one daemon cycle (~60s) for '$TPU_CMD_NAME check' to drop them from the board.\033[0m"
 
   elif [[ "$1" == "gc" ]]; then
@@ -1273,7 +1369,7 @@ EOF
     shift
     while true; do
       clear
-      echo -e "\033[2m[tpu monitor] Live mode: refreshing every 5s. Press Ctrl-C to exit...\033[0m"
+      echo -e "\033[2m[$TPU_CMD_NAME monitor] Live mode: refreshing every 5s. Press Ctrl-C to exit...\033[0m"
       echo ""
       tpu check "$@"
       sleep 5
