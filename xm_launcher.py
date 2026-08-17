@@ -127,12 +127,7 @@ def _describe_cell_choice(cells: list[str]) -> None:
 
 
 def _read_legacy_mapping():
-    """Archived job registry (`tpu clear` moves entries here). {} if absent.
-
-    `os`/`json` are imported locally to match this module's existing style --
-    they are function-local everywhere else here, not module-level.
-    """
-    import os
+    """Archived job registry (`tpu clear` moves entries here). {} if absent."""
     import json
     try:
         with open(os.path.expanduser("~/.tpu_jobs_legacy.json"), "r") as handle:
@@ -673,7 +668,6 @@ def _preflight_resume_config(bucket_cp_path: str, xid: str) -> None:
     the job re-checks the same thing at startup. It only ever aborts on a
     DIFFERENCE IT CAN PROVE.
     """
-    import os
     import sys
 
     try:
@@ -751,7 +745,6 @@ def main(argv) -> None:
         pkg_path = target_label.lstrip('/').split(':')[0]
         
         try:
-            import os
             config_path = "config.sh"
             if not os.path.exists(config_path):
                 config_path = f"{pkg_path}/config.sh"
@@ -1033,8 +1026,7 @@ def main(argv) -> None:
                   f"for globbing (* ? [ ]); the checkpoint directory will use "
                   f"{safe_exp_name!r}. The experiment title itself is unchanged.")
         folder_name = f"xid_{xid}_{time_str}_{safe_exp_name}"
-    
-        import os
+
         import json
         import fcntl
         mapping_file = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
