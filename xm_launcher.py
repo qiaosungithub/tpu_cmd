@@ -175,15 +175,13 @@ _RESUME_XID = flags.DEFINE_integer(
 )
 # Failure budget shaped after //experimental/.../mesh_diffusion launch_lib.py:
 # unlimited total failures, but a tight per-task limit that decays over time.
-# The asymmetry is the point -- a long run should survive any number of
-# unrelated preemptions, while a task that keeps dying is a real bug and should
-# be declared dead quickly rather than retried forever.
+# These are REAL-FAILURE counters; Borg tracks preemptions/evictions against the
+# separate max_task_evictions budget below.
 _MAX_TASK_FAILURES = flags.DEFINE_integer(
     'borg_max_task_failures', -1,
-    'Total task failures tolerated across all tasks before the job is aborted. '
-    '-1 means unlimited. Borg default is 0, which kills the whole experiment '
-    'the first time a preempted gang tears down. Applies to PROD and BATCH: '
-    'PROD is also preemptible via equal-priority slice defragmentation.'
+    'Total non-eviction task failures tolerated across all tasks before the '
+    'job is aborted. -1 means unlimited. This does not limit preemption '
+    'restarts; use --borg_max_task_evictions for those.'
 )
 _MAX_PER_TASK_FAILURES = flags.DEFINE_integer(
     'borg_max_per_task_failures', 1,
@@ -191,11 +189,38 @@ _MAX_PER_TASK_FAILURES = flags.DEFINE_integer(
     'Combined with the credit period below this reads as "recover from at most '
     'one failure per task every N seconds".'
 )
+_MAX_TASK_EVICTIONS = flags.DEFINE_integer(
+    'borg_max_task_evictions', -1,
+    'Total task evictions tolerated before the job is aborted. -1 means '
+    'unlimited (the Borg default); 0 prevents an evicted/preempted task from '
+    'being restarted. This is distinct from task failures.'
+)
 _FAILURE_CREDIT_PERIOD = flags.DEFINE_integer(
     'borg_failure_credit_period', 7200,
     'Every N seconds Borg decrements each live task\'s failure count, so a run '
     'is not killed by slow attrition of unrelated one-off failures.'
 )
+
+
+def _borg_overrides_for_eviction_budget(max_task_evictions: int):
+    """Builds the narrow Borg override needed for an eviction budget.
+
+    XManager's BorgScheduling exposes failure budgets, but not Borg's separate
+    max_task_evictions field. Keep the default path shape-identical by emitting
+    no override for -1 (Borg's unlimited default), and set only the missing
+    scheduling field when the operator explicitly supplies a finite budget.
+    """
+    if max_task_evictions < -1:
+        raise ValueError(
+            '--borg_max_task_evictions must be -1 (unlimited) or non-negative; '
+            f'got {max_task_evictions}.')
+    if max_task_evictions == -1:
+        return None
+    borg_overrides = xm_abc.RESTRICTED_BorgOverrides()
+    borg_overrides.scheduling.max_task_evictions = max_task_evictions
+    return borg_overrides
+
+
 # XManager derives the Borg job name from the packaged target ('main'); naming
 # the job explicitly keeps that in sync with the BCL token built below.
 _JOB_NAME = 'main'
@@ -939,19 +964,11 @@ def main(argv) -> None:
                             "unrecognised tier used to fall through to PROD.")
             job_requirements = xm.JobRequirements(**req_kwargs)
             
-            # Borg's BorgScheduling defaults are max_task_failures=0 /
-            # max_per_task_failures=0, i.e. "never restart". A preemption is
-            # itself a free failure that does not count, but when a TPU gang is
-            # torn apart the non-zero task exit IS counted as a FAILURE, and
-            # CanStartTask() then declares the job dead (borg .../job.cc).
-            # Result: one preemption kills the whole experiment.
-            #
-            # This applies to PROD too -- PROD is not immune to preemption:
-            # xid 274552915 (PROD) died to SLICE_DEFRAGMENTATION, which is the
-            # EQUAL-priority defrag path, not the higher-priority one.
-            #
+            # Borg tracks true task failures separately from evictions. The
+            # public BorgScheduling object exposes only the former; the finite
+            # eviction budget is added below through one narrow Borg override.
             # See //depot/google3/third_party/py/xmanager/xm_abc/executors.py
-            # (class BorgScheduling) and go/borg-configure-schedule#task-failure-limits.
+            # (class BorgScheduling) and go/borg-configure-schedule.
             scheduling = xm_abc.BorgScheduling(
                 max_task_failures=_MAX_TASK_FAILURES.value,
                 max_per_task_failures=_MAX_PER_TASK_FAILURES.value,
@@ -964,6 +981,10 @@ def main(argv) -> None:
             # will ignore" and prints a warning, and passing the object at all
             # is a change in shape for every existing job.
             borg_kwargs = {}
+            eviction_overrides = _borg_overrides_for_eviction_budget(
+                _MAX_TASK_EVICTIONS.value)
+            if eviction_overrides is not None:
+                borg_kwargs['borg_overrides'] = eviction_overrides
             if _AUTOPILOT.value is not None:
                 borg_kwargs['autopilot_params'] = xm_abc.AutopilotParams(
                     enabled=_AUTOPILOT.value)
@@ -1119,6 +1140,7 @@ def main(argv) -> None:
             # Recorded so `tpu check` can tell "preempted, will retry" from
             # "preempted, restart budget spent".
             "max_task_failures": _MAX_TASK_FAILURES.value,
+            "max_task_evictions": _MAX_TASK_EVICTIONS.value,
         }
     
         config_path_arg = f"configs/load_config.py:{_CONFIG.value}"
@@ -1176,6 +1198,7 @@ def main(argv) -> None:
                 if arg.startswith(('--cell=', '--load_from=', '--config.load_from=',
                                    '--wandb_resume_id=', '--config.wandb_resume_id=',
                                    '--borg_max_task_failures=', '--borg_max_per_task_failures=',
+                                   '--borg_max_task_evictions=',
                                    '--tmp_ram_fs_gib=', '--ram_gib=', '--replicas=',
                                    '--autopilot=', '--noautopilot', '--autopilot')):
                     continue

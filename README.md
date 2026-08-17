@@ -43,6 +43,7 @@ Flags:
 | `--tier=PROD\|BATCH` | Defaults to empty; g5 auto-set to PROD for legacy reason. |
 | `--force` / `-f` | Submit even if preflight verdict is RED. |
 | `--skip-preflight` / `--no-preflight` | Bypass preflight entirely. |
+| `--borg_max_task_evictions=<N>` | Maximum total Borg task evictions before aborting. Default `-1` preserves Borg's unlimited-eviction behaviour; use `0` when any preemption must make the XID terminal instead of restarting it. Distinct from the task-failure budgets. |
 | `--exp_name=...`, `-n ...`, `--config=...`, `--bucket=...`, `--workdir=...`, `--resume_xid=...`, `--config.*=...` | Passed through to `xm_launcher.py`. |
 
 Behaviour:

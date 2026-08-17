@@ -309,7 +309,7 @@ tpu() {
           passthrough_args+=("$1")
           shift
           ;;
-        # Checkpoint / resume selectors and the Borg restart budget. The
+        # Checkpoint / resume selectors and the Borg restart budgets. The
         # launcher turns load_from & wandb_resume_id into $LOAD_FROM /
         # $WANDB_RESUME_ID env vars (unified_infra convention), so they must
         # not be rewritten into --config.* flags here.
@@ -347,7 +347,7 @@ tpu() {
         # min 1024 / max 40000 milligcu, and a best-effort job then finds no
         # machine and sits in DISABLED reporting what looks like a cell capacity
         # problem. Absent => XManager's own behaviour, unchanged.
-        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--tmp_ram_fs_gib=*|--ram_gib=*|--replicas=*|--autopilot=*)
+        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--borg_max_task_evictions=*|--tmp_ram_fs_gib=*|--ram_gib=*|--replicas=*|--autopilot=*)
           passthrough_args+=("$1")
           shift
           ;;
@@ -355,7 +355,7 @@ tpu() {
           passthrough_args+=("$1")
           shift
           ;;
-        --load_from|--wandb_resume_id|--borg_max_task_failures|--borg_max_per_task_failures|--tmp_ram_fs_gib|--ram_gib|--replicas)
+        --load_from|--wandb_resume_id|--borg_max_task_failures|--borg_max_per_task_failures|--borg_max_task_evictions|--tmp_ram_fs_gib|--ram_gib|--replicas)
           passthrough_args+=("$1=$2")
           shift 2
           ;;
