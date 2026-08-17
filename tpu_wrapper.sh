@@ -493,25 +493,29 @@ print(d['group'], d['tpu_type'], d['status'],
       tier=""
     fi
     
-    # Unique run id. NOTE: a bare second-granularity timestamp is NOT unique --
-    # the documented "launch a batch in PARALLEL" workflow (jobs.md) fires several
-    # `tpu queue` processes at once, and any that start within the same second
-    # (or while a sibling is still rsyncing) previously collided on ONE stagedir,
-    # so every work unit built from whichever config rsync'd last. That silently
-    # ran an N-arm sweep as N copies of a SINGLE arm (observed 2026-08-17:
-    # 4 XIDs -> 1 stagedir -> 1 arch). Make the id collision-proof: keep the
-    # readable timestamp, then claim a unique dir atomically with `mkdir` (which
-    # fails if the name is taken), bumping a suffix until we win the race. Only
-    # the non-resume branch creates a stagedir, so guard on that.
+    # Unique run id = readable timestamp + a random hash. NOTE: a bare
+    # second-granularity timestamp is NOT unique -- the documented "launch a batch
+    # in PARALLEL" workflow (jobs.md) fires several `tpu queue` processes at once,
+    # and any starting within the same second (or while a sibling is still
+    # rsyncing) collided on ONE stagedir, so every work unit built from whichever
+    # config rsync'd last -- silently running an N-arm sweep as N copies of a
+    # SINGLE arm (observed 2026-08-17: 4 XIDs -> 1 stagedir -> 1 arch). The random
+    # hash makes a collision astronomically unlikely up front; the atomic `mkdir`
+    # (fails if the name is taken) is a belt-and-suspenders guard that just draws a
+    # fresh hash on the ~never case. Only the non-resume branch creates a stagedir.
     local now=$(date '+%y%m%d_%H%M%S')
     if [ -z "$resume_xid" ]; then
-      local _base_now="$now"
-      local _sfx=0
-      while ! mkdir "/google/src/cloud/qiaos/EqR-jax/google3/experimental/qiaos/eqr_jax_final_stages/eqr_run_${now}" 2>/dev/null; do
-        _sfx=$((_sfx + 1))
-        now="${_base_now}_${_sfx}"
-        if [ "$_sfx" -gt 100 ]; then
-          echo -e "\033[31m[stagedir] could not claim a unique stagedir after 100 tries near ${_base_now}\033[0m" >&2
+      local _ts="$now"
+      local _tries=0
+      while : ; do
+        # 6-hex random; prefer urandom, fall back to bash $RANDOM if absent.
+        local _hash=$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+        [ -n "$_hash" ] || _hash=$(printf '%04x%02x' "$RANDOM" "$((RANDOM % 256))")
+        now="${_ts}_${_hash}"
+        mkdir "/google/src/cloud/qiaos/EqR-jax/google3/experimental/qiaos/eqr_jax_final_stages/eqr_run_${now}" 2>/dev/null && break
+        _tries=$((_tries + 1))
+        if [ "$_tries" -gt 100 ]; then
+          echo -e "\033[31m[stagedir] could not claim a unique stagedir after 100 tries near ${_ts}\033[0m" >&2
           return 1
         fi
       done
