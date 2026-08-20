@@ -863,6 +863,40 @@ def _hdr(title, n):
     bar = _c(f"━━ {title} ", BOLD)
     return f"\n{bar}" + _c(f"({n})", DIM)
 
+def _age_str(job_info):
+    """Age since SUBMIT, from the timestamp tpu_wrapper baked into the run dir /
+    bucket path at launch (logdir 'eqr_run_YYMMDD_HHMMSS' or bucket
+    '..._YYYYMMDD_HHMMSS_...'). This is wall-clock since submission (queue +
+    run), NOT pure Borg run-uptime -- the daemon cache carries no work-unit
+    start time. '-' when no timestamp parses. Box runs UTC so now()==UTC."""
+    import datetime
+    stamp = None
+    m = re.search(r"_(\d{6})_(\d{6})(?:_|$)", str(job_info.get("logdir") or ""))
+    if m:
+        try:
+            stamp = datetime.datetime.strptime(m.group(1) + m.group(2), "%y%m%d%H%M%S")
+        except ValueError:
+            stamp = None
+    if stamp is None:
+        m = re.search(r"_(\d{8})_(\d{6})(?:_|$)", str(job_info.get("bucket_cp_path") or ""))
+        if m:
+            try:
+                stamp = datetime.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            except ValueError:
+                stamp = None
+    if stamp is None:
+        return "-"
+    secs = (datetime.datetime.now() - stamp).total_seconds()
+    if secs < 0:
+        return "-"
+    mins = int(secs // 60)
+    if mins < 60:
+        return f"{mins}m"
+    hrs = mins // 60
+    if hrs < 24:
+        return f"{hrs}h{mins % 60}m"
+    return f"{hrs // 24}d{hrs % 24}h"
+
 def main():
     parser = argparse.ArgumentParser(description="Rich status view for TPU jobs (like infra check).")
     parser.add_argument("-a", "--all", action="store_true", help="Show all completed/failed jobs.")
@@ -907,18 +941,23 @@ def main():
                     if len(parts) >= 3:
                         xid = parts[0]
                         if xid.isdigit():
-                            # Layout: ID | STATUS | NAME | RESUME | STEP | (DETAILS|WHY)
-                            # Index the tail, not a fixed column: the reason is
-                            # always last, and hard-coding parts[3] silently
-                            # returned the wrong field when columns were added.
+                            # Layout differs per section (infra_check builds one
+                            # table per state):
+                            #   running: XID|STATUS|NAME|RESUME|STEP|REGION|DETAILS  (7 cols)
+                            #   pending/done: XID|STATUS|NAME|RESUME|STEP|WHY        (6 cols)
+                            # Index the tail for WHY (always last); REGION only
+                            # exists on the 7-col running rows (index 5), so gate
+                            # it on the column count and leave it "" elsewhere.
                             status = parts[1]
                             name = parts[2]
                             resume = parts[3] if len(parts) >= 6 else ""
                             step = parts[4] if len(parts) >= 6 else ""
+                            region = parts[5] if len(parts) >= 7 else ""
                             why = parts[-1] if len(parts) >= 4 else ""
                             cached_status[xid] = {"status": status, "name": name,
                                                   "why": why, "resume": resume,
-                                                  "step": step, "tail": []}
+                                                  "step": step, "region": region,
+                                                  "tail": []}
                             last_xid = xid
                         elif not xid and last_xid:
                             # CONTINUATION ROW. infra_check prints a running
@@ -1056,6 +1095,10 @@ def main():
 
         resume_s = cache_info.get("resume") or "-"
         step_s = cache_info.get("step") or "-"
+        # AGE = wall-clock since submission (see _age_str). Useful on both the
+        # active board ("how long has this run existed") and the pending board
+        # ("how long has this been stuck in the auction").
+        age_s = _age_str(job_info)
 
         # Per-section columns, following unified_infra's `infra check`: each
         # section answers a different question, so a shared header wastes width
@@ -1076,10 +1119,14 @@ def main():
             tail = cache_info.get("tail") or []
             if tail:
                 active_tails[len(active_rows)] = tail
+            # REGION = Borg cell/metro where the job landed (from infra_check's
+            # _region_of, carried through the cache). "?" until the job's log
+            # reveals the cell; "-" if the cache had no region column at all.
+            region_s = cache_info.get("region") or "-"
             active_rows.append([xid, status, name, tpu_type, tier, group_str,
-                                resume_s, step_s, wu])
+                                resume_s, step_s, region_s, wu, age_s])
         elif st_lower in ["pending", "queued"]:
-            pending_rows.append([xid, status, name, tpu_type, tier, group_str, why])
+            pending_rows.append([xid, status, name, tpu_type, tier, group_str, age_s, why])
         else:
             done_rows.append([xid, status, name, tpu_type, tier, group_str,
                               step_s, why])
@@ -1107,11 +1154,11 @@ def main():
     # WU = live work units. A running job's WHY was always just "<n> active",
     # which is a count, not a reason -- as a column it is one char wide instead
     # of eating the line.
-    active_headers = ["XID", "STATUS", "NAME", "TPU", "TIER", "GROUP", "RESUME", "STEP", "WU"]
-    active_caps = [None, None, name_cap, None, None, group_cap, None, None, None]
+    active_headers = ["XID", "STATUS", "NAME", "TPU", "TIER", "GROUP", "RESUME", "STEP", "REGION", "WU", "AGE"]
+    active_caps = [None, None, name_cap, None, None, group_cap, None, None, None, None, None]
 
-    pending_headers = ["XID", "STATUS", "NAME", "TPU", "TIER", "GROUP", "WHY"]
-    pending_caps = [None, None, name_cap, None, None, group_cap, None]
+    pending_headers = ["XID", "STATUS", "NAME", "TPU", "TIER", "GROUP", "AGE", "WHY"]
+    pending_caps = [None, None, name_cap, None, None, group_cap, None, None]
 
     done_headers = ["XID", "STATUS", "NAME", "TPU", "TIER", "GROUP", "STEP", "WHY"]
     done_caps = [None, None, name_cap, None, None, group_cap, None, None]
