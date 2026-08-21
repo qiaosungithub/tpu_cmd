@@ -63,7 +63,9 @@ _CELL_BUCKETS = {
     'yucbful': '/cns/is-d/home/qiaos/eqr_data',   # cbf
     'yucbfwv': '/cns/is-d/home/qiaos/eqr_data',   # cbf
     'je':      '/cns/is-d/home/qiaos/eqr_data',   # cbf
-    'yutulpz': '/cns/nm-d/home/qiaos/eqr_data',   # tul -> nm-d  44.0 PiB sp50
+    'yutulpz': '/cns/oi-d/home/qiaos/eqr_data',   # tul -> oi-d (nm-d group quota FULL 47.9/48.2P; oi-d same-metro, 29.6P)
+    'nl':      '/cns/oi-d/home/qiaos/eqr_data',   # tul -> oi-d
+    'nk':      '/cns/oi-d/home/qiaos/eqr_data',   # tul -> oi-d
     'yulpptr': '/cns/li-d/home/qiaos/eqr_data',   # lpp -> li-d  85.2 PiB sp50
     'sk':      '/cns/si-d/home/qiaos/eqr_data',   # sin -> si-d  9.69 PiB sp50
     'sn':      '/cns/si-d/home/qiaos/eqr_data',   # sin
