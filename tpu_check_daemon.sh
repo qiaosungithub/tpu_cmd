@@ -168,6 +168,11 @@ run_named_check() {
   return $rc
 }
 
+# The slow-lane infra pass runs detached; reap it on exit so the outer
+# `while true; do tpu_check_daemon.sh; sleep 5; done` wrapper cannot accumulate
+# orphaned infra children across daemon restarts.
+trap '[ -n "${INFRA_PID:-}" ] && kill "$INFRA_PID" 2>/dev/null' EXIT
+
 while true; do
   ROUND_START=$(date +%s)
 
@@ -176,22 +181,35 @@ while true; do
 
   # Each task logs to its own temp file so concurrent writes cannot interleave;
   # the logs are replayed in a stable order once the round completes.
-  LOG_INFRA=$(mktemp)
+  # FAST LANE: money + quota. They cost ~40s and the round WAITS for them, so
+  # neither cache ever ages past the 300s staleness alarm in tpu_wrapper.sh.
+  # They used to share a single `wait` barrier with infra_check below, which on
+  # a large registry takes minutes -- so money.txt aged to ~386s and `tpu money`
+  # cried stale even though its own data was ready in 37s.
   LOG_QUOTA=$(mktemp)
   LOG_MONEY=$(mktemp)
-
-  run_infra_check > "$LOG_INFRA" 2>&1 &
-  PID_INFRA=$!
   run_named_check quota_check quota > "$LOG_QUOTA" 2>&1 &
   PID_QUOTA=$!
   run_named_check money_check money > "$LOG_MONEY" 2>&1 &
   PID_MONEY=$!
+  wait "$PID_QUOTA" "$PID_MONEY"
+  cat "$LOG_QUOTA" "$LOG_MONEY"
+  rm -f "$LOG_QUOTA" "$LOG_MONEY"
 
-  wait "$PID_INFRA" "$PID_QUOTA" "$PID_MONEY"
+  # SLOW LANE: infra_check issues one serial XManager RPC per tracked
+  # experiment, so it scales with registry size and takes minutes. It is now
+  # DETACHED -- the round never waits on it, so a slow infra pass can no longer
+  # starve the fast lane. A kill -0 guard skips starting a second pass while one
+  # is still in flight, so passes queue instead of stacking up.
+  if [ -z "${INFRA_PID:-}" ] || ! kill -0 "$INFRA_PID" 2>/dev/null; then
+    run_infra_check &
+    INFRA_PID=$!
+    INFRA_START=$(date +%s)
+  else
+    echo "$(date): infra pass still running ($(( $(date +%s) - ${INFRA_START:-0} ))s); skipping this round"
+  fi
 
-  cat "$LOG_INFRA" "$LOG_QUOTA" "$LOG_MONEY"
-  rm -f "$LOG_INFRA" "$LOG_QUOTA" "$LOG_MONEY"
-  echo "$(date): --- refresh round took $(( $(date +%s) - ROUND_START ))s ---"
+  echo "$(date): --- fast-lane round took $(( $(date +%s) - ROUND_START ))s ---"
   
   
   # Parse xm launch logs for ERROR MODES
