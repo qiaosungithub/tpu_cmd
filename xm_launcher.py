@@ -673,6 +673,24 @@ def _preflight_resume_config(bucket_cp_path: str, xid: str) -> None:
     """
     import sys
 
+    # A MISSING CONFIG FILE IS A DIFFERENCE WE CAN PROVE, not a cannot-tell.
+    # The generic except below treats every failure as "skip", which once let a
+    # `--config=configs/x_config.yml` (should be the bare mode `x`) double-wrap
+    # into a path that cannot exist and sail through to a job that died at
+    # startup. --config is already normalised to the bare mode in main(), so the
+    # file the launcher will actually load is configs/<mode>_config.yml; if that
+    # is absent, refuse now rather than package a doomed job.
+    _cfg_file = f"configs/{_CONFIG.value}_config.yml"
+    if not os.path.exists(_cfg_file) and not os.path.exists(
+            f"configs/{_CONFIG.value}_config.yaml"):
+        raise SystemExit(
+            f"\n=== REFUSING TO RESUME XID {xid} ===\n"
+            f"config file not found: {_cfg_file}\n"
+            f"--config must be a bare mode name (e.g. remote_run); the launcher "
+            f"wraps it into configs/<mode>_config.yml.\n"
+            f"\nNothing was packaged or queued.\n"
+        )
+
     try:
         sys.path.insert(0, os.getcwd())
         from configs import load_config
@@ -706,6 +724,26 @@ def _preflight_resume_config(bucket_cp_path: str, xid: str) -> None:
 
 
 def main(argv) -> None:
+    # NORMALISE --config to the bare <mode>. The contract is a short mode name
+    # (`remote_run`); load_config and the launcher then wrap it into
+    # `configs/<mode>_config.yml`. Passing the full path instead --
+    # `--config=configs/abl_config.yml` -- makes every call site double-wrap it
+    # into `configs/configs/abl_config.yml_config.yml`, a file that cannot exist,
+    # and the job dies at startup with "Could not locate ...". Strip the prefix
+    # and suffix so a full path is accepted as if the mode had been passed.
+    _raw_config = _CONFIG.value
+    _mode = _raw_config.strip()
+    if _mode.startswith('configs/'):
+        _mode = _mode[len('configs/'):]
+    for _suffix in ('_config.yml', '_config.yaml', '.yml', '.yaml'):
+        if _mode.endswith(_suffix):
+            _mode = _mode[:-len(_suffix)]
+            break
+    if _mode != _raw_config:
+        print(f"[config] normalised --config={_raw_config!r} -> {_mode!r} "
+              "(pass the bare mode name; the launcher adds configs/…_config.yml)")
+        flags.FLAGS.config = _mode
+
     exp_name = _EXP_NAME.value
     # --- Auto-Load WandB name or fallbacks ---
     cfg = None
