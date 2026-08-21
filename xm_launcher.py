@@ -74,6 +74,7 @@ _CELL_BUCKETS = {
     'el':      '/cns/el-d/home/qiaos/eqr_data',   # grq, same cell 95.4 PiB sp50
     'mb':      '/cns/mb-d/home/qiaos/eqr_data',   # ckv, same cell 10.7 PiB sp50
     'yudfwra': '/cns/rs-d/home/qiaos/eqr_data',   # dfw -> rs-d  49.3 PiB sp50
+    'dl':      '/cns/dl-d/home/qiaos/eqr_data',   # las -> dl-d  31.6 PiB sp10 (2nd v4, non-oversold)
     # no group quota in the metro -- personal 500 GiB only
     'yuskedq': '/cns/yuskedq-d/home/qiaos/eqr_data',
 }
@@ -101,7 +102,7 @@ _CELL_TIERS = (
     ('cbf/tul/lpp (mirrored data, group quota)',
      ('yucbfiv', 'yucbful', 'yucbfwv', 'je', 'yutulpz', 'yulpptr')),
     ('other metros with group quota',
-     ('sk', 'sn', 'so', 'yumrnel', 'el', 'mb', 'yudfwra')),
+     ('sk', 'sn', 'so', 'yumrnel', 'el', 'mb', 'yudfwra', 'dl')),
     ('no team storage -- personal 500 GiB only',
      ('yuskedq',)),
 )
