@@ -801,6 +801,13 @@ EOF
     shift
     python3 - "$@" << 'EOF'
 import argparse, json, os, re, sys, fcntl
+# CWD ROBUSTNESS: `tpu check` is run from anywhere, and from the google3 source
+# root the depot's //calendar package shadows the stdlib `calendar` that
+# datetime.strptime lazily imports -- crashing the render with
+# "module 'calendar' has no attribute 'day_abbr'". Strip the CWD/'' entries from
+# sys.path so stdlib always wins; a read-only cache renderer imports nothing
+# local, so this loses nothing.
+sys.path[:] = [p for p in sys.path if p not in ('', os.getcwd())]
 
 def remove_ansi(text):
     return re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", text)
@@ -1186,9 +1193,46 @@ def main():
     else:
         print(_c("  (none)", DIM))
 
+    # STALENESS: the board is a cache the background daemon refreshes. If the
+    # daemon is dead, hung, or its round is timing out, the cache silently ages
+    # and the board shows a stale world as if it were live. Surface it loudly
+    # rather than let a stopped daemon read as an idle queue. 300s matches the
+    # money/quota alarm; the daemon's fast lane refreshes every ~40s.
+    STALE_S = 300
+    import time as _time
+    if not os.path.exists(cache_file):
+        sys.stderr.write(_c(
+            "\n\U0001f6a8 [tpu check] board cache missing (%s) -- the daemon has "
+            "never written it. Start it: tpu quota (auto-starts the poller).\n"
+            % cache_file, "\033[31m"))
+    else:
+        age = _time.time() - os.path.getmtime(cache_file)
+        if age > STALE_S:
+            sys.stderr.write(_c(
+                "\n\U0001f6a8 [tpu check] board is STALE: cache last refreshed "
+                "%dm%ds ago (over the %ds limit). The daemon is dead, hung, or "
+                "its round is timing out -- statuses below may be wrong. Check "
+                "it: tmux capture-pane -t tpu-daemon -p | tail\n"
+                % (age // 60, age % 60, STALE_S), "\033[31m"))
+
 if __name__ == "__main__":
-    main()
+    # FAIL LOUDLY: a crash in the renderer must not read as "no jobs". Print the
+    # error clearly and exit non-zero so the shell wrapper (and the caller) can
+    # tell a real board from a broken one.
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        sys.stderr.write("\033[31m\U0001f6a8 [tpu check] FAILED to render board: "
+                         "%s: %s\033[0m\n" % (type(e).__name__, e))
+        traceback.print_exc()
+        sys.exit(1)
 EOF
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      echo -e "\033[31m[$TPU_CMD_NAME check] render failed (exit $_rc) -- see the error above; the board is NOT current.\033[0m" >&2
+      return "$_rc" 2>/dev/null || exit "$_rc"
+    fi
 
   elif [[ "$1" == "cancel" || "$1" == "stop" ]]; then
     shift
