@@ -1666,9 +1666,30 @@ EOF
           exec "$_ROUTE_CHECK_BIN" --worker --queue_file="$qfile" --nodry_run "$@"
           ;;
         stop)
-          tmux kill-session -t "$wsess" 2>/dev/null && \
-            echo "[build-worker] stopped ($wsess)." || \
-            echo "[build-worker] not running ($wsess)."
+          # Kill the tmux session AND the worker child it spawned. Killing the
+          # session alone kills the `while` shell but orphans the in-flight
+          # `route_check --worker` (reparented to init) -- an orphan still holds
+          # the BUILDING slot and could submit, so hunt it down by queue file.
+          local _killed=0
+          tmux has-session -t "$wsess" 2>/dev/null && _killed=1
+          tmux kill-session -t "$wsess" 2>/dev/null
+          # SIGTERM any worker bound to THIS queue file (exact match, safe).
+          local _wpids
+          _wpids=$(ps -eo pid,args 2>/dev/null | grep 'route_check' \
+                   | grep -- "--worker" | grep -F -- "--queue_file=$qfile" \
+                   | grep -v grep | awk '{print $1}')
+          if [ -n "$_wpids" ]; then
+            _killed=1
+            echo "$_wpids" | xargs -r kill 2>/dev/null
+            sleep 1
+            # SIGKILL any that ignored SIGTERM (mid-build)
+            _wpids=$(ps -eo pid,args 2>/dev/null | grep 'route_check' \
+                     | grep -- "--worker" | grep -F -- "--queue_file=$qfile" \
+                     | grep -v grep | awk '{print $1}')
+            [ -n "$_wpids" ] && echo "$_wpids" | xargs -r kill -9 2>/dev/null
+          fi
+          [ "$_killed" = "1" ] && echo "[build-worker] stopped ($wsess)." \
+                               || echo "[build-worker] not running ($wsess)."
           ;;
         status)
           if tmux has-session -t "$wsess" 2>/dev/null; then
@@ -1681,11 +1702,29 @@ EOF
           if tmux has-session -t "$wsess" 2>/dev/null; then
             echo "[build-worker] already running ($wsess). $TPU_CMD_NAME build-worker status | stop"
           else
+            # ENV PROPAGATION INTO TMUX. `tmux new-session` attaches to the tmux
+            # SERVER, which was started with its OWN (stale) environment -- a var
+            # merely exported in THIS shell is NOT visible inside the new session
+            # (verified: plain new-session drops STAGE_WS_ROOT). So bake the
+            # stage-critical vars into the command with an inline prefix, which
+            # is portable across tmux versions (unlike `-e`). STAGE_WS_ROOT is
+            # the decisive one: without it the worker stages to the default
+            # checkout, and if that workspace's CitC token bucket is drained the
+            # build dies. Capture whatever the caller exported (default to the
+            # current value so `export STAGE_WS_ROOT=...; tpu build-worker start`
+            # just works), and forward the queue file + smart-cell opt-out too.
+            local _sws="${STAGE_WS_ROOT:-}"
+            local _nosc="${TPU_NO_SMART_CELL:-}"
+            local _envprefix="TPU_LOCAL_QUEUE_FILE='$qfile'"
+            [ -n "$_sws" ]  && _envprefix="$_envprefix STAGE_WS_ROOT='$_sws'"
+            [ -n "$_nosc" ] && _envprefix="$_envprefix TPU_NO_SMART_CELL='$_nosc'"
             # A restart loop so a worker crash self-heals; each iteration builds
             # at most one job then the binary loops internally.
             tmux new-session -d -s "$wsess" -c "$HOME" \
-              "while true; do TPU_LOCAL_QUEUE_FILE='$qfile' '$_ROUTE_CHECK_BIN' --worker --queue_file='$qfile' --nodry_run; echo '[build-worker] loop exited rc='\$?', restart in 5s'; sleep 5; done"
+              "while true; do $_envprefix '$_ROUTE_CHECK_BIN' --worker --queue_file='$qfile' --nodry_run; echo '[build-worker] loop exited rc='\$?', restart in 5s'; sleep 5; done"
             echo -e "\033[36m[build-worker] started serial worker in tmux '$wsess' (queue=$qfile).\033[0m"
+            [ -n "$_sws" ] && echo -e "\033[36m  STAGE_WS_ROOT=$_sws (staging workspace pinned).\033[0m"
+            [ -z "$_sws" ] && echo -e "\033[33m  STAGE_WS_ROOT not set: worker stages to the DEFAULT checkout. If that workspace's CitC bucket is drained, export STAGE_WS_ROOT=<healthy google3 root> before start.\033[0m"
             echo "  one build at a time; watch: tmux attach -t $wsess  |  $TPU_CMD_NAME build-worker status"
           fi
           ;;
