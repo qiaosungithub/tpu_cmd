@@ -72,6 +72,10 @@ _INFRA_CHECK_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental
 # replaces it. Built by: blaze build experimental/users/qiaos/tpu_utils:{queue_cli,route_check}
 _QUEUE_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/queue_cli"
 _ROUTE_CHECK_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/route_check"
+# Smart cell picker: makes `tpu queue` pin the best placeable cell by default.
+# Fail-safe -- if missing/erroring, tpu queue falls back to the allocator.
+# Built by: blaze build experimental/users/qiaos/tpu_utils:pick_cell
+_PICK_CELL_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/pick_cell"
 _MACH_LOCALITY="/usr/local/bin/mach_locality"
 # Default must track xm_launcher.py's --bucket default; only used to work out
 # which continent the data is in when the caller does not pass --bucket.
@@ -471,6 +475,33 @@ print(d['group'], d['tpu_type'], d['status'],
     if [ -z "$group" ]; then
       echo "Error: Please specify --group (e.g., --group=5) or --power="
       return 1
+    fi
+
+    # ============ SMART CELL SELECTION (default) ============
+    # Pin the cell that can actually place this slice RIGHT NOW (most free chips,
+    # not oversold), so a submit stops landing on an oversold cell while the same
+    # accelerator sits idle elsewhere. This is the DEFAULT for every `tpu queue`.
+    #
+    # It is skipped, by design, when:
+    #   * the user pinned --cell (their choice always wins);
+    #   * --power was used (the router above already chose and pinned a cell);
+    #   * --tpu_type is a comma list (one cell cannot serve several types).
+    # And it is FAIL-SAFE: if the picker cannot recommend (no candidate, RPC
+    # failed, binary missing) it prints nothing and we fall back to today's
+    # behaviour -- let the allocator choose. It can only help, never block.
+    if [ -z "$user_cell" ] && [ -z "$power" ] && [[ "$tpu_type" != *,* ]] && [ "${TPU_NO_SMART_CELL:-0}" != "1" ]; then
+      if [ -x "$_PICK_CELL_BIN" ]; then
+        local first_g_pick="${group%%,*}"
+        local picked_cell
+        picked_cell=$("$_PICK_CELL_BIN" --tpu_type="$tpu_type" --group="$first_g_pick" --tier="${tier:-PROD}" 2>/dev/null | tail -n 1)
+        if [ -n "$picked_cell" ]; then
+          passthrough_args+=("--cell=$picked_cell")
+          user_cell="$picked_cell"   # so the locality guard below sees it
+          echo -e "\033[36m[$TPU_CMD_NAME queue] Smart cell: pinned --cell=$picked_cell (most free, non-oversold for $tpu_type). Override with --cell, or disable with TPU_NO_SMART_CELL=1.\033[0m"
+        else
+          echo -e "\033[2m[$TPU_CMD_NAME queue] Smart cell: no better cell found; letting the allocator choose (today's behaviour).\033[0m"
+        fi
+      fi
     fi
 
     # ============ BUDGET CHECK ============
