@@ -214,6 +214,15 @@ _tpu_restart_check_daemon() {
 }
 
 # Intercepts 'tpu queue' and forwards everything else to the check/quota logic or original tpu system command.
+# One extractor for the one concept. XManager's experiment id may arrive
+# colorized (\x1b[1m\x1b[34m between the sentence and the digits), so every
+# reader must strip ANSI first -- this file has already paid three defects to
+# per-call-site copies of this logic (see ACCEPT BOTH LINES inside tpu()).
+_tpu_extract_xid() {
+  sed -e 's/\x1b\[[0-9;]*m//g' "$1" \
+    | grep -oP '(?:Launched experiment|work unit\(s\) to experiment) \K\d+' | head -n 1
+}
+
 tpu() {
   if [ "$1" = "queue" ] || [ "$1" = "q" ]; then
     shift
@@ -464,6 +473,14 @@ print(d['group'], d['tpu_type'], d['status'],
       return 1
     fi
 
+    # ============ BUDGET CHECK ============
+    local budget_script="$HOME/work/wiki_agents/tools/budget_check.py"
+    if [ -x "$budget_script" ]; then
+      if ! "$budget_script" "$tpu_type" "${tier:-PROD}" "$lo_price"; then
+        return 1
+      fi
+    fi
+
     # ============ PREFLIGHT CHECK (before the ~5 min bazel packaging) ============
     if [ "$skip_preflight" != "1" ] && [ -x "$_PREFLIGHT_CLI_BIN" ]; then
       local pf_tier="${tier:-PROD}"
@@ -509,6 +526,15 @@ print(d['group'], d['tpu_type'], d['status'],
     # (fails if the name is taken) is a belt-and-suspenders guard that just draws a
     # fresh hash on the ~never case. Only the non-resume branch creates a stagedir.
     local now=$(date '+%y%m%d_%H%M%S')
+    # STAGE WORKSPACE ROOT (escape hatch). Defaults to the qiaos/802 EqR-jax
+    # CitC workspace (historical). If that workspace's CreateSnapshot token
+    # bucket is drained (writes dropped -> empty stagedir -> launch dies in
+    # os.getcwd()), export STAGE_WS_ROOT to a HEALTHY workspace google3 root to
+    # stage there instead, e.g.:
+    #   export STAGE_WS_ROOT=/google/src/cloud/qiaos/xm_test/google3   # qiaos/2
+    # The dir ${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages must exist.
+    # NOTE: any workspace can be drained the same way -- keep launches SERIAL.
+    local STAGE_WS_ROOT="${STAGE_WS_ROOT:-/google/src/cloud/qiaos/EqR-jax/google3}"
     if [ -z "$resume_xid" ]; then
       local _ts="$now"
       local _tries=0
@@ -517,7 +543,7 @@ print(d['group'], d['tpu_type'], d['status'],
         local _hash=$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
         [ -n "$_hash" ] || _hash=$(printf '%04x%02x' "$RANDOM" "$((RANDOM % 256))")
         now="${_ts}_${_hash}"
-        mkdir "/google/src/cloud/qiaos/EqR-jax/google3/experimental/qiaos/eqr_jax_final_stages/eqr_run_${now}" 2>/dev/null && break
+        mkdir "${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages/eqr_run_${now}" 2>/dev/null && break
         _tries=$((_tries + 1))
         if [ "$_tries" -gt 100 ]; then
           echo -e "\033[31m[stagedir] could not claim a unique stagedir after 100 tries near ${_ts}\033[0m" >&2
@@ -530,7 +556,7 @@ print(d['group'], d['tpu_type'], d['status'],
     echo "Created logdir: $logdir"
     
     local stagedir="experimental/qiaos/eqr_jax_final_stages/eqr_run_${now}"
-    local abs_stagedir="/google/src/cloud/qiaos/EqR-jax/google3/${stagedir}"
+    local abs_stagedir="${STAGE_WS_ROOT}/${stagedir}"
 
     # A RESUME RE-RUNS THE ORIGINAL SNAPSHOT. NEVER THE CURRENT CHECKOUT.
     #
@@ -568,7 +594,7 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
         return 1
       fi
       stagedir="$prior_stagedir"
-      abs_stagedir="/google/src/cloud/qiaos/EqR-jax/google3/${stagedir}"
+      abs_stagedir="${STAGE_WS_ROOT}/${stagedir}"
       if [ ! -d "$abs_stagedir" ]; then
         echo -e "\033[31m[resume] Recorded stagedir is gone: $abs_stagedir\033[0m"
         echo -e "\033[31m  Cannot resume XID $resume_xid without the code it ran.\033[0m"
@@ -673,7 +699,12 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       # command, --resume_xid included, so a second work unit joined the same
       # experiment and the two raced for one checkpoint path -- and, because
       # registration sits under this same test, neither reached `tpu check`.
-      local xid=$(grep -oP '(?:Launched experiment|work unit\(s\) to experiment) \K\d+' "$log_file" | head -n 1)
+      # THIRD FORM OF THIS TRAP (2026-08-21): the sentence is right but xmanager
+      # sometimes colorizes the id -- \x1b[1m\x1b[34m sits between the space and
+      # the digits, so \K\d+ fails, the launch is misread as dead, the retry
+      # DOUBLE-SUBMITS, and the real XID never reaches the registry. Strip ANSI
+      # first; `cat` shows nothing, only `cat -v` reveals the codes.
+      local xid=$(_tpu_extract_xid "$log_file")
 
       if [ -z "$xid" ]; then
         echo -e "\033[31m[launch] No experiment line -- the launcher died before creating or joining the experiment.\033[0m"
@@ -691,6 +722,7 @@ try:
 except OSError:
     sys.exit(0)
 # The launcher prints the XID it reserved even when it dies later.
+text = re.sub(r'\x1b\[[0-9;]*m', '', text)  # same ANSI trap as the shell grep above
 m = re.search(r'https?://xids?/(\d+)|experiment_id[\'":= ]+(\d+)', text)
 xid = next((g for g in (m.groups() if m else ()) if g), None)
 if not xid:
@@ -723,7 +755,7 @@ PYEOF
           # -a: the retry must not overwrite the first attempt's log. It used
           # to, which erased the evidence of whatever killed attempt one.
           "${xm_args[@]}" 2>&1 | tee -a "$log_file"
-          xid=$(grep -oP '(?:Launched experiment|work unit\(s\) to experiment) \K\d+' "$log_file" | head -n 1)
+          xid=$(_tpu_extract_xid "$log_file")
           unset _TPU_LAUNCH_RETRIED
           [ -n "$xid" ] && echo -e "\033[32m[launch] Retry succeeded: XID $xid\033[0m"
         fi
@@ -1436,8 +1468,8 @@ EOF
     # Check defaults & freshness
     if [ -f "$CACHE_DIR/default.txt" ]; then
         local AGE=$(($(date +%s) - $(stat -c %Y "$CACHE_DIR/default.txt")))
-        if [ "$AGE" -gt 180 ]; then
-            echo -e "\033[31m[$TPU_CMD_NAME quota] 🚨 ALERT: quota data is stale (last updated ${AGE}s ago, over the 3-minute limit)!\033[0m"
+        if [ "$AGE" -gt 300 ]; then
+            echo -e "\033[31m[$TPU_CMD_NAME quota] 🚨 ALERT: quota data is stale (last updated ${AGE}s ago, over the 5-minute limit)!\033[0m"
             echo -e "\033[33mLikely cause: LOAS / gcert credentials expired, or the background poller died.\033[0m"
             echo -e "\033[36m[auto-recovery] Restarting the tpu-daemon background tmux session...\033[0m"
             
@@ -1469,8 +1501,8 @@ EOF
     local CACHE_DIR="$HOME/.tpu_quota_cache_dir"
     if [ -f "$CACHE_DIR/money.txt" ]; then
         local AGE=$(($(date +%s) - $(stat -c %Y "$CACHE_DIR/money.txt")))
-        if [ "$AGE" -gt 180 ]; then
-            echo -e "\033[31m[$TPU_CMD_NAME money] 🚨 ALERT: bidding power / price data is stale (last updated ${AGE}s ago, over the 3-minute limit)!\033[0m"
+        if [ "$AGE" -gt 300 ]; then
+            echo -e "\033[31m[$TPU_CMD_NAME money] 🚨 ALERT: bidding power / price data is stale (last updated ${AGE}s ago, over the 5-minute limit)!\033[0m"
             echo -e "\033[33mLikely cause: LOAS / gcert credentials expired, or the background poller died.\033[0m"
             echo -e "\033[36m[auto-recovery] Restarting the tpu-daemon background tmux session...\033[0m"
             

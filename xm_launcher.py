@@ -62,6 +62,7 @@ _CELL_BUCKETS = {
     'yucbfiv': '/cns/is-d/home/qiaos/eqr_data',   # cbf -> is-d  69.1 PiB sp50
     'yucbful': '/cns/is-d/home/qiaos/eqr_data',   # cbf
     'yucbfwv': '/cns/is-d/home/qiaos/eqr_data',   # cbf
+    'yucbfsl': '/cns/is-d/home/qiaos/eqr_data',   # cbf
     'je':      '/cns/is-d/home/qiaos/eqr_data',   # cbf
     'yutulpz': '/cns/oi-d/home/qiaos/eqr_data',   # tul -> oi-d (nm-d group quota FULL 47.9/48.2P; oi-d same-metro, 29.6P)
     'nl':      '/cns/oi-d/home/qiaos/eqr_data',   # tul -> oi-d
@@ -775,6 +776,60 @@ def main(argv) -> None:
     _title_prefix = os.environ.get("TPU_JOB_NAME_PREFIX", "")
     if _title_prefix and not exp_name.startswith(_title_prefix):
         exp_name = f"{_title_prefix}{exp_name}"
+
+    # --- Research Hub 归属提示:跳过它,不要等满 25 分钟 -------------------
+    # 【2026-08-21 由 lyy 明确授权改这一处。备份:
+    #   ~/lyy-work/.bak_xm_launcher.py.20260821_112107】
+    #
+    # 2026-08-21 08:11 起,本工作站每一次 create_experiment() 都会触发 Research
+    # Hub 的 effort 归属交互提示。alloc 'fr-dna-grand-challenge-team-resource'
+    # 没有链到本账号任何 active effort,提示因此每次都弹。
+    #
+    # 它在无人值守场景里**无法被回答**,两条独立原因:
+    #   * 它不读 stdin,直接开 /dev/tty(//depot/google3/pyglib/promptutil.py:570
+    #     tty_raw_input,默认 _SubstituteTtyStdin),所以 `< /dev/null` 无效;
+    #   * attribution_urls 没有「空值即跳过」的语义 —— policy.py:480 是
+    #     `if description.attribution_urls:`,传 [] 或 '' 都落进 else 分支照弹。
+    #
+    # 代价是 5 次 × 300 秒 = **最多 25 分钟纯空转**
+    #   (_MAXIMUM_PROMPT_LIMIT=5 见 interactive.py:28;
+    #    xm_attribution_prompt_timeout_seconds 默认 300 见 policy_flags.py:18)。
+    #
+    # **关掉 enforcement 不改变归属结果。** 今天每一条投放最后都是无归属的 ——
+    # 提示答不上,它等满就放行。所以这一段去掉的是空转,不是记账。
+    # policy.py:373-379 读到该 flag 为真就 return True,不发任何 Research Hub
+    # RPC、不弹提示,telemetry 里记 skip_reason=DISABLE_FLAG,**不会把开销记到
+    # 任何真实 effort 上** —— 那正是不能随手编一个 rh/efforts/NNNN 的理由。
+    # 该 flag 是官方 opt-out(policy_flags.py:28 'Disable attribution
+    # enforcement for this launch'),ceres_ml 等生产 pipeline 成批在用。
+    #
+    # 拿到真实 effort 号之后应该换成显式归属,并把这一段删掉。两种写法:
+    #     export XM_ATTRIBUTION_URLS=rh/efforts/NNNN     # 无需改本文件
+    #     xm_abc.create_experiment(..., attribution_urls=['rh/efforts/NNNN'])
+    #
+    # 为什么必须先摸一下 xm_abc 的属性:xm_abc 是懒加载包
+    # (xm_abc/__init__.py 用 module_lazy_loader,真正的 import 写在
+    #  `if typing.TYPE_CHECKING:` 里),不触发导入的话 policy_flags 还没被加载,
+    # 这个 flag 名在 flags.FLAGS 里根本不存在。
+    # 也正因如此**不能从命令行传**:app.run() 在 main() 之前解析 argv,那时名字
+    # 可能还没注册,而未知的 --flag 会穿过 known_only=True 的解析,被下面约
+    # 1183 行的转发循环塞给 trainer,把训练进程搞崩。
+    #
+    # --resume_xid 那条分支不需要处理:xm_abc.get_experiment 只做一次
+    # get_experiment RPC,全 google3 里 maybe_enforce_attribution_urls 的唯一
+    # 非测试调用点是 launcher.py:433,只挂在新建实验这条路上。
+    _ = xm_abc.create_experiment          # 触发懒加载,注册 policy_flags
+    _ATTR_OPT_OUT = 'xm_disable_effort_attribution_enforcement'
+    if _ATTR_OPT_OUT in flags.FLAGS:
+        flags.FLAGS[_ATTR_OPT_OUT].value = True
+        print('[launcher] Research Hub 归属强制已关闭(官方 opt-out flag);'
+              '本次投放不会因归属提示空转。拿到真实 rh/efforts 号后请改用 '
+              'XM_ATTRIBUTION_URLS。')
+    else:
+        print(f'[launcher] 警告:{_ATTR_OPT_OUT} 未注册,归属提示可能仍会出现'
+              f'(最多空转 25 分钟)。请检查 xm_abc 懒加载是否变了。')
+    # ----------------------------------------------------------------------
+
     experiment_context = xm_abc.get_experiment(experiment_id=_RESUME_XID.value) if _RESUME_XID.value else xm_abc.create_experiment(experiment_title=exp_name)
     with experiment_context as experiment:
         
