@@ -18,6 +18,19 @@ CACHE_FILE="$TPU_CHECK_CACHE_FILE"
 TMP_FILE="$TPU_CHECK_CACHE_FILE.tmp"
 TIME_FILE="$TPU_CHECK_TIME_FILE"
 
+# SMART-ROUTER LANE (4th lane), OFF BY DEFAULT. When TPU_ROUTE_ENABLED=1 the
+# daemon drains the local queue (~/.tpu_local_queue.json) into the XM queue on
+# each round and re-routes jobs stuck PENDING past the deadline. Left unset it
+# is a complete no-op -- the daemon behaves exactly as before. TPU_ROUTE_DRYRUN=1
+# (default) makes the lane plan-and-log only; set TPU_ROUTE_DRYRUN=0 to actually
+# submit and cancel. The queue file is operator-scoped like the registry.
+: "${TPU_ROUTE_ENABLED:=0}"
+: "${TPU_ROUTE_DRYRUN:=1}"
+: "${TPU_LOCAL_QUEUE_FILE:=$HOME/.tpu_local_queue.json}"
+: "${TPU_ROUTE_GROUP:=9}"
+: "${TPU_ROUTE_REROUTE_AFTER_S:=600}"
+export TPU_LOCAL_QUEUE_FILE
+
 cd /google/src/cloud/qiaos/xm_test/google3 || {
     echo "Directory not found!"
     sleep 60
@@ -51,6 +64,7 @@ CHECKER_NAMES="money_check quota_check infra_check"
 BLAZE_BIN="$(readlink ./blaze-bin 2>/dev/null || echo "$G3/blaze-bin")"
 CHECKER_DIR="$BLAZE_BIN/$CHECKER_SUBDIR"
 BUILD_HINT="(cd $G3 && blaze build $CHECKER_SUBDIR:{money_check,quota_check,infra_check})"
+BUILD_HINT_ROUTE="(cd $G3 && blaze build $CHECKER_SUBDIR:route_check)"
 
 # Usable path for checker $1, or nothing. Resolved at every use, and falling
 # back to the live symlink so a config change cannot strand the daemon.
@@ -131,6 +145,30 @@ run_infra_check() {
 }
 
 
+# SMART-ROUTER LANE. Off unless TPU_ROUTE_ENABLED=1. Drains the local queue
+# (place pass) then re-routes jobs stuck PENDING (reroute pass). Each pass is
+# its own route_check invocation reading/writing the same operator-scoped queue
+# file. --nodry_run only when TPU_ROUTE_DRYRUN=0; otherwise it plans and logs.
+# Like infra, this makes serial XManager/goodput RPCs, so it runs DETACHED off
+# the fast lane -- money/quota must never wait on it.
+run_route_lane() {
+  local bin dry_flag
+  bin=$(checkerbin route_check) || {
+    echo "$(date): route lane - route_check not built; skipping (build: $BUILD_HINT_ROUTE)"
+    return 1
+  }
+  if [ "$TPU_ROUTE_DRYRUN" = "0" ]; then dry_flag="--nodry_run"; else dry_flag="--dry_run"; fi
+  echo "$(date): route lane - place pass ($dry_flag, queue=$TPU_LOCAL_QUEUE_FILE)"
+  "$bin" --queue_file="$TPU_LOCAL_QUEUE_FILE" --group="$TPU_ROUTE_GROUP" "$dry_flag" 2>&1 \
+    | sed 's/^/  [route:place] /'
+  echo "$(date): route lane - reroute pass ($dry_flag, after ${TPU_ROUTE_REROUTE_AFTER_S}s)"
+  "$bin" --queue_file="$TPU_LOCAL_QUEUE_FILE" --reroute \
+    --reroute_after_s="$TPU_ROUTE_REROUTE_AFTER_S" "$dry_flag" 2>&1 \
+    | sed 's/^/  [route:reroute] /'
+  echo "$(date): route lane - done"
+}
+
+
 # $1 = binary name, $2 = human-readable label for logs.
 run_named_check() {
   local bin out rc
@@ -171,7 +209,7 @@ run_named_check() {
 # The slow-lane infra pass runs detached; reap it on exit so the outer
 # `while true; do tpu_check_daemon.sh; sleep 5; done` wrapper cannot accumulate
 # orphaned infra children across daemon restarts.
-trap '[ -n "${INFRA_PID:-}" ] && kill "$INFRA_PID" 2>/dev/null' EXIT
+trap '[ -n "${INFRA_PID:-}" ] && kill "$INFRA_PID" 2>/dev/null; [ -n "${ROUTE_PID:-}" ] && kill "$ROUTE_PID" 2>/dev/null' EXIT
 
 while true; do
   ROUND_START=$(date +%s)
@@ -207,6 +245,19 @@ while true; do
     INFRA_START=$(date +%s)
   else
     echo "$(date): infra pass still running ($(( $(date +%s) - ${INFRA_START:-0} ))s); skipping this round"
+  fi
+
+  # ROUTER LANE (4th lane), OFF unless TPU_ROUTE_ENABLED=1. Same discipline as
+  # infra: DETACHED so its serial RPCs never delay money/quota, with a kill -0
+  # guard so a slow pass does not stack. A no-op when disabled.
+  if [ "$TPU_ROUTE_ENABLED" = "1" ]; then
+    if [ -z "${ROUTE_PID:-}" ] || ! kill -0 "$ROUTE_PID" 2>/dev/null; then
+      run_route_lane &
+      ROUTE_PID=$!
+      ROUTE_START=$(date +%s)
+    else
+      echo "$(date): route lane still running ($(( $(date +%s) - ${ROUTE_START:-0} ))s); skipping this round"
+    fi
   fi
 
   echo "$(date): --- fast-lane round took $(( $(date +%s) - ROUND_START ))s ---"

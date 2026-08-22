@@ -67,6 +67,11 @@ get_group_id_by_alloc() {
 _PREFLIGHT_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/preflight_cli"
 _ROUTER_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/router_cli"
 _INFRA_CHECK_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/infra_check"
+# The local-queue smart-router CLI (tpu enqueue / queue-status / dequeue) and
+# the router tick (tpu route-tick). Side-by-side with `tpu queue`; never
+# replaces it. Built by: blaze build experimental/users/qiaos/tpu_utils:{queue_cli,route_check}
+_QUEUE_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/queue_cli"
+_ROUTE_CHECK_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/route_check"
 _MACH_LOCALITY="/usr/local/bin/mach_locality"
 # Default must track xm_launcher.py's --bucket default; only used to work out
 # which continent the data is in when the caller does not pass --bucket.
@@ -1234,6 +1239,47 @@ EOF
       return "$_rc" 2>/dev/null || exit "$_rc"
     fi
 
+    # LOCAL QUEUE SUMMARY (cache-only, no RPC -- keeps `tpu check` instant).
+    # Shows the smart-queue's stored state beneath the XM board so both are in
+    # one view. The live "why is each waiting" is `tpu queue-status`. Silent if
+    # the operator has never enqueued anything (no file / empty), so nobody who
+    # ignores the new system sees new output.
+    local _lq="${TPU_LOCAL_QUEUE_FILE:-$HOME/.tpu_local_queue.json}"
+    if [ -s "$_lq" ]; then
+      TPU_LQ_FILE="$_lq" python3 - << 'LQEOF'
+import json, os, sys
+sys.path[:] = [p for p in sys.path if p not in ('', os.getcwd())]
+path = os.environ['TPU_LQ_FILE']
+try:
+    with open(path) as f:
+        raw = json.load(f)
+except Exception:
+    sys.exit(0)
+entries = raw.get('entries', raw) if isinstance(raw, dict) else raw
+if not entries:
+    sys.exit(0)
+from collections import Counter
+c = Counter(e.get('state', '?') for e in entries)
+COL = {'QUEUED': '\033[33m', 'SUBMITTED': '\033[36m', 'RUNNING': '\033[32m',
+       'FAILED': '\033[31m', 'DONE': '\033[35m'}
+summary = '  '.join(f"{COL.get(k,'')}{k}:{v}\033[0m" for k, v in sorted(c.items()))
+print(f"\n\033[1;36m━━ Local Queue (smart router) ━━\033[0m   {summary}")
+# show the QUEUED and SUBMITTED ones compactly; terminal states stay collapsed.
+rows = [e for e in entries if e.get('state') in ('QUEUED', 'SUBMITTED')]
+for e in sorted(rows, key=lambda e: (e.get('state') != 'QUEUED', -e.get('priority', 0))):
+    jid = str(e.get('job_id', '?'))[:24]
+    st = e.get('state', '?')
+    disp = f"{COL.get(st,'')}{st:9s}\033[0m"
+    archs = ','.join(e.get('allowed_archs', []))[:14]
+    why = e.get('last_reason', '') or ''
+    if st == 'SUBMITTED':
+        why = f"xid={e.get('xid')} {e.get('cell') or '?'} {e.get('arch') or ''}-{e.get('chips') or ''}".strip()
+    lock = ' \033[35m[lock]\033[0m' if e.get('topology_locked') else ''
+    print(f"  {jid:24s} {disp} {str(e.get('power','')):9s} {archs:14s} {why}{lock}")
+print("\033[2m  Full live view: tpu queue-status\033[0m")
+LQEOF
+    fi
+
   elif [[ "$1" == "cancel" || "$1" == "stop" ]]; then
     shift
     local dry_run=0
@@ -1492,6 +1538,36 @@ EOF
       sleep 5
     done
 
+  # --- LOCAL QUEUE + SMART ROUTER (side-by-side; never touches `tpu queue`) ---
+  # `tpu enqueue` adds a DESIRED run to an unlimited local queue (a queued job
+  # costs nothing -- PENDING does not bill). The router (`tpu route-tick`, run
+  # by the daemon) drains it into the XM queue only when a cell can actually
+  # place it, so a job never sits PENDING for hours in an oversold cell.
+  #   tpu enqueue --power=v7-32 --archs=v7,v6p --launch=config=configs/eqr.py
+  #   tpu queue-status        # the local queue + WHY each job waits
+  #   tpu dequeue <job_id>    # drop one before it is submitted
+  elif [[ "$1" == "enqueue" || "$1" == "queue-status" || "$1" == "qs" \
+          || "$1" == "dequeue" || "$1" == "route-tick" ]]; then
+    local sub="$1"; shift
+    # Local queue is operator-scoped like the registry: npu overrides this var.
+    local qfile="${TPU_LOCAL_QUEUE_FILE:-$HOME/.tpu_local_queue.json}"
+    if [[ "$sub" == "route-tick" ]]; then
+      if [ ! -x "$_ROUTE_CHECK_BIN" ]; then
+        echo -e "\033[31mRouter tick binary not built. Run:\033[0m"
+        echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils:route_check)"
+        return 1
+      fi
+      "$_ROUTE_CHECK_BIN" --queue_file="$qfile" "$@"
+    else
+      if [ ! -x "$_QUEUE_CLI_BIN" ]; then
+        echo -e "\033[31mLocal-queue CLI not built. Run:\033[0m"
+        echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils:queue_cli)"
+        return 1
+      fi
+      # queue-status has an alias `qs`; the binary understands both.
+      "$_QUEUE_CLI_BIN" "$sub" --queue_file="$qfile" "$@"
+    fi
+
   else
     command tpu "$@"
   fi
@@ -1516,5 +1592,8 @@ npu() {
   local -x TPU_JOB_NAME_PREFIX="${NPU_JOB_NAME_PREFIX:-lyy-}"
   local -x TPU_CMD_NAME="npu"
   local -x TPU_OPERATOR="lyy"
+  # The smart local queue is per-operator too, or npu's enqueue would land in
+  # sqa's queue and the router would submit it under the wrong bookkeeping.
+  local -x TPU_LOCAL_QUEUE_FILE="${NPU_LOCAL_QUEUE_FILE:-$HOME/lyy-work/.npu_local_queue.json}"
   tpu "$@"
 }
