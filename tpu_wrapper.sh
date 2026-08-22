@@ -241,6 +241,7 @@ tpu() {
     local lo_price=""
     local no_limit_order=0
     local user_cell=""
+    local user_metros=""
     local resume_xid=""
     local passthrough_args=()
     
@@ -340,6 +341,23 @@ tpu() {
         --cell)
           user_cell="$2"
           passthrough_args+=("$1=$2")
+          shift 2
+          ;;
+        # --metro / --metros constrain the SMART CELL pick to one or more metros
+        # WITHOUT pinning a single cell. This is the right tool for a
+        # data-locality-locked run: a whole metro shares one storage cell (cbf's
+        # yucbfiv/yucbful/yucbfwv/yucbfsl/je all read /cns/is-d), so naming the
+        # metro keeps the job same-metro while the picker still avoids the
+        # oversold cells INSIDE it -- both goals at once, instead of over-pinning
+        # one cell by hand. It is a router selector only, so it is NOT passed
+        # through to `tpu queue`/xm_launcher (which do not understand it); it just
+        # feeds pick_cell --metros below.
+        --metro=*|--metros=*)
+          user_metros="${1#*=}"
+          shift
+          ;;
+        --metro|--metros)
+          user_metros="$2"
           shift 2
           ;;
         # --tmp_ram_fs_gib sizes the per-task RAM disk backing /tmp. The
@@ -493,11 +511,22 @@ print(d['group'], d['tpu_type'], d['status'],
       if [ -x "$_PICK_CELL_BIN" ]; then
         local first_g_pick="${group%%,*}"
         local picked_cell
-        picked_cell=$("$_PICK_CELL_BIN" --tpu_type="$tpu_type" --group="$first_g_pick" --tier="${tier:-PROD}" 2>/dev/null | tail -n 1)
+        # A --metro/--metros constraint (data-locality) is forwarded so the pick
+        # stays inside the metro that co-locates the data while still avoiding
+        # oversold cells within it.
+        local pick_metro_args=()
+        if [ -n "$user_metros" ]; then
+          pick_metro_args=(--metros="$user_metros")
+        fi
+        picked_cell=$("$_PICK_CELL_BIN" --tpu_type="$tpu_type" --group="$first_g_pick" --tier="${tier:-PROD}" "${pick_metro_args[@]}" 2>/dev/null | tail -n 1)
         if [ -n "$picked_cell" ]; then
           passthrough_args+=("--cell=$picked_cell")
           user_cell="$picked_cell"   # so the locality guard below sees it
-          echo -e "\033[36m[$TPU_CMD_NAME queue] Smart cell: pinned --cell=$picked_cell (most free, non-oversold for $tpu_type). Override with --cell, or disable with TPU_NO_SMART_CELL=1.\033[0m"
+          local metro_note=""
+          [ -n "$user_metros" ] && metro_note=" in metro=$user_metros"
+          echo -e "\033[36m[$TPU_CMD_NAME queue] Smart cell: pinned --cell=$picked_cell (most free, non-oversold for $tpu_type$metro_note). Override with --cell, or disable with TPU_NO_SMART_CELL=1.\033[0m"
+        elif [ -n "$user_metros" ]; then
+          echo -e "\033[33m[$TPU_CMD_NAME queue] Smart cell: no placeable cell in metro=$user_metros for $tpu_type right now; letting the allocator choose. Pin --cell if you must stay in-metro.\033[0m"
         else
           echo -e "\033[2m[$TPU_CMD_NAME queue] Smart cell: no better cell found; letting the allocator choose (today's behaviour).\033[0m"
         fi
