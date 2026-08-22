@@ -1356,13 +1356,15 @@ if not entries:
     sys.exit(0)
 from collections import Counter
 c = Counter(e.get('state', '?') for e in entries)
-COL = {'QUEUED': '\033[33m', 'SUBMITTED': '\033[36m', 'RUNNING': '\033[32m',
-       'FAILED': '\033[31m', 'DONE': '\033[35m'}
+COL = {'QUEUED': '\033[33m', 'BUILDING': '\033[1;35m', 'SUBMITTED': '\033[36m',
+       'RUNNING': '\033[32m', 'FAILED': '\033[31m', 'DONE': '\033[35m'}
 summary = '  '.join(f"{COL.get(k,'')}{k}:{v}\033[0m" for k, v in sorted(c.items()))
 print(f"\n\033[1;36m━━ Local Queue (smart router) ━━\033[0m   {summary}")
-# show the QUEUED and SUBMITTED ones compactly; terminal states stay collapsed.
-rows = [e for e in entries if e.get('state') in ('QUEUED', 'SUBMITTED')]
-for e in sorted(rows, key=lambda e: (e.get('state') != 'QUEUED', -e.get('priority', 0))):
+# show BUILDING first (the one live build), then QUEUED and SUBMITTED; terminal
+# states stay collapsed into the count summary above.
+_order = {'BUILDING': 0, 'QUEUED': 1, 'SUBMITTED': 2}
+rows = [e for e in entries if e.get('state') in ('QUEUED', 'BUILDING', 'SUBMITTED')]
+for e in sorted(rows, key=lambda e: (_order.get(e.get('state'), 9), -e.get('priority', 0))):
     jid = str(e.get('job_id', '?'))[:24]
     st = e.get('state', '?')
     disp = f"{COL.get(st,'')}{st:9s}\033[0m"
@@ -1643,11 +1645,56 @@ EOF
   #   tpu queue-status        # the local queue + WHY each job waits
   #   tpu dequeue <job_id>    # drop one before it is submitted
   elif [[ "$1" == "enqueue" || "$1" == "queue-status" || "$1" == "qs" \
-          || "$1" == "dequeue" || "$1" == "route-tick" ]]; then
+          || "$1" == "dequeue" || "$1" == "route-tick" || "$1" == "build-worker" ]]; then
     local sub="$1"; shift
     # Local queue is operator-scoped like the registry: npu overrides this var.
     local qfile="${TPU_LOCAL_QUEUE_FILE:-$HOME/.tpu_local_queue.json}"
-    if [[ "$sub" == "route-tick" ]]; then
+    if [[ "$sub" == "build-worker" ]]; then
+      # The SERIAL build-worker: one build at a time, forever, draining the
+      # local queue. Runs in a dedicated tmux session so it survives the shell
+      # and is easy to observe. Sub-actions: start (default) / stop / status / run.
+      if [ ! -x "$_ROUTE_CHECK_BIN" ]; then
+        echo -e "\033[31mRouter binary not built. Run:\033[0m"
+        echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils:route_check)"
+        return 1
+      fi
+      local wsess="${TPU_BUILD_WORKER_SESSION:-tpu-build-worker}"
+      local action="${1:-start}"
+      case "$action" in
+        run)  # run the loop in the FOREGROUND (used inside tmux, or for debug)
+          shift
+          exec "$_ROUTE_CHECK_BIN" --worker --queue_file="$qfile" --nodry_run "$@"
+          ;;
+        stop)
+          tmux kill-session -t "$wsess" 2>/dev/null && \
+            echo "[build-worker] stopped ($wsess)." || \
+            echo "[build-worker] not running ($wsess)."
+          ;;
+        status)
+          if tmux has-session -t "$wsess" 2>/dev/null; then
+            echo "[build-worker] RUNNING ($wsess). Recent:"; tmux capture-pane -t "$wsess" -p 2>/dev/null | grep -vE '^\s*$' | tail -8
+          else
+            echo "[build-worker] not running. Start: $TPU_CMD_NAME build-worker start"
+          fi
+          ;;
+        start)
+          if tmux has-session -t "$wsess" 2>/dev/null; then
+            echo "[build-worker] already running ($wsess). $TPU_CMD_NAME build-worker status | stop"
+          else
+            # A restart loop so a worker crash self-heals; each iteration builds
+            # at most one job then the binary loops internally.
+            tmux new-session -d -s "$wsess" -c "$HOME" \
+              "while true; do TPU_LOCAL_QUEUE_FILE='$qfile' '$_ROUTE_CHECK_BIN' --worker --queue_file='$qfile' --nodry_run; echo '[build-worker] loop exited rc='\$?', restart in 5s'; sleep 5; done"
+            echo -e "\033[36m[build-worker] started serial worker in tmux '$wsess' (queue=$qfile).\033[0m"
+            echo "  one build at a time; watch: tmux attach -t $wsess  |  $TPU_CMD_NAME build-worker status"
+          fi
+          ;;
+        *)
+          echo "usage: $TPU_CMD_NAME build-worker [start|stop|status|run]"
+          return 1
+          ;;
+      esac
+    elif [[ "$sub" == "route-tick" ]]; then
       if [ ! -x "$_ROUTE_CHECK_BIN" ]; then
         echo -e "\033[31mRouter tick binary not built. Run:\033[0m"
         echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils:route_check)"
