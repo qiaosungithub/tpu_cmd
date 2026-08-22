@@ -583,7 +583,11 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
     else
     mkdir -p "$abs_stagedir"
     echo "Snapshotting source codebase to CitC stagedir: $abs_stagedir"
-    rsync -aL --exclude={'bazel-*','.citc','.git','__pycache__','*.npy','*.npz','*.ckpt','*.pth','*.pt','*.safetensors','data','logs','wandb'} ./ "$abs_stagedir/"
+    # `.venv` (and `.jj`) are excluded: the Borg interpreter is hermetic, so a
+    # packaged virtualenv is dead weight -- a 17k-file .venv added ~10-15 min of
+    # pure rsync per arm for nothing (arc2 field report). Nothing in xm_launcher
+    # or config.sh reads .venv.
+    rsync -aL --exclude={'bazel-*','.citc','.git','.jj','.venv','__pycache__','*.npy','*.npz','*.ckpt','*.pth','*.pt','*.safetensors','data','logs','wandb'} ./ "$abs_stagedir/"
     if [ ! -f "$abs_stagedir/config.sh" ] && [ -f "$HOME/work/tpu_cmd/config.sh" ]; then
       cp "$HOME/work/tpu_cmd/config.sh" "$abs_stagedir/"
     fi
