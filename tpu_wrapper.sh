@@ -526,7 +526,22 @@ print(d['group'], d['tpu_type'], d['status'],
           [ -n "$user_metros" ] && metro_note=" in metro=$user_metros"
           echo -e "\033[36m[$TPU_CMD_NAME queue] Smart cell: pinned --cell=$picked_cell (most free, non-oversold for $tpu_type$metro_note). Override with --cell, or disable with TPU_NO_SMART_CELL=1.\033[0m"
         elif [ -n "$user_metros" ]; then
-          echo -e "\033[33m[$TPU_CMD_NAME queue] Smart cell: no placeable cell in metro=$user_metros for $tpu_type right now; letting the allocator choose. Pin --cell if you must stay in-metro.\033[0m"
+          # --metro is a HARD data-locality constraint. If NO cell in that metro
+          # can place the slice right now, we must NOT fall back to "let the
+          # allocator choose" -- that roams to an out-of-metro cell with no data
+          # and the job dies in the dataloader (observed: --metro=tul full ->
+          # 3 sqrt arms drifted to yuskedq, no 128 data, crashed). FAIL CLOSED:
+          # refuse to submit so the caller retries later or pins a cell on
+          # purpose. Escape hatches: --force or TPU_METRO_FALLBACK=1 to allow
+          # the roam; or pass an explicit --cell to stage-and-queue in-metro.
+          if [ "$force" = "1" ] || [ "${TPU_METRO_FALLBACK:-0}" = "1" ]; then
+            echo -e "\033[33m[$TPU_CMD_NAME queue] Smart cell: no placeable cell in metro=$user_metros for $tpu_type right now; --force/TPU_METRO_FALLBACK set -> letting the allocator choose (MAY leave the data metro).\033[0m"
+          else
+            echo -e "\033[31m[$TPU_CMD_NAME queue] REFUSING to submit: --metro=$user_metros has no placeable $tpu_type cell right now, and falling back to the allocator would roam to an out-of-metro cell with NO data (dataloader would crash).\033[0m"
+            echo -e "\033[33m  Options: wait and retry (the metro frees up); pin an explicit --cell=<in-metro cell> to stage-and-queue there; or, only if this run has no data-locality need, re-run with --force (or TPU_METRO_FALLBACK=1) to allow an out-of-metro cell.\033[0m"
+            cd "$orig_dir" 2>/dev/null
+            return 1
+          fi
         else
           echo -e "\033[2m[$TPU_CMD_NAME queue] Smart cell: no better cell found; letting the allocator choose (today's behaviour).\033[0m"
         fi
