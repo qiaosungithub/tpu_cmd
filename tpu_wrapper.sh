@@ -1356,14 +1356,15 @@ if not entries:
     sys.exit(0)
 from collections import Counter
 c = Counter(e.get('state', '?') for e in entries)
-COL = {'QUEUED': '\033[33m', 'BUILDING': '\033[1;35m', 'SUBMITTED': '\033[36m',
-       'RUNNING': '\033[32m', 'FAILED': '\033[31m', 'DONE': '\033[35m'}
+COL = {'QUEUED': '\033[33m', 'BUILDING': '\033[1;35m', 'HELD': '\033[1;31m',
+       'SUBMITTED': '\033[36m', 'RUNNING': '\033[32m', 'FAILED': '\033[31m',
+       'DONE': '\033[35m'}
 summary = '  '.join(f"{COL.get(k,'')}{k}:{v}\033[0m" for k, v in sorted(c.items()))
 print(f"\n\033[1;36m━━ Local Queue (smart router) ━━\033[0m   {summary}")
 # show BUILDING first (the one live build), then QUEUED and SUBMITTED; terminal
 # states stay collapsed into the count summary above.
-_order = {'BUILDING': 0, 'QUEUED': 1, 'SUBMITTED': 2}
-rows = [e for e in entries if e.get('state') in ('QUEUED', 'BUILDING', 'SUBMITTED')]
+_order = {'BUILDING': 0, 'HELD': 1, 'QUEUED': 2, 'SUBMITTED': 3}
+rows = [e for e in entries if e.get('state') in ('QUEUED', 'BUILDING', 'HELD', 'SUBMITTED')]
 for e in sorted(rows, key=lambda e: (_order.get(e.get('state'), 9), -e.get('priority', 0))):
     jid = str(e.get('job_id', '?'))[:24]
     st = e.get('state', '?')
@@ -1645,7 +1646,7 @@ EOF
   #   tpu queue-status        # the local queue + WHY each job waits
   #   tpu dequeue <job_id>    # drop one before it is submitted
   elif [[ "$1" == "enqueue" || "$1" == "queue-status" || "$1" == "qs" \
-          || "$1" == "dequeue" || "$1" == "route-tick" || "$1" == "build-worker" ]]; then
+          || "$1" == "dequeue" || "$1" == "requeue" || "$1" == "route-tick" || "$1" == "build-worker" ]]; then
     local sub="$1"; shift
     # Local queue is operator-scoped like the registry: npu overrides this var.
     local qfile="${TPU_LOCAL_QUEUE_FILE:-$HOME/.tpu_local_queue.json}"
