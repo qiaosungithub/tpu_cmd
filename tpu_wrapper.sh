@@ -227,9 +227,102 @@ _tpu_extract_xid() {
     | grep -oP '(?:Launched experiment|work unit\(s\) to experiment) \K\d+' | head -n 1
 }
 
+# DAEMON AUTO-HEAL. Called opportunistically from `tpu check` / `tpu queue`.
+# Distinguishes a DEAD daemon (restart) from a SLOW-but-alive one (leave it).
+#
+# WHY NOT restart on board-staleness (the 300s alarm): staleness means the
+# DATA is old, which a HEALTHY daemon also shows when the infra lane is starved
+# by host load -- its serial XManager RPCs crawl, a round takes 400s+, and the
+# board ages past 300s while money/quota keep refreshing fine. On 2026-08-23
+# the infra pass took 447s and updated the cache 21s later: slow, not dead.
+# Restarting there would KILL the in-flight infra pass (so it never completes),
+# drop the INFRA_PID de-dup state, and not fix a thing (host is still loaded).
+#
+# So liveness is judged by ROUND PROGRESS, not cache age: a healthy daemon
+# prints a round line every ~85s. Dead/hung = session gone, process gone, or
+# no round line for >10min. Only THAT restarts.
+#
+# Blast radius: reuses _tpu_restart_check_daemon, which refuses when a scoped
+# operator (npu, TPU_JOB_NAME_PREFIX set) runs it -- so npu never restarts the
+# owner's daemon. Throttled: checks at most every AUTOHEAL_EVERY seconds; after
+# a restart, waits AUTOHEAL_COOLDOWN before another (no restart storm).
+# TPU_DAEMON_AUTOHEAL=0 disables. TPU_DAEMON_AUTOHEAL_DRYRUN=1 prints the
+# verdict without restarting (used to validate the logic without touching a
+# loaded host).
+_tpu_daemon_autoheal() {
+  [ "${TPU_DAEMON_AUTOHEAL:-1}" = "1" ] || return 0
+  local dry="${TPU_DAEMON_AUTOHEAL_DRYRUN:-0}"
+  local now stamp last_check every="${TPU_DAEMON_AUTOHEAL_EVERY:-180}"
+  now=$(date +%s)
+  # Throttle: skip if we checked within `every` seconds (per-operator stamp).
+  local stampf="/tmp/tpu_autoheal.$(id -u).$([ -n "${TPU_JOB_NAME_PREFIX:-}" ] && echo npu || echo tpu).stamp"
+  if [ "$dry" != "1" ] && [ -f "$stampf" ]; then
+    last_check=$(cat "$stampf" 2>/dev/null || echo 0)
+    [ $(( now - last_check )) -lt "$every" ] && return 0
+  fi
+  echo "$now" > "$stampf" 2>/dev/null
+
+  # --- Judge liveness ---
+  local verdict reason
+  if ! tmux has-session -t tpu-daemon 2>/dev/null; then
+    verdict=DEAD; reason="tmux session 'tpu-daemon' gone"
+  elif ! pgrep -f tpu_check_daemon.sh >/dev/null 2>&1; then
+    verdict=DEAD; reason="no tpu_check_daemon.sh process"
+  else
+    # Alive session+process: judge by round progress. Parse the last timestamped
+    # line from the daemon pane; if it is older than 10min, the loop is hung.
+    local pane last_epoch age_round
+    pane=$(tmux capture-pane -t tpu-daemon -p 2>/dev/null | grep -E ': --- |Successfully updated|round took' | tail -1)
+    # daemon prints e.g. 'Sun Aug 23 05:15:13 PM UTC 2026: ...'
+    local ts
+    ts=$(echo "$pane" | grep -oE '[A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]+ [0-9:]+ [AP]M [A-Z]+ [0-9]{4}' | head -1)
+    if [ -n "$ts" ]; then
+      last_epoch=$(date -d "$ts" +%s 2>/dev/null || echo 0)
+    else
+      last_epoch=0
+    fi
+    if [ "$last_epoch" -gt 0 ]; then
+      age_round=$(( now - last_epoch ))
+      if [ "$age_round" -gt "${TPU_DAEMON_HUNG_SEC:-600}" ]; then
+        verdict=HUNG; reason="no round progress for ${age_round}s (>600s)"
+      else
+        verdict=ALIVE; reason="round progressed ${age_round}s ago (healthy; slow infra lane is not death)"
+      fi
+    else
+      # Can't parse a timestamp -- be conservative, do NOT restart on ambiguity.
+      verdict=ALIVE; reason="round timestamp unparseable; not restarting on ambiguity"
+    fi
+  fi
+
+  if [ "$verdict" = "ALIVE" ]; then
+    [ "$dry" = "1" ] && echo -e "\033[2m[daemon autoheal DRYRUN] verdict=ALIVE ($reason) -> no action\033[0m"
+    return 0
+  fi
+
+  # verdict is DEAD or HUNG -> restart (unless dry-run or cooling down).
+  if [ "$dry" = "1" ]; then
+    echo -e "\033[33m[daemon autoheal DRYRUN] verdict=$verdict ($reason) -> WOULD restart (suppressed by dry-run)\033[0m"
+    return 0
+  fi
+  local coolf="/tmp/tpu_autoheal_restart.$(id -u).stamp"
+  if [ -f "$coolf" ]; then
+    local last_restart; last_restart=$(cat "$coolf" 2>/dev/null || echo 0)
+    if [ $(( now - last_restart )) -lt "${TPU_DAEMON_AUTOHEAL_COOLDOWN:-300}" ]; then
+      echo -e "\033[33m[daemon autoheal] verdict=$verdict but restarted <5min ago; skipping to avoid a restart storm.\033[0m"
+      return 0
+    fi
+  fi
+  echo -e "\033[31m[daemon autoheal] daemon $verdict: $reason. Auto-restarting tpu-daemon...\033[0m"
+  echo "$now" > "$coolf" 2>/dev/null
+  _tpu_restart_check_daemon
+}
+
 tpu() {
   if [ "$1" = "queue" ] || [ "$1" = "q" ]; then
     shift
+    # Opportunistic daemon self-heal (throttled to ~3min; restarts only a truly
+    # dead/hung daemon, never a slow-but-alive one -- see _tpu_daemon_autoheal).
+    _tpu_daemon_autoheal
     local orig_dir="$PWD"
     local group=""
     local tpu_type=""
@@ -1006,6 +1099,10 @@ EOF
 
   elif [[ "$1" == "check" || "$1" == "c" ]]; then
     shift
+    # Opportunistic daemon self-heal (throttled; restarts only a dead/hung
+    # daemon, not a slow one). The board staleness banner below tells the user
+    # data is old; this quietly fixes the case where the daemon actually died.
+    _tpu_daemon_autoheal
     python3 - "$@" << 'EOF'
 import argparse, json, os, re, sys, fcntl
 # CWD ROBUSTNESS: `tpu check` is run from anywhere, and from the google3 source
