@@ -1569,15 +1569,18 @@ print(f"\n\033[1;36m━━ Local Queue (smart router) ━━\033[0m   {summary}"
 _order = {'BUILDING': 0, 'HELD': 1, 'QUEUED': 2, 'SUBMITTED': 3}
 rows = [e for e in entries if e.get('state') in ('QUEUED', 'BUILDING', 'HELD', 'SUBMITTED')]
 for e in sorted(rows, key=lambda e: (_order.get(e.get('state'), 9), -e.get('priority', 0))):
-    jid = str(e.get('job_id', '?'))[:24]
     st = e.get('state', '?')
     disp = f"{COL.get(st,'')}{st:9s}\033[0m"
-    archs = ','.join(e.get('allowed_archs', []))[:14]
+    # Show the experiment NAME (from launch_kwargs) as the primary id -- the
+    # job_id is a random short hash that says nothing about which run this is.
+    lk = e.get('launch_kwargs', {}) or {}
+    name = (lk.get('exp_name') or lk.get('config') or str(e.get('job_id', '?')))[:30]
+    archs = ','.join(e.get('allowed_archs', []))[:10]
     why = e.get('last_reason', '') or ''
     if st == 'SUBMITTED':
         why = f"xid={e.get('xid')} {e.get('cell') or '?'} {e.get('arch') or ''}-{e.get('chips') or ''}".strip()
     lock = ' \033[35m[lock]\033[0m' if e.get('topology_locked') else ''
-    print(f"  {jid:24s} {disp} {str(e.get('power','')):9s} {archs:14s} {why}{lock}")
+    print(f"  {name:30s} {disp} {str(e.get('power','')):9s} {archs:10s} {why}{lock}")
 print("\033[2m  Full live view: tpu queue-status\033[0m")
 LQEOF
     fi
