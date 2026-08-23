@@ -750,6 +750,42 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       echo -e "\033[2m[$TPU_CMD_NAME queue] stage lock released (staging done; build/launch proceeds unlocked).\033[0m"
     fi
 
+    # HOST-LEVEL BUILD LOCK (serial build, DEFAULT ON). The stage lock above
+    # only serialized the rsync (CitC token bucket). Build/launch was left
+    # parallel on the theory that different checkouts use different blaze
+    # output_base and "do not collide". They don't collide LOGICALLY -- but
+    # they all compete for the SAME host RAM/CPU. On 2026-08-23, 5+ lines
+    # un-froze at once and ran ~18 blaze + ~28 rabbit/mpm packers together;
+    # avail RAM fell 40G->16G, load hit 157, so-thrash spikes to 17k. The
+    # output_base assumption was right and irrelevant: the shared resource is
+    # the machine, not the build tree.
+    #
+    # So: ONE host-wide lock around build/launch, keyed to the host (NOT the
+    # workspace -- every workspace's build burns the same RAM). Every path
+    # (bare / guarded / worker) funnels through this function, so this lock
+    # serializes builds across ALL of them without any caller changing how it
+    # invokes `tpu queue`. This is the "serial build is the default" the
+    # operator asked for.
+    #
+    # Escape hatch: TPU_SERIAL_BUILD=0 restores the old parallel behaviour.
+    # Timeout (-w) degrades to parallel rather than refusing to launch, so a
+    # wedged holder can never block the whole fleet's launches forever (same
+    # philosophy as the stage lock). fd 201 (stage lock used 200).
+    local _build_locked=0
+    if [ "${TPU_SERIAL_BUILD:-1}" = "1" ]; then
+      local _build_lock="/tmp/tpu_build.host.lock"
+      local _build_wait="${TPU_SERIAL_BUILD_WAIT:-1800}"
+      exec 201>"$_build_lock" 2>/dev/null
+      echo -e "\033[2m[$TPU_CMD_NAME queue] waiting for host build lock ($_build_lock; serial build is default, TPU_SERIAL_BUILD=0 to opt out)...\033[0m"
+      if flock -w "$_build_wait" 201 2>/dev/null; then
+        _build_locked=1
+        echo -e "\033[2m[$TPU_CMD_NAME queue] host build lock acquired; this build runs alone (serial).\033[0m"
+      else
+        _build_locked=0
+        echo -e "\033[33m[$TPU_CMD_NAME queue] host build lock busy >${_build_wait}s; proceeding in PARALLEL (degraded). Host may be under a build storm.\033[0m"
+      fi
+    fi
+
     # Process multiple groups (e.g. 1,2)
     IFS=',' read -ra GROUP_ARRAY <<< "$group"
     if [ ${#GROUP_ARRAY[@]} -gt 1 ]; then
@@ -760,6 +796,8 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       local alloc=$(get_alloc_by_group_id "$g")
       if [ -z "$alloc" ]; then
         echo "Error: Unknown group number: $g"
+        # Release the host build lock on this early-return, else it wedges the fleet.
+        if [ "${_build_locked:-0}" = "1" ]; then flock -u 201 2>/dev/null; exec 201>&- 2>/dev/null; fi
         cd "$orig_dir"
         return 1
       fi
@@ -957,6 +995,13 @@ EOF
           fi
       fi
     done
+    # Release the host build lock now that all groups' build/launch/registration
+    # are done -- the next queued build (bare/guarded/worker) can proceed.
+    if [ "${_build_locked:-0}" = "1" ]; then
+      flock -u 201 2>/dev/null
+      exec 201>&- 2>/dev/null
+      echo -e "\033[2m[$TPU_CMD_NAME queue] host build lock released.\033[0m"
+    fi
     cd "$orig_dir"
 
   elif [[ "$1" == "check" || "$1" == "c" ]]; then
