@@ -1793,5 +1793,11 @@ npu() {
   # The smart local queue is per-operator too, or npu's enqueue would land in
   # sqa's queue and the router would submit it under the wrong bookkeeping.
   local -x TPU_LOCAL_QUEUE_FILE="${NPU_LOCAL_QUEUE_FILE:-$HOME/lyy-work/.npu_local_queue.json}"
+  # The build-worker's tmux session must ALSO be per-operator, or `npu
+  # build-worker start` would collide with sqa's `tpu-build-worker` session
+  # (has-session would say "already running") and `npu build-worker stop` would
+  # kill sqa's worker. A distinct name gives lyy an independent worker draining
+  # lyy's own queue.
+  local -x TPU_BUILD_WORKER_SESSION="${NPU_BUILD_WORKER_SESSION:-npu-build-worker}"
   tpu "$@"
 }
