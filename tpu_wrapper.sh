@@ -243,6 +243,7 @@ tpu() {
     local user_cell=""
     local user_metros=""
     local resume_xid=""
+    local _stage_locked=0
     local passthrough_args=()
     
     while [[ $# -gt 0 ]]; do
@@ -650,6 +651,39 @@ print(d['group'], d['tpu_type'], d['status'],
     # The snapshot is immutable and already built, so reusing it is also
     # strictly cheaper. Deliberate code changes belong in a NEW experiment,
     # where the comparison is honest, not smuggled in through a resume.
+    #
+    # ===================== STAGE-WRITE SERIALIZATION =====================
+    # The CitC CreateSnapshot token bucket is per-(user,workspace). A BURST of
+    # concurrent stage-writes (rsync into a stagedir) into the SAME workspace
+    # drains it -> truncated stagedir / .par crash (the second failure mode in
+    # monitoring.md). The build-worker's BUILDING lock only serializes ITS OWN
+    # queue; it does NOT cover a direct `tpu queue` (guarded or bare) running
+    # concurrently, and both stage into the same workspace. So the true fix is
+    # ONE lock HERE, inside `tpu queue` itself -- every path (bare, guarded,
+    # worker) funnels through this function, so a lock here serializes the
+    # stage-write across ALL of them.
+    #
+    # Keyed by STAGE_WS_ROOT (the bucket is per-workspace, so two DIFFERENT
+    # workspaces may stage in parallel). Held only around the stage-write, then
+    # released BEFORE the build/launch -- builds in different checkouts do not
+    # collide (different blaze output_base), so serializing them too would waste
+    # the whole point of parallel checkouts. A resume re-uses an existing
+    # snapshot (no rsync), so it barely holds the lock.
+    #
+    # fd 200; lock file per workspace under /tmp (stable across the run). The
+    # -w timeout means a wedged holder cannot block launches forever -- on
+    # timeout we log and proceed (degrade to today's unlocked behaviour rather
+    # than refuse to launch).
+    local _stage_lock="/tmp/tpu_stage.$(echo "$STAGE_WS_ROOT" | tr '/' '_').lock"
+    exec 200>"$_stage_lock" 2>/dev/null
+    if flock -w 900 200 2>/dev/null; then
+      _stage_locked=1
+      echo -e "\033[2m[$TPU_CMD_NAME queue] stage lock acquired ($_stage_lock); serial stage-write into $(basename "$STAGE_WS_ROOT")-ws.\033[0m"
+    else
+      _stage_locked=0
+      echo -e "\033[33m[$TPU_CMD_NAME queue] stage lock busy >900s; proceeding WITHOUT it (degraded). If you see truncated stagedirs, a stage-write storm is in progress.\033[0m"
+    fi
+
     if [ -n "$resume_xid" ]; then
       local prior_stagedir
       prior_stagedir=$(python3 -c "import json,os
@@ -666,6 +700,7 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
         echo -e "\033[31m  Looked in $TPU_JOBS_FILE and $TPU_JOBS_LEGACY_FILE.\033[0m"
         echo -e "\033[31m  Refusing to package the current checkout: a resume must re-run the\033[0m"
         echo -e "\033[31m  original snapshot. Pass --stagedir=<path> if you know it.\033[0m"
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
         return 1
       fi
       stagedir="$prior_stagedir"
@@ -673,6 +708,7 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       if [ ! -d "$abs_stagedir" ]; then
         echo -e "\033[31m[resume] Recorded stagedir is gone: $abs_stagedir\033[0m"
         echo -e "\033[31m  Cannot resume XID $resume_xid without the code it ran.\033[0m"
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
         return 1
       fi
       echo -e "\033[32m[resume] Re-using the ORIGINAL snapshot (not the working tree):\033[0m"
@@ -702,6 +738,16 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
     export TPU_STAGEDIR="$abs_stagedir"
     export TPU_LOGDIR="$logdir"
     cd "$abs_stagedir"
+    fi
+
+    # STAGE-WRITE DONE -> release the per-workspace stage lock now, BEFORE the
+    # build/launch, so builds in different checkouts still run in parallel (the
+    # token bucket was the only shared resource; blaze output_base differs per
+    # checkout). Everything past here (build, launch, registration) is unlocked.
+    if [ "${_stage_locked:-0}" = "1" ]; then
+      flock -u 200 2>/dev/null
+      exec 200>&- 2>/dev/null
+      echo -e "\033[2m[$TPU_CMD_NAME queue] stage lock released (staging done; build/launch proceeds unlocked).\033[0m"
     fi
 
     # Process multiple groups (e.g. 1,2)
