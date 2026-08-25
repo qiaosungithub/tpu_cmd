@@ -746,32 +746,43 @@ print(d['group'], d['tpu_type'], d['status'],
     # where the comparison is honest, not smuggled in through a resume.
     #
     # ===================== STAGE-WRITE SERIALIZATION =====================
-    # The CitC CreateSnapshot token bucket is per-(user,workspace). A BURST of
-    # concurrent stage-writes (rsync into a stagedir) into the SAME workspace
-    # drains it -> truncated stagedir / .par crash (the second failure mode in
-    # monitoring.md). The build-worker's BUILDING lock only serializes ITS OWN
+    # The CitC CreateSnapshot token bucket is per-USER (one bucket shared by ALL
+    # of this user's workspaces). A BURST of concurrent stage-writes (rsync into
+    # a stagedir) -- whether into the same workspace OR different ones -- drains
+    # that one bucket -> truncated stagedir / .par crash (the second failure mode
+    # in monitoring.md). The build-worker's BUILDING lock only serializes ITS OWN
     # queue; it does NOT cover a direct `tpu queue` (guarded or bare) running
     # concurrently, and both stage into the same workspace. So the true fix is
     # ONE lock HERE, inside `tpu queue` itself -- every path (bare, guarded,
     # worker) funnels through this function, so a lock here serializes the
     # stage-write across ALL of them.
     #
-    # Keyed by STAGE_WS_ROOT (the bucket is per-workspace, so two DIFFERENT
-    # workspaces may stage in parallel). Held only around the stage-write, then
-    # released BEFORE the build/launch -- builds in different checkouts do not
-    # collide (different blaze output_base), so serializing them too would waste
-    # the whole point of parallel checkouts. A resume re-uses an existing
-    # snapshot (no rsync), so it barely holds the lock.
+    # Keyed PER-USER, NOT per-workspace. The CitC CreateSnapshot token bucket is
+    # per-USER (one bucket shared by ALL of this user's workspaces), so a burst
+    # of concurrent stage-writes across DIFFERENT workspaces drains the SAME
+    # bucket -> truncated stagedir. An earlier version keyed this lock by
+    # STAGE_WS_ROOT on the wrong assumption that the bucket was per-workspace;
+    # that let N workspaces (xm_test, EqR-jax, lyy_arc, elt_jax, ...) each hold
+    # their own lock and stage in parallel, which is exactly the storm the lock
+    # is meant to prevent (2026-08-24: income/5 pushed the fleet onto BATCH, many
+    # lines drained at once, and coconut's stagedir truncated to 15/415 entries).
+    # A single per-user lock serializes stage-writes across every workspace, in
+    # line with the one bucket they actually share.
     #
-    # fd 200; lock file per workspace under /tmp (stable across the run). The
+    # Held only around the stage-write, then released BEFORE the build/launch --
+    # builds in different checkouts do not collide (different blaze output_base),
+    # so serializing them too would waste the whole point of parallel checkouts.
+    # A resume re-uses an existing snapshot (no rsync), so it barely holds it.
+    #
+    # fd 200; one lock file per user under /tmp (stable across the run). The
     # -w timeout means a wedged holder cannot block launches forever -- on
     # timeout we log and proceed (degrade to today's unlocked behaviour rather
     # than refuse to launch).
-    local _stage_lock="/tmp/tpu_stage.$(echo "$STAGE_WS_ROOT" | tr '/' '_').lock"
+    local _stage_lock="/tmp/tpu_stage.$(id -u).lock"
     exec 200>"$_stage_lock" 2>/dev/null
     if flock -w 900 200 2>/dev/null; then
       _stage_locked=1
-      echo -e "\033[2m[$TPU_CMD_NAME queue] stage lock acquired ($_stage_lock); serial stage-write into $(basename "$STAGE_WS_ROOT")-ws.\033[0m"
+      echo -e "\033[2m[$TPU_CMD_NAME queue] stage lock acquired ($_stage_lock); serial stage-write (per-user, all workspaces).\033[0m"
     else
       _stage_locked=0
       echo -e "\033[33m[$TPU_CMD_NAME queue] stage lock busy >900s; proceeding WITHOUT it (degraded). If you see truncated stagedirs, a stage-write storm is in progress.\033[0m"
