@@ -808,7 +808,18 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
         return 1
       fi
       stagedir="$prior_stagedir"
-      abs_stagedir="${STAGE_WS_ROOT}/${stagedir}"
+      # storm#2 A read-side defense: a registry entry may have recorded an
+      # ABSOLUTE stagedir. xm_launcher.py registers os.environ[TPU_STAGEDIR]
+      # (absolute), whereas the wrapper's own registration stores it RELATIVE;
+      # under a stage storm the launcher can win the race and leave an absolute
+      # path in ~/.tpu_jobs.json. If it is already absolute, do NOT prepend
+      # STAGE_WS_ROOT -- doing so double-prepends and the -d check below falsely
+      # reports "stagedir gone". Cause-agnostic: catches an absolute path no
+      # matter how it got recorded. Escape/override: pass an absolute stagedir.
+      case "$prior_stagedir" in
+        /*) abs_stagedir="$prior_stagedir" ;;
+        *)  abs_stagedir="${STAGE_WS_ROOT}/${stagedir}" ;;
+      esac
       if [ ! -d "$abs_stagedir" ]; then
         echo -e "\033[31m[resume] Recorded stagedir is gone: $abs_stagedir\033[0m"
         echo -e "\033[31m  Cannot resume XID $resume_xid without the code it ran.\033[0m"
