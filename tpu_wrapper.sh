@@ -137,33 +137,47 @@ _check_locality() {
 # cannot reach (go/loas-restricted-credentials). set_limit_order reaches the
 # same state over a path that works today. Revisit if that access is granted.
 #
-# WHY a per-card table AND NOT one global number: --price is an ABSOLUTE price
-# per chip-hour, and prices differ ~20x across cards. Measured 2026-07-29:
-# v4 1.22, v5p 20.32, v6e 26.01, v6p 0-60 credits/chip-hour. A single number
-# either fails to cap the cheap cards or permanently blocks the dear ones.
+# FIXED POLICY (operator directive 2026-08-25). The cap is a HARDCODED absolute
+# price per chip-hour, by accelerator family -- NOT a market tracker and NOT
+# externally overridable. Earlier revisions tracked 3x the dearest cell or read
+# a hand-set fallback table; both are gone. There is now exactly one number per
+# family and one place it lives.
 #
-# The values below are roughly 3x the observed price -- loose enough to ride out
-# ordinary intraday swings (this pool moves several fold within a day), tight
-# enough to stop a genuine blowout. They are a blast-radius limit, not an
-# attempt to track the market. Re-check with `tpu money` if prices shift.
+# THIS TABLE IS THE SHELL HALF OF A SINGLE SOURCE OF TRUTH. The Python half is
+# experimental/users/qiaos/tpu_utils/cap_policy.py (CAP_POLICY), which `tpu
+# money` reads so the displayed cap and the enforced cap cannot drift. Keep the
+# two in sync.
+# LINT.IfChange(cap_policy)
 _TPU_SLO_BIN="/google/bin/releases/brain-quota/set_limit_order/set_limit_order"
 
-# Absolute cap in credits per CHIP-hour, by accelerator family.
-_tpu_limit_price_for_arch() {
+_tpu_limit_price_for_arch() {   # <arch> -> fixed cap in credits/chip-hour
   case "$1" in
-    v4)      echo "12"  ;;   # market ~1.2
-    v5p)     echo "60"  ;;   # market ~20.3
-    v5e)     echo "30"  ;;   # market low; conservative
-    v6e)     echo "80"  ;;   # market ~26.0
-    v6p)     echo "180" ;;   # market 0-60
-    *)       echo "100" ;;   # unknown family: generous but still bounded
+    v7)  echo "20" ;;
+    v6p) echo "20" ;;
+    v6e) echo "10" ;;
+    v5p) echo "5"  ;;
+    v4)  echo "5"  ;;
+    # NVIDIA GPUs. The cap is per GPU-hour (set_limit_order is per-chip and a
+    # GPU device is one chip). Tiered by compute class against v5p so the cap
+    # tracks the TPU rows: A100 ~0.68x v5p -> v5p tier; H100/H200 ~2.15x v5p
+    # ~= v6e -> v6e tier; B200/B300/GB200/GB300 ~4.9x v5p ~= v6p/v7 -> v6p
+    # tier. All sit far above current market (H100 PROD ~0.1, B200 ~0.6,
+    # A100 ~0.93, GB200 free) -- these are blast-radius bounds, not trackers.
+    a100)  echo "5"  ;;
+    h100)  echo "10" ;;
+    h200)  echo "10" ;;
+    b200)  echo "20" ;;
+    b300)  echo "20" ;;
+    gb200) echo "20" ;;
+    gb300) echo "20" ;;
+    *)   echo ""   ;;   # no policy for this family: caller skips the cap
   esac
 }
+# LINT.ThenChange(//experimental/users/qiaos/tpu_utils/cap_policy.py)
 
-# _tpu_set_limit_order <xid> <tpu_type> <tier> [price_override]
+# _tpu_set_limit_order <xid> <tpu_type> <tier>
 _tpu_set_limit_order() {
-  local xid="$1" tpu_type="$2" tier="$3" override="$4"
-
+  local xid="$1" tpu_type="$2" tier="$3"
   # BATCH clears at 0 by construction (supply >= demand), and BATCH admission
   # never reads a floor or a price. A cap there would be inert.
   if [ "${tier^^}" = "BATCH" ]; then
@@ -177,9 +191,17 @@ _tpu_set_limit_order() {
   fi
 
   local arch="${tpu_type%%-*}"
-  local price="${override:-$(_tpu_limit_price_for_arch "$arch")}"
+  # FIXED per-family policy. No market read, no override -- one number per
+  # family from _tpu_limit_price_for_arch (kept in sync with cap_policy.py).
+  local price
+  price="$(_tpu_limit_price_for_arch "$arch")"
+  if [ -z "$price" ]; then
+    # No policy for this family: leave the job uncapped rather than guess.
+    echo -e "\033[2m[limit order] Skipped: no cap policy for ${arch}.\033[0m"
+    return 0
+  fi
 
-  echo -e "\033[36m[limit order] Capping XID $xid at ${price} credits/chip-hour (${arch})...\033[0m"
+  echo -e "\033[36m[limit order] Capping XID $xid at ${price} credits/chip-hour (${arch}, fixed policy)...\033[0m"
   local lo_log="/tmp/tpu_limit_order_${xid}.log"
   if "$_TPU_SLO_BIN" --xid="$xid" --price="$price" > "$lo_log" 2>&1; then
     echo -e "\033[32m[limit order] Capped XID $xid at ${price} cr/chip-hr.\033[0m"
@@ -331,7 +353,8 @@ tpu() {
     local power=""
     local force=0
     local skip_preflight=0
-    local lo_price=""
+    # lo_price removed 2026-08-25: the cap is a fixed per-family policy, not an
+    # operator-supplied number. budget_check now accounts at the market price.
     local no_limit_order=0
     local user_cell=""
     local user_metros=""
@@ -385,11 +408,9 @@ tpu() {
           force=1
           shift
           ;;
-        --lo-price=*|--limit-order-price=*)
-          lo_price="${1#*=}"
-          shift
-          continue
-          ;;
+        # NOTE: --lo-price / --limit-order-price were REMOVED 2026-08-25. The
+        # per-chip cap is now a fixed per-family policy (_tpu_limit_price_for_arch
+        # / cap_policy.py) and is deliberately NOT externally overridable.
         --no-limit-order|--no-lo)
           no_limit_order=1
           shift
@@ -645,7 +666,7 @@ print(d['group'], d['tpu_type'], d['status'],
     # ============ BUDGET CHECK ============
     local budget_script="$HOME/work/wiki_agents/tools/budget_check.py"
     if [ -x "$budget_script" ]; then
-      if ! "$budget_script" "$tpu_type" "${tier:-PROD}" "$lo_price"; then
+      if ! "$budget_script" "$tpu_type" "${tier:-PROD}"; then
         return 1
       fi
     fi
@@ -1104,7 +1125,7 @@ EOF
           # Cap this XID's price. Per-XID scope: does not affect teammates and
           # survives the periodic group-wide push (SCU > XID > MDB).
           if [ "$no_limit_order" != "1" ]; then
-            _tpu_set_limit_order "$xid" "$tpu_type" "$tier" "$lo_price"
+            _tpu_set_limit_order "$xid" "$tpu_type" "$tier"
           else
             echo -e "\033[2m[limit order] Skipped (--no-limit-order). Job runs at market price.\033[0m"
           fi
