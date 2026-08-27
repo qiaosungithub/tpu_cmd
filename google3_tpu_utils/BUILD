@@ -1,6 +1,6 @@
 
 
-load("//devtools/python/blaze:pytype.bzl", "pytype_binary", "pytype_strict_binary")
+load("//devtools/python/blaze:pytype.bzl", "pytype_binary", "pytype_strict_binary", "pytype_strict_library")
 
 pytype_strict_binary(
     name = "quota_check",
@@ -175,6 +175,15 @@ pytype_strict_binary(
 )
 
 # --- Local-queue router --------------------------------------------------
+# Cell -> metro resolution. A dependency-free leaf so BOTH routers (the
+# smart-cell default via avail_provider, and the --power router via
+# preflight:router) resolve a cell's metro identically. No deps = no build
+# cycle even though preflight:router pulls it in.
+pytype_strict_library(
+    name = "metro_util",
+    srcs = ["metro_util.py"],
+)
+
 # Pure scheduling core: queue schema, placement, priority/fairness, topology
 # lock, effective-price type selection. No I/O, no RPC -- unit-tested in full.
 pytype_strict_library(
@@ -199,6 +208,7 @@ pytype_strict_library(
     name = "avail_provider",
     srcs = ["avail_provider.py"],
     deps = [
+        ":metro_util",
         ":route_lib",
         "//borg/common:scalar_resource_py_pb2",
         "//borg/xborg/frontend/goodput_optimizer/proto:goodput_optimizer_service_py_pb2",
