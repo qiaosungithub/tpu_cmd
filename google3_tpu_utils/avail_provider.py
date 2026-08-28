@@ -81,11 +81,36 @@ _GROUP_MAP = {
 DEFAULT_MARKET_JSON = os.path.expanduser('~/.tpu_quota_cache_dir/market.json')
 DEFAULT_PRICE_POOL = 'deepmind-dynamic-pool'
 
-# Cell -> metro resolution now lives in the dependency-free ``metro_util`` leaf
-# so the --power router (``preflight.router``) and this smart-cell path agree on
-# it exactly. Re-exported under the historical names for existing callers/tests.
+# Cell -> metro resolution lives in the dependency-free ``metro_util`` leaf,
+# itself a facade over the MEASURED ``cell_locality`` snapshot, so the --power
+# router (``preflight.router``) and this smart-cell path agree on it exactly.
+# Re-exported under the historical names for existing callers/tests.
 _METRO_OVERRIDES = metro_util.METRO_OVERRIDES
 metro_of = metro_util.metro_of
+
+# The string a CellAvail carries when the cell's metro was never measured.
+#
+# WHY A STRING AND NOT THE SENTINEL. ``CellAvail.metro`` is typed ``str`` and
+# ``route_lib.best_cell_for_shape`` calls ``.lower()`` on it unconditionally, so
+# putting the sentinel object in the field would turn an unknown cell into an
+# AttributeError deep inside the placement loop -- a crash, not a decision. This
+# marker is a string that can never equal a real metro (metros are three lowercase
+# letters), so an ``--metro`` allow-list DROPS the cell, which is the fail-closed
+# direction: an unmeasurable cell is never silently treated as in-metro.
+#
+# It is deliberately NOT '' -- an empty metro would read as "no constraint" to a
+# future filter written the other way round, and '' is what a missing field looks
+# like. This value announces itself in any log line that prints it.
+UNMEASURED_METRO = '__unmeasured__'
+
+
+def metro_str(cell: str) -> str:
+  """``metro_of`` coerced to a str for ``CellAvail.metro``, never guessing.
+
+  Unknown -> ``UNMEASURED_METRO``, which no allow-list can match.
+  """
+  m = metro_of(cell)
+  return UNMEASURED_METRO if m is metro_util.UNKNOWN else str(m)
 
 
 def load_prices(market_json_path: str = DEFAULT_MARKET_JSON,
@@ -164,7 +189,7 @@ def build_availability(
       pool += max(0, free_chips)
       avail_by_cell[f'{cell}|{arch}'] = route_lib.CellAvail(
           cell=cell, arch=arch, free_chips=free_chips, oversold=oversold,
-          price=price, metro=metro_of(cell))
+          price=price, metro=metro_str(cell))
     arch_pool[arch] = float(pool)
   return avail_by_cell, arch_price, arch_pool
 

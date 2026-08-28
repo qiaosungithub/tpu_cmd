@@ -175,13 +175,30 @@ pytype_strict_binary(
 )
 
 # --- Local-queue router --------------------------------------------------
-# Cell -> metro resolution. A dependency-free leaf so BOTH routers (the
-# smart-cell default via avail_provider, and the --power router via
-# preflight:router) resolve a cell's metro identically. No deps = no build
-# cycle even though preflight:router pulls it in.
+# THE cell -> (metro, continent, campus) snapshot, MEASURED with
+# `mach_locality` and regenerable by remeasure_cell_locality.py. A
+# dependency-free leaf (stdlib only, no I/O at import) so every layer that has
+# an opinion about where a cell is -- both routers, the launcher, and the
+# training binaries -- can import the same rows and cannot drift apart.
+#
+# It replaced 70 hand-written tables across nine checkouts. An unknown cell
+# resolves to the UNKNOWN sentinel and the *_or_die helpers raise; nothing here
+# ever guesses a metro from a cell's name (that heuristic was measured wrong for
+# 26 of 57 cells).
+pytype_strict_library(
+    name = "cell_locality",
+    srcs = ["cell_locality.py"],
+)
+
+# Cell -> metro resolution. A thin fail-closed facade over :cell_locality, kept
+# as its own target because both routers (the smart-cell default via
+# avail_provider, and the --power router via preflight:router) import this name.
 pytype_strict_library(
     name = "metro_util",
     srcs = ["metro_util.py"],
+    deps = [
+        ":cell_locality",
+    ],
 )
 
 # Pure scheduling core: queue schema, placement, priority/fairness, topology

@@ -44,41 +44,364 @@ _BUCKET = flags.DEFINE_string(
     'TPU worker fails with ACCESS_DENIED. Pass a gs:// path only if that bucket '
     'grants access to the prod identity.'
 )
+# WHERE A JOB'S CHECKPOINTS GO, resolved from the cell it lands in.
+#
 # Checkpoints are written from the TPU workers, so the bucket has to be near
 # THEM, not near wherever the default happens to point. Getting this wrong is
 # not a mild slowdown: XID 275990419 ran on `yuskedq` (metro ske, continent EU)
 # while writing to `yutulpz` (metro tul, NA), and orbax reported 10 MiB/s, ~10s
 # of BLOCKED TPU per save plus 33-56s of background flush. Its duty cycle fell
 # to 0.082, below the 0.20 WIM pruning threshold, and the job was deleted.
+# XID 284145906 died the same way on `yukulwh` (metro kul, ASIA).
 #
-# Map each compute cell to a bucket in the same metro. An unlisted cell keeps
-# the default, and an explicit --bucket always wins.
+# THE OLD TABLE MAPPED CELLS AND SILENTLY DEFAULTED. It listed 18 cells and any
+# other cell fell through to `--bucket`'s default (`/cns/yutulpz-d`, metro tul,
+# North America). That fall-through is the mechanism that killed the two jobs
+# above: an unlisted cell is not a cell near tul, it is a cell we know nothing
+# about, and 88% of the cells the scheduler can price were unlisted.
 #
-# A cell whose metro has no team storage quota is listed with its own -d cell,
-# which is only the 500 GiB personal ceiling -- fine for a smoke test, not for a
-# real run. Cells whose metro DOES have group quota point at that neighbour.
-_CELL_BUCKETS = {
-    # metro has PiB-scale group quota (charged to deepmind-resources-colossus)
-    'yucbfiv': '/cns/is-d/home/qiaos/eqr_data',   # cbf -> is-d  69.1 PiB sp50
-    'yucbful': '/cns/is-d/home/qiaos/eqr_data',   # cbf
-    'yucbfwv': '/cns/is-d/home/qiaos/eqr_data',   # cbf
-    'yucbfsl': '/cns/is-d/home/qiaos/eqr_data',   # cbf
-    'je':      '/cns/is-d/home/qiaos/eqr_data',   # cbf
-    'yutulpz': '/cns/oi-d/home/qiaos/eqr_data',   # tul -> oi-d (nm-d group quota FULL 47.9/48.2P; oi-d same-metro, 29.6P)
-    'nl':      '/cns/oi-d/home/qiaos/eqr_data',   # tul -> oi-d
-    'nk':      '/cns/oi-d/home/qiaos/eqr_data',   # tul -> oi-d
-    'yulpptr': '/cns/li-d/home/qiaos/eqr_data',   # lpp -> li-d  85.2 PiB sp50
-    'sk':      '/cns/si-d/home/qiaos/eqr_data',   # sin -> si-d  9.69 PiB sp50
-    'sn':      '/cns/si-d/home/qiaos/eqr_data',   # sin
-    'so':      '/cns/si-d/home/qiaos/eqr_data',   # sin
-    'yumrnel': '/cns/qo-d/home/qiaos/eqr_data',   # mrn -> qo-d  8.80 PiB sp50
-    'el':      '/cns/el-d/home/qiaos/eqr_data',   # grq, same cell 95.4 PiB sp50
-    'mb':      '/cns/mb-d/home/qiaos/eqr_data',   # ckv, same cell 10.7 PiB sp50
-    'yudfwra': '/cns/rs-d/home/qiaos/eqr_data',   # dfw -> rs-d  49.3 PiB sp50
-    'dl':      '/cns/dl-d/home/qiaos/eqr_data',   # las -> dl-d  31.6 PiB sp10 (2nd v4, non-oversold)
-    # no group quota in the metro -- personal 500 GiB only
-    'yuskedq': '/cns/yuskedq-d/home/qiaos/eqr_data',
+# THIS TABLE IS KEYED BY METRO, MEASURED, AND FAIL-CLOSED:
+#   * cell -> metro comes from `mach_locality -k metro`, not from the cell's
+#     name (the name-based guess was wrong for 26 of 57 cells);
+#   * metro -> storage cell is the group's flex registration, verified with
+#     `flex.par list_ceiling -s colossus -g deepmind-resources-colossus -l <c>`
+#     ("Number of registrations found: 0" for an unregistered cell). NOT with
+#     `fileutil quota`, which reports a plausible 500.00G for an unregistered
+#     group because that is the default bucket it falls through to;
+#   * a cell whose metro has no registration RAISES rather than defaulting.
+# Collapsing 18 cell rows into 10 metro rows changes NO existing answer -- the
+# old table was verified to be exactly this function of the measured metro.
+#
+# WHY THE ROWS ARE COPIED HERE instead of imported: this file is rsynced into a
+# stagedir and built there, so it cannot import from ~/work/tpu_cmd. The copy is
+# kept honest by `_assert_locality_matches_source()` below, which diffs it
+# against the source of truth when that is reachable and FAILS on a mismatch --
+# a silent drift between the two is exactly what this whole change removes.
+#
+# Regenerate with:
+#   python3 ~/work/tpu_cmd/google3_tpu_utils/remeasure_cell_locality.py --write
+#   python3 ~/work/tpu_cmd/google3_tpu_utils/sync_launcher_locality.py
+_LOCALITY_MEASURED_AT = '2026-08-28T17:37:46Z'
+_LOCALITY_SOURCE = os.path.expanduser(
+    '~/work/tpu_cmd/google3_tpu_utils/cell_locality.py')
+
+# cell -> (metro, continent). Compute cells only; storage cells live in
+# _METRO_STORAGE_CELL below.
+_CELL_LOCALITY = {
+    'lcbomp':      ('bom', 'ap'),
+    'ly':          ('bom', 'ap'),
+    'wu':          ('icn', 'ap'),
+    'yukulwh':     ('kul', 'ap'),
+    'rx':          ('nrt', 'ap'),
+    'sd':          ('sin', 'ap'),
+    'se':          ('sin', 'ap'),
+    'sf':          ('sin', 'ap'),
+    'sg':          ('sin', 'ap'),
+    'sh':          ('sin', 'ap'),
+    'si':          ('sin', 'ap'),
+    'sj':          ('sin', 'ap'),
+    'sk':          ('sin', 'ap'),
+    'sl':          ('sin', 'ap'),
+    'sm':          ('sin', 'ap'),
+    'sn':          ('sin', 'ap'),
+    'so':          ('sin', 'ap'),
+    'lcsydv':      ('syd', 'ap'),
+    'ta':          ('tpe', 'ap'),
+    'tb':          ('tpe', 'ap'),
+    'tc':          ('tpe', 'ap'),
+    'td':          ('tpe', 'ap'),
+    'tg':          ('tpe', 'ap'),
+    'th':          ('tpe', 'ap'),
+    'tl':          ('tpe', 'ap'),
+    'tm':          ('tpe', 'ap'),
+    'tp':          ('tpe', 'ap'),
+    'rc':          ('bll', 'eu'),
+    'rd':          ('bll', 'eu'),
+    'wb':          ('bru', 'eu'),
+    'wd':          ('bru', 'eu'),
+    'we':          ('bru', 'eu'),
+    'wf':          ('bru', 'eu'),
+    'wg':          ('bru', 'eu'),
+    'wh':          ('bru', 'eu'),
+    'wi':          ('bru', 'eu'),
+    'wq':          ('bru', 'eu'),
+    'ra':          ('dhr', 'eu'),
+    'rb':          ('dhr', 'eu'),
+    'dg':          ('dub', 'eu'),
+    'di':          ('dub', 'eu'),
+    'dj':          ('dub', 'eu'),
+    'lcfrai':      ('fra', 'eu'),
+    'ea':          ('grq', 'eu'),
+    'eb':          ('grq', 'eu'),
+    'ec':          ('grq', 'eu'),
+    'ed':          ('grq', 'eu'),
+    'ef':          ('grq', 'eu'),
+    'ei':          ('grq', 'eu'),
+    'ej':          ('grq', 'eu'),
+    'el':          ('grq', 'eu'),
+    'en':          ('grq', 'eu'),
+    'eq':          ('grq', 'eu'),
+    'lclhrb':      ('lhr', 'eu'),
+    'sv':          ('lhr', 'eu'),
+    'yulhrp':      ('lhr', 'eu'),
+    'yulhrs':      ('lhr', 'eu'),
+    'la':          ('lpp', 'eu'),
+    'lb':          ('lpp', 'eu'),
+    'le':          ('lpp', 'eu'),
+    'lg':          ('lpp', 'eu'),
+    'lh':          ('lpp', 'eu'),
+    'li':          ('lpp', 'eu'),
+    'lj':          ('lpp', 'eu'),
+    'lk':          ('lpp', 'eu'),
+    'lo':          ('lpp', 'eu'),
+    'lq':          ('lpp', 'eu'),
+    'lt':          ('lpp', 'eu'),
+    'lu':          ('lpp', 'eu'),
+    'yulpptr':     ('lpp', 'eu'),
+    'yuskedq':     ('ske', 'eu'),
+    'ym':          ('atl', 'na'),
+    'yo':          ('atl', 'na'),
+    'yq':          ('atl', 'na'),
+    'ys':          ('atl', 'na'),
+    'lcausi':      ('aus', 'na'),
+    'lcausr':      ('aus', 'na'),
+    'ib':          ('cbf', 'na'),
+    'if':          ('cbf', 'na'),
+    'ig':          ('cbf', 'na'),
+    'iq':          ('cbf', 'na'),
+    'is':          ('cbf', 'na'),
+    'it':          ('cbf', 'na'),
+    'ix':          ('cbf', 'na'),
+    'iy':          ('cbf', 'na'),
+    'iz':          ('cbf', 'na'),
+    'jb':          ('cbf', 'na'),
+    'je':          ('cbf', 'na'),
+    'jg':          ('cbf', 'na'),
+    'ji':          ('cbf', 'na'),
+    'jj':          ('cbf', 'na'),
+    'jn':          ('cbf', 'na'),
+    'jo':          ('cbf', 'na'),
+    'jp':          ('cbf', 'na'),
+    'jq':          ('cbf', 'na'),
+    'js':          ('cbf', 'na'),
+    'jt':          ('cbf', 'na'),
+    'jz':          ('cbf', 'na'),
+    'ny':          ('cbf', 'na'),
+    'nz':          ('cbf', 'na'),
+    'yucbfaa':     ('cbf', 'na'),
+    'yucbfab':     ('cbf', 'na'),
+    'yucbfac':     ('cbf', 'na'),
+    'yucbfad':     ('cbf', 'na'),
+    'yucbfcd':     ('cbf', 'na'),
+    'yucbfiv':     ('cbf', 'na'),
+    'yucbflq':     ('cbf', 'na'),
+    'yucbfpv':     ('cbf', 'na'),
+    'yucbfrl':     ('cbf', 'na'),
+    'yucbfsl':     ('cbf', 'na'),
+    'yucbfsr':     ('cbf', 'na'),
+    'yucbful':     ('cbf', 'na'),
+    'yucbfwv':     ('cbf', 'na'),
+    'ue':          ('chs', 'na'),
+    'uj':          ('chs', 'na'),
+    'ux':          ('chs', 'na'),
+    'uy':          ('chs', 'na'),
+    'vj':          ('chs', 'na'),
+    'vk':          ('chs', 'na'),
+    'vl':          ('chs', 'na'),
+    'vz':          ('chs', 'na'),
+    'yuchspe':     ('chs', 'na'),
+    'yuchstz':     ('chs', 'na'),
+    'ma':          ('ckv', 'na'),
+    'mb':          ('ckv', 'na'),
+    'md':          ('ckv', 'na'),
+    'me':          ('ckv', 'na'),
+    'mf':          ('ckv', 'na'),
+    'mg':          ('ckv', 'na'),
+    'mh':          ('ckv', 'na'),
+    'mj':          ('ckv', 'na'),
+    'yuckvax':     ('ckv', 'na'),
+    'ga':          ('cmh', 'na'),
+    'gb':          ('cmh', 'na'),
+    'gh':          ('cmh', 'na'),
+    'gl':          ('cmh', 'na'),
+    'gm':          ('cmh', 'na'),
+    'go':          ('cmh', 'na'),
+    'rg':          ('cmh', 'na'),
+    'yucmhaa':     ('cmh', 'na'),
+    'yucmhab':     ('cmh', 'na'),
+    'yucmhcg':     ('cmh', 'na'),
+    'yucmhfq':     ('cmh', 'na'),
+    'yucmhgs':     ('cmh', 'na'),
+    'yucmhnb':     ('cmh', 'na'),
+    'yucmhps':     ('cmh', 'na'),
+    'yucmhqa':     ('cmh', 'na'),
+    'yucmhsu':     ('cmh', 'na'),
+    'yucmhty':     ('cmh', 'na'),
+    'yucmhwf':     ('cmh', 'na'),
+    'rq':          ('dfw', 'na'),
+    'rr':          ('dfw', 'na'),
+    'rs':          ('dfw', 'na'),
+    'rt':          ('dfw', 'na'),
+    'rw':          ('dfw', 'na'),
+    'yudfwra':     ('dfw', 'na'),
+    'pw':          ('dls', 'na'),
+    'px':          ('dls', 'na'),
+    'py':          ('dls', 'na'),
+    'pz':          ('dls', 'na'),
+    'ts':          ('dls', 'na'),
+    'tt':          ('dls', 'na'),
+    'yufwahd':     ('fwa', 'na'),
+    'yufwakf':     ('fwa', 'na'),
+    'bh':          ('iad', 'na'),
+    'bi':          ('iad', 'na'),
+    'bk':          ('iad', 'na'),
+    'pd':          ('iad', 'na'),
+    'wv':          ('iad', 'na'),
+    'ww':          ('iad', 'na'),
+    'yuiadrs':     ('iad', 'na'),
+    'yuiadtq':     ('iad', 'na'),
+    'dd':          ('las', 'na'),
+    'dl':          ('las', 'na'),
+    'dy':          ('las', 'na'),
+    'dz':          ('las', 'na'),
+    'qc':          ('mrn', 'na'),
+    'qn':          ('mrn', 'na'),
+    'qo':          ('mrn', 'na'),
+    'qr':          ('mrn', 'na'),
+    'yumrnel':     ('mrn', 'na'),
+    'yuphxej':     ('phx', 'na'),
+    'yuphxer':     ('phx', 'na'),
+    'yuphxrp':     ('phx', 'na'),
+    'ro':          ('rno', 'na'),
+    'yurnoaa':     ('rno', 'na'),
+    'yurnolb':     ('rno', 'na'),
+    'yurnoyc':     ('rno', 'na'),
+    'na':          ('tul', 'na'),
+    'nf':          ('tul', 'na'),
+    'nk':          ('tul', 'na'),
+    'nl':          ('tul', 'na'),
+    'nm':          ('tul', 'na'),
+    'nn':          ('tul', 'na'),
+    'oa':          ('tul', 'na'),
+    'od':          ('tul', 'na'),
+    'oe':          ('tul', 'na'),
+    'oi':          ('tul', 'na'),
+    'oj':          ('tul', 'na'),
+    'ok':          ('tul', 'na'),
+    'oq':          ('tul', 'na'),
+    'ot':          ('tul', 'na'),
+    'ow':          ('tul', 'na'),
+    'oz':          ('tul', 'na'),
+    'pa':          ('tul', 'na'),
+    'pb':          ('tul', 'na'),
+    'yutulis':     ('tul', 'na'),
+    'yutulpz':     ('tul', 'na'),
+    'yutulrf':     ('tul', 'na'),
+    'gc':          ('uos', 'na'),
+    'gd':          ('uos', 'na'),
+    'ge':          ('uos', 'na'),
+    'gg':          ('uos', 'na'),
+    'lcyulk':      ('yul', 'na'),
+    'ce':          ('scl', 'sa'),
+    'cf':          ('scl', 'sa'),
+    'cg':          ('scl', 'sa'),
+    'cj':          ('scl', 'sa'),
+    'lcscld':      ('scl', 'sa'),
 }
+
+# metro -> the CNS cell the GROUP is registered in. One row per metro
+# because every cell in a metro shares its storage.
+_METRO_STORAGE_CELL = {
+    'cbf':   'is-d',
+    'ckv':   'mb-d',
+    'cmh':   'go-d',
+    'dfw':   'rs-d',
+    'grq':   'el-d',
+    'las':   'dl-d',
+    'lpp':   'li-d',
+    'mrn':   'qo-d',
+    'sin':   'si-d',
+    'tul':   'oi-d',
+}
+
+# Metros with NO group registration: a write here lands on the PERSONAL
+# 500 GiB per-cell ceiling. Named rather than omitted so the error can
+# say WHICH kind of "no" it is.
+_PERSONAL_ONLY_METROS = {
+    'phx':   'yuphxrp-d',
+    'ske':   'yuskedq-d',
+}
+
+
+def _metro_of(cell):
+    """Measured metro for `cell`, or None. Never guesses from the name."""
+    row = _CELL_LOCALITY.get((cell or '').strip().lower())
+    return row[0] if row else None
+
+
+def _continent_of(cell):
+    """Measured continent for `cell`, or None."""
+    row = _CELL_LOCALITY.get((cell or '').strip().lower())
+    return row[1] if row else None
+
+
+def _storage_cell_of(cell):
+    """The CNS cell co-located with `cell`, or None if none is registered."""
+    metro = _metro_of(cell)
+    if metro is None:
+        return None
+    return _METRO_STORAGE_CELL.get(metro) or _PERSONAL_ONLY_METROS.get(metro)
+
+
+def _assert_locality_matches_source():
+    """Fail if this embedded copy has drifted from the shared snapshot.
+
+    Runs only where the source file is reachable (an interactive launch from the
+    checkout); inside a stagedir build it is absent and the check is skipped --
+    which is safe because the stagedir copy was rsynced from a checkout where
+    this same assertion had already passed at launch time.
+
+    The check is a DIFF, not a version stamp: a stamp can be bumped without the
+    rows changing and rows can change without the stamp moving.
+    """
+    try:
+        with open(_LOCALITY_SOURCE) as handle:
+            source = handle.read()
+    except OSError:
+        return  # not reachable from here; nothing to compare against
+    namespace = {}
+    try:
+        exec(compile(source, _LOCALITY_SOURCE, 'exec'), namespace)  # noqa: S102
+        truth = namespace['_MEASURED']
+        truth_storage = namespace['_METRO_STORAGE_CELL']
+        truth_personal = namespace['_PERSONAL_ONLY_METROS']
+    except Exception as exc:  # noqa: BLE001 - a broken source must not be silent
+        raise SystemExit(
+            '[locality] cannot read the cell-locality source of truth '
+            f'{_LOCALITY_SOURCE}: {exc}. Refusing to launch with an '
+            'unverifiable bucket map -- fix the file, or delete it to fall '
+            'back to this launcher\'s embedded copy.')
+    want = {c: (r[0], r[1]) for c, r in truth.items() if not c.endswith('-d')}
+    problems = []
+    for cell in sorted(set(want) | set(_CELL_LOCALITY)):
+        mine, theirs = _CELL_LOCALITY.get(cell), want.get(cell)
+        if mine != theirs:
+            problems.append(f'  {cell}: launcher={mine} source={theirs}')
+    if truth_storage != _METRO_STORAGE_CELL:
+        problems.append(f'  metro->storage: launcher={_METRO_STORAGE_CELL} '
+                        f'source={truth_storage}')
+    if truth_personal != _PERSONAL_ONLY_METROS:
+        problems.append(f'  personal-only: launcher={_PERSONAL_ONLY_METROS} '
+                        f'source={truth_personal}')
+    if problems:
+        raise SystemExit(
+            '[locality] this launcher\'s embedded cell map has DRIFTED from '
+            f'{_LOCALITY_SOURCE}:\n' + '\n'.join(problems[:20])
+            + (f'\n  ... and {len(problems) - 20} more' if len(problems) > 20 else '')
+            + '\n  Re-sync with: python3 '
+              '~/work/tpu_cmd/google3_tpu_utils/sync_launcher_locality.py\n'
+              '  Refusing to launch: a drifted bucket map is how a job ends up '
+              'checkpointing to another continent.')
 
 # WHERE A v7 JOB SHOULD PREFER TO LAND, best tier first.
 #
@@ -140,27 +463,92 @@ def _read_legacy_mapping():
         return {}
 
 
+# The path under a CNS cell root that this project's checkpoints live in. The
+# shared locality layer owns WHICH CELL; the directory below it stays here.
+_BUCKET_SUFFIX = 'home/qiaos/eqr_data'
+
+
 def _local_bucket() -> str:
-    """The durable root nearest the cell this job will run in."""
-    # An explicitly passed --bucket is authoritative.
+    """The durable root nearest the cell this job will run in, or exit.
+
+    FAIL CLOSED, ON AN UNCONDITIONAL PATH. Every return below is either an
+    explicit user choice or a bucket PROVEN co-located with a measured cell;
+    there is no branch that falls through to a default prefix. The previous
+    version returned `--bucket`'s default for any cell it did not recognise,
+    which is how XID 284145906 (cell `yukulwh`, metro kul, ASIA) came to write
+    its checkpoints to `/cns/yutulpz-d` in North America, stall on every save,
+    and be deleted by the WIM pruner. Nothing in its logs said so, because the
+    wrong path is a perfectly valid path.
+
+    The guard is deliberately NOT nested inside an `if binary exists` or
+    `if flag set` block: a protection reachable only on some paths is a
+    protection that disappears exactly when something else has already gone
+    wrong.
+    """
+    # 1. An explicitly passed --bucket is authoritative. The user named a
+    #    location; it is not this function's business to second-guess it.
     if _BUCKET.present:
         return _BUCKET.value
+
+    # 2. This launcher's embedded cell map must agree with the shared snapshot.
+    #    Checked here, on the one path every unpinned launch takes.
+    _assert_locality_matches_source()
+
     cell = (_CELL.value or '').strip()
-    for name, bucket in _CELL_BUCKETS.items():
-        if name == cell:
-            print(f"[locality] cell={cell}: using co-located bucket {bucket}")
-            return bucket
-    # NO PINNED CELL. Under --cell_prefer the scheduler picks from a whole tier,
-    # so the landing cell is not knowable here and the bucket cannot be matched
-    # to it. That is a real hazard rather than a cosmetic one: a checkpoint
-    # prefix a metro away costs 4-5x throughput and gets the job pruned
-    # mid-run (storage.md). Say so, rather than letting the default look
-    # deliberate. Pin --cell, or pass --bucket for a location you have chosen.
-    if _CELL_PREFER.value and _CELL_PREFER.value.lower() not in ('off',):
-        print(f"[locality] NOTE: no --cell pinned, so the bucket cannot be matched "
-              f"to the landing cell; using {_BUCKET.value!r}. If that is not in the "
-              f"metro this job lands in, pass --bucket or --cell explicitly.")
-    return _BUCKET.value
+
+    # 3. NO PINNED CELL. Under --cell_prefer the scheduler picks from a whole
+    #    tier, so the landing cell is not knowable here and no bucket can be
+    #    proven co-located with it. Refuse rather than ship a plausible guess.
+    if not cell:
+        raise SystemExit(
+            '[locality] REFUSING to launch: no --cell is pinned, so the landing '
+            'cell -- and therefore the metro its checkpoints must be written in '
+            '-- is not knowable at submit time. Falling back to the default '
+            f'bucket ({_BUCKET.value!r}) is what got XID 284145906 deleted: it '
+            'wrote from Asia to North America, stalled the accelerator on every '
+            'save, and the pruner removed it mid-run.\n'
+            '  Fix, in order of preference:\n'
+            '    * pass --cell=<cell> (tpu queue pins one for you by default), or\n'
+            '    * pass --bucket=<root> if you have chosen a location on purpose.')
+
+    # 4. A pinned cell resolves through the MEASURED map, or refuses.
+    storage_cell = _storage_cell_of(cell)
+    if storage_cell is None:
+        metro = _metro_of(cell)
+        if metro is None:
+            why = (f'cell {cell!r} is not in the measured locality snapshot '
+                   f'({len(_CELL_LOCALITY)} cells, measured '
+                   f'{_LOCALITY_MEASURED_AT}), so no bucket can be proven '
+                   f'co-located with it')
+            how = ('re-measure with `python3 '
+                   '~/work/tpu_cmd/google3_tpu_utils/remeasure_cell_locality.py '
+                   '--write` (the cell may be newly turned up), then re-sync '
+                   'this launcher with sync_launcher_locality.py')
+        else:
+            why = (f'cell {cell!r} is in metro {metro!r} (continent '
+                   f'{_continent_of(cell)!r}), which has NO storage cell '
+                   f'registered for the group')
+            how = (f'register the group in a {metro!r} CNS cell and add it to '
+                   f'_METRO_STORAGE_CELL, or run in a metro that has storage '
+                   f'({", ".join(sorted(_METRO_STORAGE_CELL))})')
+        raise SystemExit(
+            f'[locality] REFUSING to launch: {why}. Refusing to fall back to '
+            f'{_BUCKET.value!r} -- an out-of-metro checkpoint stream is not a '
+            f'slowdown, it is a deletion (XID 275990419, XID 284145906).\n'
+            f'  Fix: {how}; or pass --bucket=<root> explicitly.')
+
+    bucket = f'/cns/{storage_cell}/{_BUCKET_SUFFIX}'
+    metro = _metro_of(cell)
+    note = ''
+    if metro in _PERSONAL_ONLY_METROS:
+        note = ('  NOTE: this metro has no GROUP storage registration, so the '
+                'write lands on the personal 500 GiB per-cell ceiling. Fine for '
+                'a smoke test; exhausting it poisons every write in the cell.')
+    print(f'[locality] cell={cell} (metro {metro}, continent '
+          f'{_continent_of(cell)}): co-located bucket {bucket}')
+    if note:
+        print(note)
+    return bucket
 
 
 _WORKDIR = flags.DEFINE_string(
@@ -840,21 +1228,45 @@ def main(argv) -> None:
         
         pkg_path = target_label.lstrip('/').split(':')[0]
         
-        try:
-            config_path = "config.sh"
-            if not os.path.exists(config_path):
-                config_path = f"{pkg_path}/config.sh"
-            with open(config_path, "r") as f:
-                for line in f:
-                    if line.startswith("export PROJECT_NAME="):
-                        project_name = line.split("=")[1].strip().strip('"').strip("'")
-                    elif line.startswith("export PACKAGE_MODE="):
-                        package_mode = line.split("=")[1].strip().strip('"').strip("'")
-                    elif line.startswith("export TARGET_LABEL="):
-                        target_label = line.split("=")[1].strip().strip('"').strip("'")
-                        pkg_path = target_label.lstrip('/').split(':')[0]
-        except Exception:
-            pass
+        # Locate config.sh ROBUSTLY. This read decides package_mode, which
+        # routes bazel_binary (internal Borg) vs python_container (GCP, needs a
+        # mapped cloud project). A SILENT read failure here used to default
+        # package_mode to "python" -> python_container -> GCP get_project(
+        # 'deepmind-dynamic') -> NotImplementedError: No project set, killing
+        # every PROD arm at launch. The read failed silently because config.sh
+        # was resolved CWD-RELATIVE, and the wrapper's getcwd guard chdir's to
+        # $STAGE_WS_ROOT (which has no top-level config.sh) right before launch.
+        # Fix: resolve via $TPU_STAGEDIR (exported by the wrapper on BOTH the
+        # fresh-build and resume paths) FIRST, then fall back to CWD; and make a
+        # failure LOUD instead of defaulting to python.
+        _stagedir = os.environ.get("TPU_STAGEDIR", "")
+        _config_candidates = []
+        if _stagedir:
+            _config_candidates.append(os.path.join(_stagedir, "config.sh"))
+        _config_candidates.append("config.sh")
+        if pkg_path:
+            _config_candidates.append(f"{pkg_path}/config.sh")
+        _config_path = next((c for c in _config_candidates if os.path.exists(c)), None)
+        if _config_path is None:
+            raise SystemExit(
+                "[launcher] FATAL: config.sh not found in any of "
+                f"{_config_candidates} (TPU_STAGEDIR={_stagedir!r}, cwd={os.getcwd()!r}). "
+                "Refusing to guess package_mode: defaulting to 'python' would route "
+                "to python_container/GCP and die with 'No project set for pool_name: "
+                "deepmind-dynamic'. Ensure the wrapper staged config.sh and exported "
+                "TPU_STAGEDIR."
+            )
+        with open(_config_path, "r") as f:
+            for line in f:
+                if line.startswith("export PROJECT_NAME="):
+                    project_name = line.split("=")[1].strip().strip('"').strip("'")
+                elif line.startswith("export PACKAGE_MODE="):
+                    package_mode = line.split("=")[1].strip().strip('"').strip("'")
+                elif line.startswith("export TARGET_LABEL="):
+                    target_label = line.split("=")[1].strip().strip('"').strip("'")
+                    pkg_path = target_label.lstrip('/').split(':')[0]
+        print(f"[launcher] config.sh={_config_path} -> package_mode={package_mode!r} "
+              f"target_label={target_label!r} project_name={project_name!r}")
 
         executors = []
         is_tpu_job = False
@@ -872,6 +1284,31 @@ def main(argv) -> None:
             "v6p": "ghostfish",       # 92
             "v7": "ghostfishlite",    # 101
         }
+        # NVIDIA GPUs. xm.ResourceType is CASE-INSENSITIVE and the kwarg name IS
+        # the lowercase enum name, so JobRequirements(h100=8) / (b200=8) /
+        # (gb200=8) work directly -- the map is identity, present so the GPU
+        # branch below can recognise these arch tokens and so a typo gets a
+        # clean error instead of a cryptic ResourceType KeyError at submit.
+        # NVLINK_DOMAIN is the device_group size from the platform GCL
+        # (platforms/accelerator_metadata/platforms/*.gcl): the largest slice
+        # that is fully NVLink-connected. Above it, chips talk over network
+        # RDMA, so a bigger single-job ask is legal but not faster for
+        # comms-bound work -- we warn, not block.
+        GPU_MAP = {
+            "a100": "a100",          # 46  (40 GiB)
+            "a100_80gib": "a100_80gib",  # 66
+            "h100": "h100",          # 70
+            "h200": "h200",          # 86
+            "b200": "b200",          # 87
+            "b300": "b300",          # 112
+            "gb200": "gb200",        # 89
+            "gb300": "gb300",        # 100
+        }
+        NVLINK_DOMAIN = {
+            "a100": 16, "a100_80gib": 8, "h100": 8, "h200": 8,
+            "b200": 8, "b300": 8, "gb200": 72, "gb300": 72,
+        }
+        FISH_MAP.update(GPU_MAP)
         
         # LINT.IfChange(group_map) — keep in sync with tpu_wrapper.sh & group_utils.py.
         _GROUP_MAP = {
@@ -942,6 +1379,25 @@ def main(argv) -> None:
                         raise ValueError(f"[BLOCKED] In {alloc_str or 'the current resource pool'}, the minimum allowed slice for {arch} is {min_allowed} chips, but you requested {num_cores}. To avoid an instant fragmentation rejection, request at least {arch}-{min_allowed}.")
                     if cores in TORUS_2D_MAP:
                         cores = TORUS_2D_MAP[cores]
+                elif arch_lower in GPU_MAP:
+                    # NVIDIA GPUs are NOT a torus: the chip count passes through
+                    # UNCHANGED as a scalar (JobRequirements(h100=8) -> a 1-D
+                    # topology of 8, one task). No TPU min-slice rule applies
+                    # (those are torus/pod fragmentation limits). We only WARN
+                    # when the ask exceeds the card's NVLink domain, because
+                    # past that boundary the extra chips talk over network RDMA
+                    # rather than NVLink -- legal, but not faster for
+                    # communication-bound work, and multi-host GPU coordination
+                    # (torchrun/NCCL) is the caller's responsibility, not the
+                    # JAX-coordination path this launcher injects for TPUs.
+                    domain = NVLINK_DOMAIN.get(arch_lower)
+                    if domain and num_cores > domain:
+                        print(f"[gpu] WARNING: requested {arch}-{num_cores} exceeds the "
+                              f"{domain}-GPU NVLink domain for {arch}. Chips beyond "
+                              f"{domain} communicate over network RDMA, not NVLink; "
+                              f"comms-bound work will not scale linearly, and you must "
+                              f"handle multi-host GPU coordination yourself.")
+                    # cores stays the raw integer string; no torus remap.
                 
                 res_name = FISH_MAP.get(arch_lower, arch_lower)
             else:
@@ -1090,8 +1546,13 @@ def main(argv) -> None:
                 executor = xm_abc.Gcp(requirements=job_requirements)
             executors.append(executor)
             # Any TPU accelerator in the request means the job is multi-task and
-            # needs the JAX coordination flags injected below.
-            if res_name in FISH_MAP.values() or res_name.startswith('tpu'):
+            # needs the JAX coordination flags injected below. GPUs are NOT
+            # TPU jobs: FISH_MAP now also carries the GPU families, so match
+            # against the TPU codenames ONLY (GPU_MAP is the exclusion set),
+            # or the GPU path would wrongly get the TPU JAX-coordination flags.
+            _is_gpu = res_name in GPU_MAP
+            if not _is_gpu and (res_name in FISH_MAP.values()
+                                or res_name.startswith('tpu')):
                 is_tpu_job = True
 
         final_executor = xm.Fallback(executors) if len(executors) > 1 else executors[0]
@@ -1342,10 +1803,42 @@ def main(argv) -> None:
         
 
         if package_mode == "bazel":
+            # BASE build flags for every bazel job. A GPU job additionally
+            # needs CUDA compiled IN: torch's CUDA kernels are `if_cuda`-gated
+            # in //third_party/py/torch, and xmanager's apply_default_bazel_args
+            # does NOT auto-add --config=cuda from the accelerator -- it must be
+            # passed explicitly (verified in xm_abc/packaging/bazel_args.py).
+            # Without it a torch/GPU bazel binary builds CPU-ONLY and reports
+            # torch.cuda.device_count()==0 at runtime -- the torch twin of the
+            # JAX tpu_support trap (a CPU-only build that does not say so).
+            #
+            # xm_abc.bazel_args.gpu(<resource>) returns exactly what xmanager
+            # itself uses for a GPU job: --config=cuda, --define=cuda_compress=1,
+            # the per-SM enables (h100 -> sm90), and the accelerator FDO/opt
+            # flags. This is the bazel/Borg counterpart of the python_container
+            # base_image('pytorch') branch below (which only covers the GCP
+            # path). TPU and CPU jobs are untouched: the GPU flags are appended
+            # ONLY when res_name is a GPU arch. Fail-open -- a lookup failure
+            # falls back to a bare --config=cuda, which still yields CUDA torch,
+            # because a launcher that refuses to submit is worse than one that
+            # builds with slightly coarser flags.
+            _bazel_args = ["--define=PYTYPE=FALSE", "--norun_validations"]
+            if res_name in GPU_MAP:
+                try:
+                    _gpu_res = xm.ResourceType[res_name.upper()]
+                    _gpu_flags = tuple(xm_abc.bazel_args.gpu(_gpu_res))
+                except Exception as _e:  # noqa: BLE001 - never block a launch on flag lookup
+                    _gpu_flags = ("--config=cuda", "--define=cuda_compress=1")
+                    print(f"[gpu] bazel_args.gpu({res_name!r}) unavailable "
+                          f"({type(_e).__name__}: {_e}); using bare {_gpu_flags}.")
+                for _f in _gpu_flags:
+                    if _f not in _bazel_args:
+                        _bazel_args.append(_f)
+                print(f"[gpu] bazel CUDA build flags for {res_name}: {_gpu_flags}")
             (executable,) = experiment.package(
                 [xm.bazel_binary(
                     label=target_label,
-                    bazel_args=["--define=PYTYPE=FALSE", "--norun_validations"],
+                    bazel_args=_bazel_args,
                     executor_spec=final_executor.Spec(),
                     args=executable_args,
                     env_vars=job_env_vars,
@@ -1353,10 +1846,23 @@ def main(argv) -> None:
             )
         else: # python mode default
             base_image_accel = executors[0].requirements.accelerator
+            # Pick the container framework from the accelerator: a GPU job needs
+            # the CUDA PyTorch image (framework_defaults.base_image('pytorch',
+            # gpu) -> gcr.io/deeplearning-platform-release/pytorch-gpu...),
+            # while TPU/JAX keeps the jax image. Hardcoding 'jax' shipped a
+            # JAX-only image to a torch-on-GPU job. `is_tpu_job` is already False
+            # for GPUs (so no JaxFlags were injected); this makes the IMAGE match
+            # too. Override with FRAMEWORK=... in config.sh if a GPU job really
+            # wants JAX (jax-on-GPU) or vice versa.
+            _fw = os.environ.get('FRAMEWORK', '')
+            if not _fw:
+                _fw = 'pytorch' if (not is_tpu_job and res_name in GPU_MAP) else 'jax'
+            print(f'[launcher] python_container framework={_fw!r} '
+                  f'accel={base_image_accel}')
             (executable,) = experiment.package(
                 [xm.python_container(
                     path='.',
-                    base_image=framework_defaults.base_image('jax', base_image_accel),
+                    base_image=framework_defaults.base_image(_fw, base_image_accel),
                     entrypoint=xm.ModuleName('main'),
                     use_deep_module=True,
                     executor_spec=final_executor.Spec(),

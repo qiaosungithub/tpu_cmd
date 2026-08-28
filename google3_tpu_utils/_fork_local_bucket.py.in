@@ -1,0 +1,71 @@
+def _local_bucket() -> str:
+    """The durable root nearest the cell this job will run in, or exit.
+
+    FAIL CLOSED, ON AN UNCONDITIONAL PATH. The previous version returned
+    `--bucket`'s default for any cell it did not recognise, so a job landing in
+    an unlisted cell silently inherited a checkpoint prefix that could be on
+    another continent -- how XID 284145906 (cell `yukulwh`, metro kul, ASIA,
+    writing to `/cns/yutulpz-d` in North America) stalled on every save and was
+    deleted by the WIM pruner mid-run. There is now no branch that reaches a
+    default: every return is an explicit choice or a PROVEN co-located bucket.
+    """
+    # 1. An explicitly passed --bucket is authoritative.
+    if _BUCKET.present:
+        return _BUCKET.value
+
+    # 2. Validate this file's own map before trusting any answer from it.
+    _assert_locality_sane()
+
+    cell = (_CELL.value or '').strip()
+
+    # 3. This project's own row wins -- WHICH cell inside the metro is its
+    #    choice, and check 1 above already proved the row is co-located.
+    if cell and cell in _CELL_BUCKETS:
+        bucket = _CELL_BUCKETS[cell]
+        print(f"[locality] cell={cell} (metro {_metro_of(cell)}): "
+              f"using co-located bucket {bucket}")
+        return bucket
+
+    # 4. NO PINNED CELL: the landing cell is unknowable at submit time, so no
+    #    bucket can be proven co-located with it. Refuse rather than guess.
+    if not cell:
+        raise SystemExit(
+            '[locality] REFUSING to launch: no --cell is pinned, so the metro '
+            'this job will write its checkpoints from is not knowable. Falling '
+            f'back to {_BUCKET.value!r} is what got XID 284145906 deleted.\n'
+            '  Fix: pass --cell=<cell> (tpu queue pins one by default), or '
+            '--bucket=<root> if you have chosen a location on purpose.')
+
+    # 5. A pinned cell this project has not listed: derive from the measured
+    #    metro if the group has storage there, else REFUSE.
+    metro = _metro_of(cell)
+    storage_cell = (_METRO_STORAGE_CELL.get(metro)
+                    or _PERSONAL_ONLY_METROS.get(metro)) if metro else None
+    if storage_cell is None:
+        if metro is None:
+            why = (f'cell {cell!r} is not in the measured locality snapshot '
+                   f'({len(_CELL_LOCALITY)} cells, measured '
+                   f'{_LOCALITY_MEASURED_AT})')
+            how = ('re-measure with `python3 ~/work/tpu_cmd/google3_tpu_utils/'
+                   'remeasure_cell_locality.py --write`, then re-sync this file '
+                   'with sync_fork_locality.py --write')
+        else:
+            why = (f'cell {cell!r} is in metro {metro!r} (continent '
+                   f'{_continent_of(cell)!r}), which has NO group storage')
+            how = (f'run in a metro that has storage '
+                   f'({", ".join(sorted(_METRO_STORAGE_CELL))})')
+        raise SystemExit(
+            f'[locality] REFUSING to launch: {why}, so no bucket can be proven '
+            f'co-located with it. Refusing to fall back to {_BUCKET.value!r} -- '
+            f'an out-of-metro checkpoint stream is a deletion, not a slowdown.\n'
+            f'  Fix: {how}; or pass --bucket=<root> explicitly.')
+
+    suffix = _BUCKET_SUFFIX_FOR_DERIVED
+    bucket = f'/cns/{storage_cell}/{suffix}'
+    print(f"[locality] cell={cell} (metro {metro}, continent "
+          f"{_continent_of(cell)}) is not in this project's _CELL_BUCKETS; "
+          f"derived co-located bucket {bucket}")
+    if metro in _PERSONAL_ONLY_METROS:
+        print('  NOTE: no GROUP storage in this metro -- the write lands on the '
+              'personal 500 GiB per-cell ceiling.')
+    return bucket

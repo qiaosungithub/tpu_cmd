@@ -1,0 +1,347 @@
+
+# --------------------------------------------------------------------------
+# MEASURED CELL LOCALITY -- shared with ~/work/tpu_cmd/google3_tpu_utils/
+#                           cell_locality.py, which is the source of truth.
+# --------------------------------------------------------------------------
+# This checkout keeps its OWN `_CELL_BUCKETS` above, on purpose: which CNS cell
+# a project writes to inside a metro is that project's choice (this one uses
+# a different tul cell from its siblings, and both are correct -- same metro,
+# free cross-cell reads). What is NOT a matter of choice is which metro a cell
+# is in, and that is what these rows carry.
+#
+# THE ROWS ARE COPIED, NOT IMPORTED, because this file is rsynced into a
+# stagedir and built there, so it cannot reach ~/work/tpu_cmd. The copy is kept
+# honest by `_assert_locality_sane()` below, which (a) re-derives every
+# `_CELL_BUCKETS` row's metro from the measurement and REFUSES on a cross-metro
+# row, and (b) diffs the rows against the source of truth when it is reachable.
+#
+# Regenerate with:
+#   python3 ~/work/tpu_cmd/google3_tpu_utils/remeasure_cell_locality.py --write
+#   python3 ~/work/tpu_cmd/google3_tpu_utils/sync_fork_locality.py --write
+_LOCALITY_MEASURED_AT = '2026-08-28T17:37:46Z'
+_LOCALITY_SOURCE = os.path.expanduser(
+    '~/work/tpu_cmd/google3_tpu_utils/cell_locality.py')
+
+_CELL_LOCALITY = {
+    'lcbomp':      ('bom', 'ap'),
+    'ly':          ('bom', 'ap'),
+    'wu':          ('icn', 'ap'),
+    'yukulwh':     ('kul', 'ap'),
+    'rx':          ('nrt', 'ap'),
+    'sd':          ('sin', 'ap'),
+    'se':          ('sin', 'ap'),
+    'sf':          ('sin', 'ap'),
+    'sg':          ('sin', 'ap'),
+    'sh':          ('sin', 'ap'),
+    'si':          ('sin', 'ap'),
+    'sj':          ('sin', 'ap'),
+    'sk':          ('sin', 'ap'),
+    'sl':          ('sin', 'ap'),
+    'sm':          ('sin', 'ap'),
+    'sn':          ('sin', 'ap'),
+    'so':          ('sin', 'ap'),
+    'lcsydv':      ('syd', 'ap'),
+    'ta':          ('tpe', 'ap'),
+    'tb':          ('tpe', 'ap'),
+    'tc':          ('tpe', 'ap'),
+    'td':          ('tpe', 'ap'),
+    'tg':          ('tpe', 'ap'),
+    'th':          ('tpe', 'ap'),
+    'tl':          ('tpe', 'ap'),
+    'tm':          ('tpe', 'ap'),
+    'tp':          ('tpe', 'ap'),
+    'rc':          ('bll', 'eu'),
+    'rd':          ('bll', 'eu'),
+    'wb':          ('bru', 'eu'),
+    'wd':          ('bru', 'eu'),
+    'we':          ('bru', 'eu'),
+    'wf':          ('bru', 'eu'),
+    'wg':          ('bru', 'eu'),
+    'wh':          ('bru', 'eu'),
+    'wi':          ('bru', 'eu'),
+    'wq':          ('bru', 'eu'),
+    'ra':          ('dhr', 'eu'),
+    'rb':          ('dhr', 'eu'),
+    'dg':          ('dub', 'eu'),
+    'di':          ('dub', 'eu'),
+    'dj':          ('dub', 'eu'),
+    'lcfrai':      ('fra', 'eu'),
+    'ea':          ('grq', 'eu'),
+    'eb':          ('grq', 'eu'),
+    'ec':          ('grq', 'eu'),
+    'ed':          ('grq', 'eu'),
+    'ef':          ('grq', 'eu'),
+    'ei':          ('grq', 'eu'),
+    'ej':          ('grq', 'eu'),
+    'el':          ('grq', 'eu'),
+    'en':          ('grq', 'eu'),
+    'eq':          ('grq', 'eu'),
+    'lclhrb':      ('lhr', 'eu'),
+    'sv':          ('lhr', 'eu'),
+    'yulhrp':      ('lhr', 'eu'),
+    'yulhrs':      ('lhr', 'eu'),
+    'la':          ('lpp', 'eu'),
+    'lb':          ('lpp', 'eu'),
+    'le':          ('lpp', 'eu'),
+    'lg':          ('lpp', 'eu'),
+    'lh':          ('lpp', 'eu'),
+    'li':          ('lpp', 'eu'),
+    'lj':          ('lpp', 'eu'),
+    'lk':          ('lpp', 'eu'),
+    'lo':          ('lpp', 'eu'),
+    'lq':          ('lpp', 'eu'),
+    'lt':          ('lpp', 'eu'),
+    'lu':          ('lpp', 'eu'),
+    'yulpptr':     ('lpp', 'eu'),
+    'yuskedq':     ('ske', 'eu'),
+    'ym':          ('atl', 'na'),
+    'yo':          ('atl', 'na'),
+    'yq':          ('atl', 'na'),
+    'ys':          ('atl', 'na'),
+    'lcausi':      ('aus', 'na'),
+    'lcausr':      ('aus', 'na'),
+    'ib':          ('cbf', 'na'),
+    'if':          ('cbf', 'na'),
+    'ig':          ('cbf', 'na'),
+    'iq':          ('cbf', 'na'),
+    'is':          ('cbf', 'na'),
+    'it':          ('cbf', 'na'),
+    'ix':          ('cbf', 'na'),
+    'iy':          ('cbf', 'na'),
+    'iz':          ('cbf', 'na'),
+    'jb':          ('cbf', 'na'),
+    'je':          ('cbf', 'na'),
+    'jg':          ('cbf', 'na'),
+    'ji':          ('cbf', 'na'),
+    'jj':          ('cbf', 'na'),
+    'jn':          ('cbf', 'na'),
+    'jo':          ('cbf', 'na'),
+    'jp':          ('cbf', 'na'),
+    'jq':          ('cbf', 'na'),
+    'js':          ('cbf', 'na'),
+    'jt':          ('cbf', 'na'),
+    'jz':          ('cbf', 'na'),
+    'ny':          ('cbf', 'na'),
+    'nz':          ('cbf', 'na'),
+    'yucbfaa':     ('cbf', 'na'),
+    'yucbfab':     ('cbf', 'na'),
+    'yucbfac':     ('cbf', 'na'),
+    'yucbfad':     ('cbf', 'na'),
+    'yucbfcd':     ('cbf', 'na'),
+    'yucbfiv':     ('cbf', 'na'),
+    'yucbflq':     ('cbf', 'na'),
+    'yucbfpv':     ('cbf', 'na'),
+    'yucbfrl':     ('cbf', 'na'),
+    'yucbfsl':     ('cbf', 'na'),
+    'yucbfsr':     ('cbf', 'na'),
+    'yucbful':     ('cbf', 'na'),
+    'yucbfwv':     ('cbf', 'na'),
+    'ue':          ('chs', 'na'),
+    'uj':          ('chs', 'na'),
+    'ux':          ('chs', 'na'),
+    'uy':          ('chs', 'na'),
+    'vj':          ('chs', 'na'),
+    'vk':          ('chs', 'na'),
+    'vl':          ('chs', 'na'),
+    'vz':          ('chs', 'na'),
+    'yuchspe':     ('chs', 'na'),
+    'yuchstz':     ('chs', 'na'),
+    'ma':          ('ckv', 'na'),
+    'mb':          ('ckv', 'na'),
+    'md':          ('ckv', 'na'),
+    'me':          ('ckv', 'na'),
+    'mf':          ('ckv', 'na'),
+    'mg':          ('ckv', 'na'),
+    'mh':          ('ckv', 'na'),
+    'mj':          ('ckv', 'na'),
+    'yuckvax':     ('ckv', 'na'),
+    'ga':          ('cmh', 'na'),
+    'gb':          ('cmh', 'na'),
+    'gh':          ('cmh', 'na'),
+    'gl':          ('cmh', 'na'),
+    'gm':          ('cmh', 'na'),
+    'go':          ('cmh', 'na'),
+    'rg':          ('cmh', 'na'),
+    'yucmhaa':     ('cmh', 'na'),
+    'yucmhab':     ('cmh', 'na'),
+    'yucmhcg':     ('cmh', 'na'),
+    'yucmhfq':     ('cmh', 'na'),
+    'yucmhgs':     ('cmh', 'na'),
+    'yucmhnb':     ('cmh', 'na'),
+    'yucmhps':     ('cmh', 'na'),
+    'yucmhqa':     ('cmh', 'na'),
+    'yucmhsu':     ('cmh', 'na'),
+    'yucmhty':     ('cmh', 'na'),
+    'yucmhwf':     ('cmh', 'na'),
+    'rq':          ('dfw', 'na'),
+    'rr':          ('dfw', 'na'),
+    'rs':          ('dfw', 'na'),
+    'rt':          ('dfw', 'na'),
+    'rw':          ('dfw', 'na'),
+    'yudfwra':     ('dfw', 'na'),
+    'pw':          ('dls', 'na'),
+    'px':          ('dls', 'na'),
+    'py':          ('dls', 'na'),
+    'pz':          ('dls', 'na'),
+    'ts':          ('dls', 'na'),
+    'tt':          ('dls', 'na'),
+    'yufwahd':     ('fwa', 'na'),
+    'yufwakf':     ('fwa', 'na'),
+    'bh':          ('iad', 'na'),
+    'bi':          ('iad', 'na'),
+    'bk':          ('iad', 'na'),
+    'pd':          ('iad', 'na'),
+    'wv':          ('iad', 'na'),
+    'ww':          ('iad', 'na'),
+    'yuiadrs':     ('iad', 'na'),
+    'yuiadtq':     ('iad', 'na'),
+    'dd':          ('las', 'na'),
+    'dl':          ('las', 'na'),
+    'dy':          ('las', 'na'),
+    'dz':          ('las', 'na'),
+    'qc':          ('mrn', 'na'),
+    'qn':          ('mrn', 'na'),
+    'qo':          ('mrn', 'na'),
+    'qr':          ('mrn', 'na'),
+    'yumrnel':     ('mrn', 'na'),
+    'yuphxej':     ('phx', 'na'),
+    'yuphxer':     ('phx', 'na'),
+    'yuphxrp':     ('phx', 'na'),
+    'ro':          ('rno', 'na'),
+    'yurnoaa':     ('rno', 'na'),
+    'yurnolb':     ('rno', 'na'),
+    'yurnoyc':     ('rno', 'na'),
+    'na':          ('tul', 'na'),
+    'nf':          ('tul', 'na'),
+    'nk':          ('tul', 'na'),
+    'nl':          ('tul', 'na'),
+    'nm':          ('tul', 'na'),
+    'nn':          ('tul', 'na'),
+    'oa':          ('tul', 'na'),
+    'od':          ('tul', 'na'),
+    'oe':          ('tul', 'na'),
+    'oi':          ('tul', 'na'),
+    'oj':          ('tul', 'na'),
+    'ok':          ('tul', 'na'),
+    'oq':          ('tul', 'na'),
+    'ot':          ('tul', 'na'),
+    'ow':          ('tul', 'na'),
+    'oz':          ('tul', 'na'),
+    'pa':          ('tul', 'na'),
+    'pb':          ('tul', 'na'),
+    'yutulis':     ('tul', 'na'),
+    'yutulpz':     ('tul', 'na'),
+    'yutulrf':     ('tul', 'na'),
+    'gc':          ('uos', 'na'),
+    'gd':          ('uos', 'na'),
+    'ge':          ('uos', 'na'),
+    'gg':          ('uos', 'na'),
+    'lcyulk':      ('yul', 'na'),
+    'ce':          ('scl', 'sa'),
+    'cf':          ('scl', 'sa'),
+    'cg':          ('scl', 'sa'),
+    'cj':          ('scl', 'sa'),
+    'lcscld':      ('scl', 'sa'),
+}
+
+# metro -> the CNS cell the GROUP is registered in (flex registry, verified with
+# `flex.par list_ceiling`; NOT `fileutil quota`, which reports a plausible
+# 500.00G for an unregistered group). Used only for a cell this project's own
+# _CELL_BUCKETS does not list.
+_METRO_STORAGE_CELL = {
+    'cbf':   'is-d',
+    'ckv':   'mb-d',
+    'cmh':   'go-d',
+    'dfw':   'rs-d',
+    'grq':   'el-d',
+    'las':   'dl-d',
+    'lpp':   'li-d',
+    'mrn':   'qo-d',
+    'sin':   'si-d',
+    'tul':   'oi-d',
+}
+
+# Metros with NO group registration -- personal 500 GiB per-cell ceiling only.
+_PERSONAL_ONLY_METROS = {
+    'phx':   'yuphxrp-d',
+    'ske':   'yuskedq-d',
+}
+
+
+def _metro_of(cell):
+    """Measured metro for `cell`, or None. Never guesses from the name."""
+    row = _CELL_LOCALITY.get((cell or '').strip().lower())
+    return row[0] if row else None
+
+
+def _continent_of(cell):
+    """Measured continent for `cell`, or None."""
+    row = _CELL_LOCALITY.get((cell or '').strip().lower())
+    return row[1] if row else None
+
+
+def _cns_cell_of(path):
+    """'/cns/oi-d/home/x' -> 'oi-d'. None for anything that is not a /cns/ path."""
+    if not isinstance(path, str) or not path.startswith('/cns/'):
+        return None
+    return path[len('/cns/'):].split('/', 1)[0] or None
+
+
+def _assert_locality_sane():
+    """Refuse to launch on a cross-metro bucket row or a drifted copy.
+
+    TWO CHECKS, and they catch different faults:
+      1. every `_CELL_BUCKETS` row must name a storage cell in the SAME METRO as
+         its compute cell -- this catches a hand-edited row that quietly sends
+         checkpoints to another region, which is the failure that got two jobs
+         deleted (XID 275990419, XID 284145906);
+      2. the measured rows must match the shared snapshot when it is reachable.
+    Check 1 runs ALWAYS -- it needs nothing outside this file. Check 2 is
+    skipped inside a stagedir where the source is absent, which is safe because
+    the stagedir was rsynced from a checkout where check 2 had just passed.
+    """
+    problems = []
+    for cell, path in _CELL_BUCKETS.items():
+        metro = _metro_of(cell)
+        store = _cns_cell_of(path)
+        store_metro = _metro_of(store[:-2]) if store and store.endswith('-d') else None
+        if metro is None:
+            problems.append(f'  {cell} -> {path}: compute cell is not in the '
+                            f'measured snapshot, so co-location cannot be proven')
+        elif store_metro is None:
+            problems.append(f'  {cell} -> {path}: storage cell {store!r} is not '
+                            f'in the measured snapshot')
+        elif metro != store_metro:
+            problems.append(
+                f'  {cell} ({metro}/{_continent_of(cell)}) -> {path} '
+                f'({store_metro}): CROSS-METRO checkpoint row')
+    if problems:
+        raise SystemExit(
+            '[locality] REFUSING to launch: this checkout\'s _CELL_BUCKETS has '
+            'rows that are not co-located:\n' + '\n'.join(problems)
+            + '\n  A checkpoint stream outside the compute metro is not a '
+              'slowdown, it is a deletion by the WIM pruner.')
+    try:
+        with open(_LOCALITY_SOURCE) as handle:
+            source = handle.read()
+    except OSError:
+        return
+    namespace = {}
+    try:
+        exec(compile(source, _LOCALITY_SOURCE, 'exec'), namespace)  # noqa: S102
+        truth = {c: (r[0], r[1]) for c, r in namespace['_MEASURED'].items()
+                 if not c.endswith('-d')}
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(
+            f'[locality] cannot read {_LOCALITY_SOURCE}: {exc}. Refusing to '
+            'launch with an unverifiable cell map.')
+    drift = [f'  {c}: local={_CELL_LOCALITY.get(c)} source={truth.get(c)}'
+             for c in sorted(set(truth) | set(_CELL_LOCALITY))
+             if _CELL_LOCALITY.get(c) != truth.get(c)]
+    if drift:
+        raise SystemExit(
+            '[locality] this checkout\'s measured cell rows have DRIFTED from '
+            f'{_LOCALITY_SOURCE}:\n' + '\n'.join(drift[:20])
+            + (f'\n  ... and {len(drift) - 20} more' if len(drift) > 20 else '')
+            + '\n  Re-sync: python3 '
+              '~/work/tpu_cmd/google3_tpu_utils/sync_fork_locality.py --write')
