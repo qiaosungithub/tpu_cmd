@@ -64,18 +64,18 @@ get_group_id_by_alloc() {
 
 # Preflight & router blaze targets (built once, reused). If missing, tpu queue
 # will still work but skip the pre-flight check with a warning.
-_PREFLIGHT_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/preflight_cli"
-_ROUTER_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/router_cli"
-_INFRA_CHECK_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/infra_check"
+_PREFLIGHT_CLI_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/preflight_cli"
+_ROUTER_CLI_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/router_cli"
+_INFRA_CHECK_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/infra_check"
 # The local-queue smart-router CLI (tpu enqueue / queue-status / dequeue) and
 # the router tick (tpu route-tick). Side-by-side with `tpu queue`; never
 # replaces it. Built by: blaze build experimental/users/qiaos/tpu_utils:{queue_cli,route_check}
-_QUEUE_CLI_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/queue_cli"
-_ROUTE_CHECK_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/route_check"
+_QUEUE_CLI_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/queue_cli"
+_ROUTE_CHECK_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/route_check"
 # Smart cell picker: makes `tpu queue` pin the best placeable cell by default.
 # Fail-safe -- if missing/erroring, tpu queue falls back to the allocator.
 # Built by: blaze build experimental/users/qiaos/tpu_utils:pick_cell
-_PICK_CELL_BIN="/google/src/cloud/qiaos/xm_test/google3/blaze-bin/experimental/users/qiaos/tpu_utils/pick_cell"
+_PICK_CELL_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/pick_cell"
 _MACH_LOCALITY="/usr/local/bin/mach_locality"
 # Default must track xm_launcher.py's --bucket default; only used to work out
 # which continent the data is in when the caller does not pass --bucket.
@@ -339,6 +339,179 @@ _tpu_daemon_autoheal() {
   _tpu_restart_check_daemon
 }
 
+# ---------------------------------------------------------------------------
+# STAGING SOURCE GUARD -- refuse a stage-write whose SOURCE cannot be a project
+# checkout. Three INDEPENDENT judgements; any one of them refuses.
+#
+# WHY (2026-08-28 incident, measured independently by four lines). The stage
+# rsync's SOURCE is `./` -- the CWD -- and the CWD is chosen by the CALLER:
+# route_check submits with cwd=<the queue entry's `workdir`>, a free-text field
+# defaulted at enqueue time to whatever getcwd() happened to be. Nothing ever
+# checked what that directory WAS. Two shapes cost a whole day:
+#
+#   (1) workdir == STAGE_WS_ROOT (a google3 depot root, 417 top-level dirs).
+#       abs_stagedir is BUILT from STAGE_WS_ROOT, so the source CONTAINED the
+#       destination and rsync copied the depot into a subdirectory of itself:
+#       1.1 GB in 3 min, hits the 300 s timeout -> `continue` -> `rm -rf` ->
+#       re-rsync, forever. ONE queue entry produced 76.1% of that day's 91,437
+#       CreateSnapshot failures.
+#   (2) workdir == /tmp (~9,400 top-level entries). Here the destination is NOT
+#       inside the source, so a containment check alone cannot see it; rsync
+#       simply tries to package the whole of /tmp.
+#
+# Hence three checks, deliberately independent, two of them structural (no
+# number to tune):
+#   A. containment, EITHER WAY, on realpath-canonicalised paths. dest-inside-
+#      source is the rsync-forever loop; source-inside-dest is worse still --
+#      the `rm -rf "$abs_stagedir"` that opens every stage attempt would delete
+#      the source tree.
+#   B. the source IS a google3 workspace root (path shape OR marker files).
+#      Cheap, semantic, count-free -- a second opinion that cannot drift with
+#      the size of a depot.
+#   C. the source has implausibly many top-level entries. MEASURED on this
+#      workstation: every legitimate project workdir in the live queue holds
+#      3..97 entries (median ~20; the largest, ~/work itself, 97); a depot root
+#      416-417; /tmp ~9,400; a bare $HOME 229. The default limit 200 is the
+#      geometric mean of 97 and 416 -- 2.1x above the largest legitimate
+#      workdir seen and 2.1x below a depot root, so it has multiplicative
+#      margin on both sides, and it also catches a bare $HOME.
+#
+# Escape hatch, for C ONLY and always logged: TPU_STAGE_MAX_TOPLEVEL=<n> raises
+# the limit, TPU_STAGE_MAX_TOPLEVEL=0 disables the count check. A and B are NOT
+# overridable: no legitimate stage-write of this pipeline has ever had a depot
+# root as its source, and a self-containing rsync is never correct.
+#
+# An unreadable or uncountable source REFUSES (fail closed) rather than counting
+# as 0 or "clean": if one readdir of the source cannot finish in 20 s, the 300 s
+# rsync of that same source will not end well either, and the caller gets an
+# immediate clean failure instead of three timed-out attempts.
+#
+# Usage: _tpu_stage_src_guard <src> <dst> [<where>] [<quiet>]  0 = allow, 1 = REFUSE
+#   <where> names the call site in the message; <quiet>=1 suppresses only the
+#   "ok" line (a refusal is NEVER quiet).
+_tpu_stage_src_guard() {
+  local src_raw="$1" dst_raw="$2" where="${3:-stage}" quiet="${4:-0}"
+  local src dst rc check="" detail="" hint=""
+  local _probe_to="${TPU_STAGE_GUARD_PROBE_TIMEOUT:-20}"
+  local _max="${TPU_STAGE_MAX_TOPLEVEL:-200}"
+
+  # ---- canonicalise BOTH sides before comparing anything. `[ -d ]` and a
+  # string compare both lie about symlinks, and this bug is entirely about
+  # paths. -m on the destination: its last component may not exist yet.
+  if [ -n "$src_raw" ]; then
+    src=$(timeout "$_probe_to" realpath -- "$src_raw" 2>/dev/null); rc=$?
+  else
+    src=""; rc=1
+  fi
+  if [ "$rc" -ne 0 ] || [ -z "$src" ]; then
+    check="SOURCE-UNRESOLVABLE"
+    detail="cannot canonicalise the source directory (realpath rc=$rc). It does not exist, is unreadable, or this process's CWD was severed under it (an srcfsd restart does exactly that)."
+    hint="Re-run from a directory that exists, or fix the queue entry's workdir."
+  fi
+  # Resolve the destination even when the source already failed, so the message
+  # can SHOW it. Reporting an unexamined path as "unresolvable" would invent a
+  # second fault and send the reader after the wrong one.
+  dst=$(timeout "$_probe_to" realpath -m -- "$dst_raw" 2>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$dst" ]; then
+    dst=""
+    if [ -z "$check" ]; then
+      check="DEST-UNRESOLVABLE"
+      detail="cannot canonicalise the destination stagedir (realpath -m rc=$rc)."
+      hint="Check that STAGE_WS_ROOT points at a readable google3 root."
+    fi
+  fi
+
+  # ---- A. containment, either direction. Trailing slash on both so /a/bc is
+  # not read as inside /a/b; quoted expansion in ${d#"$s"} so a glob character
+  # in a path stays a literal.
+  if [ -z "$check" ]; then
+    local s="${src%/}/" d="${dst%/}/"
+    if [ "${d#"$s"}" != "$d" ]; then
+      check="DEST-INSIDE-SOURCE"
+      detail="the destination stagedir is INSIDE the source tree, so rsync would copy the source into a subdirectory of itself -- the 300s-timeout / rm -rf / retry loop that caused the 2026-08-28 CreateSnapshot storm."
+      hint="The workdir must be the project checkout you want packaged, NOT the workspace that holds the stagedir (STAGE_WS_ROOT=$STAGE_WS_ROOT)."
+    elif [ "${s#"$d"}" != "$s" ]; then
+      check="SOURCE-INSIDE-DEST"
+      detail="the source tree is INSIDE the destination stagedir, and this staging path opens every attempt with 'rm -rf <stagedir>' -- it would DELETE the source."
+      hint="Point the workdir at the project checkout, outside \${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages/."
+    fi
+  fi
+
+  # ---- B. the source is a google3 workspace root (path shape OR markers).
+  if [ -z "$check" ]; then
+    local _is_g3=0
+    case "$src" in
+      /google/src/cloud/*/google3|/google_src/cloud/*/google3) _is_g3=1 ;;
+      /google/src/head/depot/google3|/google/src/files/*/depot/google3) _is_g3=1 ;;
+    esac
+    if [ "$_is_g3" -eq 0 ] \
+       && [ -f "$src/WORKSPACE" ] && [ -d "$src/devtools" ] && [ -d "$src/third_party" ]; then
+      _is_g3=2
+    fi
+    if [ "$_is_g3" -ne 0 ]; then
+      check="SOURCE-IS-A-GOOGLE3-ROOT"
+      if [ "$_is_g3" -eq 1 ]; then
+        detail="the source path is a google3 workspace root (CitC / mainline path shape)."
+      else
+        detail="the source holds the google3-root markers WORKSPACE + devtools/ + third_party/."
+      fi
+      hint="A whole depot is never the thing to package. Set the queue entry's workdir to the project checkout (e.g. ~/work/<project>)."
+    fi
+  fi
+
+  # ---- C. implausibly many top-level entries (skippable, always logged).
+  if [ -z "$check" ] && [ "$_max" != "0" ]; then
+    local _n=-1 _out _try
+    for _try in 1 2; do
+      _out=$(timeout "$_probe_to" find "$src" -mindepth 1 -maxdepth 1 -printf 'x' 2>/dev/null); rc=$?
+      if [ "$rc" -eq 0 ]; then _n="${#_out}"; break; fi
+      _n=-1
+    done
+    if [ "$_n" -lt 0 ]; then
+      check="SOURCE-UNCOUNTABLE"
+      detail="could not enumerate the source's top-level entries within ${_probe_to}s, twice -- UNKNOWN, not zero. A source whose readdir hangs will hang the 300s rsync too."
+      hint="Wait for srcfsd to settle, or set TPU_STAGE_MAX_TOPLEVEL=0 to skip the size check deliberately."
+    elif [ "$_n" -gt "$_max" ]; then
+      check="SOURCE-TOO-LARGE"
+      detail="the source has $_n top-level entries (limit $_max). Every legitimate project workdir measured on this host has 3-97; a google3 depot root has ~417 and /tmp ~9,400."
+      hint="Set the queue entry's workdir to the project checkout. If this really is a legitimate ${_n}-entry checkout, re-run with TPU_STAGE_MAX_TOPLEVEL=$((_n + 1)) -- explicit and logged."
+    fi
+  elif [ -z "$check" ]; then
+    echo -e "\033[33m[$TPU_CMD_NAME queue] stage-source size check DISABLED by TPU_STAGE_MAX_TOPLEVEL=0 (deliberate override).\033[0m" >&2
+  fi
+
+  if [ -n "$check" ]; then
+    # WHO, not just WHAT. This file is shared by two operators on one Unix
+    # account (`tpu` = sqa, `npu` = lyy, which re-enters this same function
+    # with TPU_CMD_NAME/TPU_OPERATOR overridden), so a refusal that named only
+    # the check would send whoever reads it hunting through the wrong queue
+    # file. Same identity expression the `check` board already uses, so the two
+    # cannot drift; falls back to $USER when unset (the sqa/`tpu` side).
+    local _op="${TPU_OPERATOR:-${USER:-unknown}}"
+    echo -e "\033[31m[$TPU_CMD_NAME queue] ($_op) REFUSING to stage ($where): $check\033[0m" >&2
+    echo -e "\033[31m  source (rsync './')  : ${src:-<unresolvable: $src_raw>}\033[0m" >&2
+    echo -e "\033[31m  destination stagedir : ${dst:-<unresolvable: $dst_raw>}\033[0m" >&2
+    echo -e "\033[31m  why: $detail\033[0m" >&2
+    echo -e "\033[33m  fix: $hint\033[0m" >&2
+    echo -e "\033[33m  The source of a stage-write is the CWD: for a queue-driven build that is the\033[0m" >&2
+    echo -e "\033[33m  entry's \"workdir\" field; for an interactive run it is the directory you are in.\033[0m" >&2
+    echo -e "\033[2m  (guard: _tpu_stage_src_guard in tpu_wrapper.sh; see ~/work/.monitor_watch/STAGING_GUARD_v46.md)\033[0m" >&2
+    # LAST LINE, ANSI-FREE, ONE LINE -- and last on purpose. route_check stores
+    # only `_tail(out, 240)` in the queue entry's `last_reason`, i.e. the final
+    # 240 characters, so anything printed after this would push the verdict out
+    # of the only record an operator reads on the board. Same convention as
+    # budget_check.py's `[[BUDGET_DEFERRED]]` marker: a stable, colour-free,
+    # greppable token, so a future reader (or route_check itself) can classify
+    # this refusal as a bad workdir rather than "the build crashed".
+    echo "[[STAGE_SRC_REFUSED]] operator=$_op tool=$TPU_CMD_NAME $check src=${src:-$src_raw} dst=${dst:-$dst_raw} -- fix the queue entry's workdir" >&2
+    return 1
+  fi
+  if [ "$quiet" != "1" ] && [ "${TPU_STAGE_GUARD_VERBOSE:-1}" = "1" ]; then
+    echo -e "\033[2m[$TPU_CMD_NAME queue] (${TPU_OPERATOR:-${USER:-unknown}}) stage-source guard ok ($where): src=$src -> dst=$dst\033[0m"
+  fi
+  return 0
+}
+
 tpu() {
   if [ "$1" = "queue" ] || [ "$1" = "q" ]; then
     shift
@@ -533,7 +706,7 @@ tpu() {
       fi
       if [ ! -x "$_ROUTER_CLI_BIN" ]; then
         echo -e "\033[31mError: router binary not built. Run:\033[0m"
-        echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:router_cli)"
+        echo "  (cd /google/src/cloud/qiaos/run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:router_cli)"
         return 1
       fi
       echo -e "\033[36m[$TPU_CMD_NAME queue] Router mode: --power=$power. Probing candidates...\033[0m"
@@ -665,8 +838,13 @@ print(d['group'], d['tpu_type'], d['status'],
 
     # ============ BUDGET CHECK ============
     local budget_script="$HOME/work/wiki_agents/tools/budget_check.py"
-    if [ -x "$budget_script" ]; then
-      if ! "$budget_script" "$tpu_type" "${tier:-PROD}"; then
+    # Gate on EXISTENCE (-f) + explicit python3, NOT the exec bit (-x). The +x
+    # bit silently drops on git checkout / rsync / editor rewrites, and an -x
+    # gate then SKIPS the budget check with no error -- a live over-spend path
+    # (found 2026-08-26: file was -rw-r-----, launch budget gate was being
+    # bypassed entirely; running-job enforcer was the only thing catching it).
+    if [ -f "$budget_script" ]; then
+      if ! python3 "$budget_script" "$tpu_type" "${tier:-PROD}"; then
         return 1
       fi
     fi
@@ -678,9 +856,17 @@ print(d['group'], d['tpu_type'], d['status'],
       local first_g="${group%%,*}"
       if [ "$first_g" = "5" ] && [ -z "$tier" ]; then pf_tier="PROD"; fi
       echo -e "\033[36m[$TPU_CMD_NAME queue] Running preflight check on ${first_g}/${tpu_type} @ ${pf_tier}...\033[0m"
-      "$_PREFLIGHT_CLI_BIN" --tpu_type="$tpu_type" --group="$first_g" --tier="$pf_tier"
+      # v6 2026-08-26: preflight is wrapped in `timeout` so a srcfsd FUSE-hang
+      # (b/162421836 swap-thrash: stat blocks in request_wait_answer with NO
+      # timeout) cannot burn the whole route_check 1800s build wall-clock. On
+      # timeout, `timeout` returns 124 (or 128+SIG=137 if -k had to KILL); we
+      # treat that as fail-OPEN (skip the pre-check, let the build proceed) --
+      # preflight is advisory, never a build gate on its own hang.
+      timeout -k 5 120 "$_PREFLIGHT_CLI_BIN" --tpu_type="$tpu_type" --group="$first_g" --tier="$pf_tier"
       local pf_status=$?
-      if [ "$pf_status" -eq 1 ]; then
+      if [ "$pf_status" -eq 124 ] || [ "$pf_status" -eq 137 ]; then
+        echo -e "\033[33m[$TPU_CMD_NAME queue] Preflight TIMED OUT after 120s (srcfsd FUSE-hang?); proceeding without pre-check (fail-open).\033[0m"
+      elif [ "$pf_status" -eq 1 ]; then
         if [ "$force" = "1" ]; then
           echo -e "\033[33m[$TPU_CMD_NAME queue] Preflight said RED but --force is set; continuing anyway.\033[0m"
         else
@@ -697,7 +883,7 @@ print(d['group'], d['tpu_type'], d['status'],
       fi
     elif [ "$skip_preflight" != "1" ]; then
       echo -e "\033[33m[$TPU_CMD_NAME queue] Preflight binary not built at $_PREFLIGHT_CLI_BIN — skipping.\033[0m"
-      echo -e "\033[33m  Build with: (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:preflight_cli)\033[0m"
+      echo -e "\033[33m  Build with: (cd /google/src/cloud/qiaos/run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:preflight_cli)\033[0m"
     fi
     
     # Default tier if not specified (we handle this externally or keep it empty for defaults)
@@ -716,16 +902,61 @@ print(d['group'], d['tpu_type'], d['status'],
     # (fails if the name is taken) is a belt-and-suspenders guard that just draws a
     # fresh hash on the ~never case. Only the non-resume branch creates a stagedir.
     local now=$(date '+%y%m%d_%H%M%S')
-    # STAGE WORKSPACE ROOT (escape hatch). Defaults to the qiaos/802 EqR-jax
-    # CitC workspace (historical). If that workspace's CreateSnapshot token
-    # bucket is drained (writes dropped -> empty stagedir -> launch dies in
-    # os.getcwd()), export STAGE_WS_ROOT to a HEALTHY workspace google3 root to
-    # stage there instead, e.g.:
-    #   export STAGE_WS_ROOT=/google/src/cloud/qiaos/xm_test/google3   # qiaos/2
-    # The dir ${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages must exist.
-    # NOTE: any workspace can be drained the same way -- keep launches SERIAL.
-    local STAGE_WS_ROOT="${STAGE_WS_ROOT:-/google/src/cloud/qiaos/EqR-jax/google3}"
+    # STAGE WORKSPACE ROOT (escape hatch). The default is the workspace whose
+    # CitC write path is currently healthy; `export STAGE_WS_ROOT=<other
+    # google3 root>` overrides it, unchanged. A drained/wedged CreateSnapshot
+    # path drops writes silently -> truncated or empty stagedir -> the launch
+    # dies later in os.getcwd(), so the default matters.
+    #
+    # HOW TO DECIDE WHETHER TO MOVE IT AGAIN (the criterion, not today's answer):
+    # each CitC workspace records its own dropped writes in
+    #   /google/src/cloud/<user>/<workspace>/.citc/dropped_resources.ascii
+    # An idle/healthy one is 49 bytes -- a bare `# devtools_srcfs.Workspace
+    # DroppedLocalResources` header with no `resource {` blocks. Compare all of
+    # them and pick a workspace whose file is at the header size AND that has
+    # actually staged recently (a workspace with no traffic is not evidence of
+    # health -- check for recent eqr_run_* dirs under its
+    # experimental/qiaos/eqr_jax_final_stages before trusting a zero):
+    #   for w in /google/src/cloud/$USER/*/; do \
+    #     printf '%-40s %s\n' "$(basename ${w%/})" \
+    #       "$(stat -c %s $w.citc/dropped_resources.ascii 2>/dev/null || echo UNKNOWN)"; done
+    # ${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages must exist.
+    # NOTE: any workspace can be drained -- keep launches SERIAL regardless.
+    #
+    # v6 2026-08-28: moved elt_jax -> run_amply_workspace (qiaos/402). Measured:
+    # elt_jax (qiaos/3202) held 92,091 drop records, every other one of the 18
+    # workspaces sat at the empty 49-byte header. The control is real rather
+    # than a traffic artefact -- lyy_arc staged 69 dirs today with 0 drops
+    # against elt_jax's 40 with 92,091 -- and lyy's lane escaped the whole
+    # incident precisely because it always exported STAGE_WS_ROOT explicitly.
+    # Caveat kept deliberately visible: 75.6% of those drops belong to 8
+    # stagedirs that were being fed a RECURSIVE COPY OF THE DEPOT (their dropped
+    # paths are depot top-level dirs like abuse/, third_party/ inside the
+    # stagedir), i.e. mostly the bug the guard above now blocks, not proof the
+    # tree is diseased. The remaining 22,208 drops across 43 ordinary stagedirs
+    # are the part that is genuinely workspace-level, and they are still ~22k
+    # more than anywhere else -- which is why this moves. Revert by exporting
+    # STAGE_WS_ROOT, or by re-checking the two files with the recipe above.
+    local STAGE_WS_ROOT="${STAGE_WS_ROOT:-/google/src/cloud/qiaos/run_amply_workspace/google3}"
+
+    # STAGE-SOURCE GUARD, CALL 1 OF 2 -- the EARLIEST point at which both ends
+    # of the copy are known, and deliberately BEFORE the claim loop below: fail
+    # here and literally nothing has happened -- no mkdir into a workspace that
+    # may be the wrong one, no logdir, no stage lock, no `rm -rf`, no rsync, no
+    # build lane held. The destination is not drawn yet (the 6-hex hash comes
+    # from the loop), so this checks the PLANNED path; it differs from the real
+    # one only in that last component, which cannot change either containment
+    # verdict -- every candidate name sits directly under the same parent.
+    # Non-resume only: a resume re-uses an existing snapshot and never rsyncs,
+    # so the directory it runs from is irrelevant to it, and guarding it would
+    # refuse launches that are healthy today.
     if [ -z "$resume_xid" ]; then
+      if ! _tpu_stage_src_guard "." \
+            "${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages/eqr_run_${now}_<pending>" \
+            "pre-claim, planned destination"; then
+        return 1
+      fi
+      # ---- claim a unique stagedir (guard has passed; nothing above created it)
       local _ts="$now"
       local _tries=0
       while : ; do
@@ -841,9 +1072,40 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
         /*) abs_stagedir="$prior_stagedir" ;;
         *)  abs_stagedir="${STAGE_WS_ROOT}/${stagedir}" ;;
       esac
+      # A RELATIVE stagedir IS NOT ANCHORED TO TODAY'S STAGE_WS_ROOT. The
+      # registry stores `experimental/qiaos/eqr_jax_final_stages/eqr_run_...`
+      # with no record of WHICH workspace it was written into, so prepending the
+      # current default silently assumes the default has never moved. It has:
+      # every time STAGE_WS_ROOT is repointed (EqR-jax -> elt_jax on 08-26,
+      # elt_jax -> run_amply_workspace on 08-28), every snapshot staged under
+      # the previous root stops resolving, and a perfectly recoverable run
+      # reports "Recorded stagedir is gone" -- 36 of them, measured, at the
+      # moment of the 08-28 move. So: if the path does not exist under the
+      # current root, LOOK for it in the sibling workspaces before giving up.
+      # Search order puts the current root first; nothing is created or written.
+      if [ ! -d "$abs_stagedir" ]; then
+        case "$prior_stagedir" in
+          /*) : ;;   # an absolute record names its own workspace; nothing to search
+          *)
+            local _alt _alt_root _found=""
+            for _alt_root in "$STAGE_WS_ROOT" /google/src/cloud/*/*/google3; do
+              _alt="${_alt_root}/${stagedir}"
+              [ -d "$_alt" ] || continue
+              _found="$_alt"; break
+            done
+            if [ -n "$_found" ] && [ "$_found" != "$abs_stagedir" ]; then
+              echo -e "\033[33m[resume] Snapshot is not under the current STAGE_WS_ROOT; found it in the workspace it was actually staged into:\033[0m"
+              echo -e "\033[33m  looked for : $abs_stagedir\033[0m"
+              echo -e "\033[33m  using      : $_found\033[0m"
+              abs_stagedir="$_found"
+            fi
+            ;;
+        esac
+      fi
       if [ ! -d "$abs_stagedir" ]; then
         echo -e "\033[31m[resume] Recorded stagedir is gone: $abs_stagedir\033[0m"
         echo -e "\033[31m  Cannot resume XID $resume_xid without the code it ran.\033[0m"
+        echo -e "\033[2m  (also searched the other CitC workspaces for ${stagedir})\033[0m"
         [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
         return 1
       fi
@@ -854,21 +1116,179 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       export TPU_LOGDIR="$logdir"
       cd "$abs_stagedir"
     else
-    mkdir -p "$abs_stagedir"
     echo "Snapshotting source codebase to CitC stagedir: $abs_stagedir"
     # `.venv` (and `.jj`) are excluded: the Borg interpreter is hermetic, so a
     # packaged virtualenv is dead weight -- a 17k-file .venv added ~10-15 min of
     # pure rsync per arm for nothing (arc2 field report). Nothing in xm_launcher
     # or config.sh reads .venv.
-    rsync -aL --exclude={'bazel-*','.citc','.git','.jj','.venv','__pycache__','*.npy','*.npz','*.ckpt','*.pth','*.pt','*.safetensors','data','logs','wandb'} ./ "$abs_stagedir/"
-    if [ ! -f "$abs_stagedir/config.sh" ] && [ -f "$HOME/work/tpu_cmd/config.sh" ]; then
-      cp "$HOME/work/tpu_cmd/config.sh" "$abs_stagedir/"
-    fi
-    if [ ! -f "$abs_stagedir/xm_launcher.py" ] && [ -f "$HOME/work/tpu_cmd/xm_launcher.py" ]; then
-      cp "$HOME/work/tpu_cmd/xm_launcher.py" "$abs_stagedir/"
-    fi
-    if [ -f "$abs_stagedir/config.sh" ]; then
-      sed -i "s|export TARGET_LABEL=.*|export TARGET_LABEL=\"//${stagedir}:main\"|g" "$abs_stagedir/config.sh"
+    #
+    # STAGE-WRITE VERIFY + RETRY (srcfsd drop-write defense). Under srcfsd
+    # anon-leak swap-thrash (b/162421836) the CitC-backed stagedir SILENTLY
+    # DROPS a fraction of writes: rsync/cp report success, an immediate read
+    # even sees the file, then srcfsd evicts the dirty page and the writeback
+    # to the CitC backend fails -- the file reverts/vanishes seconds later.
+    # Observed 4/5 writes lost during thrash; a stagedir ended up with 46 files
+    # but no BUILD, and config.sh sometimes never landed so the TARGET_LABEL
+    # sed below silently no-ops and the build falls back to the ORIGINAL
+    # package label (//experimental/qiaos/eqr_jax_final:main), which the
+    # snapshot then can't resolve -> "no such package ... BUILD file not
+    # found". That burns a build attempt and holds the shared build lane for
+    # nothing. So: stage, then VERIFY the two files the build actually needs
+    # (BUILD present; config.sh present AND its TARGET_LABEL rewritten to the
+    # stagedir), and RETRY the whole stage on a partial write. Fail-fast after
+    # a few tries rather than feed a corrupt stagedir into blaze.
+    # Reap any ORPHAN rsync from a prior attempt of THIS wrapper's staging that
+    # is still writing an eqr_jax_final_stages stagedir. A timed-out/killed
+    # attempt can leave an rsync reparented to init (PPID=1) holding CPU/fds and
+    # (if same stagedir root) contending. Kill by-PID after verifying comm=rsync
+    # AND target is under our staging root -- never pattern-kill.
+    local _stage_root_re="experimental/qiaos/eqr_jax_final_stages/eqr_run_"
+    for _op in $(pgrep -x rsync 2>/dev/null); do
+      # only orphans (PPID==1): a live sibling build's rsync has a real parent
+      _pp=$(timeout 2 awk '/^PPid:/{print $2}' "/proc/$_op/status" 2>/dev/null)
+      [ "$_pp" = "1" ] || continue
+      _cl=$(timeout 2 tr '\0' ' ' < "/proc/$_op/cmdline" 2>/dev/null)
+      case "$_cl" in
+        *"$_stage_root_re"*)
+          echo -e "\033[33m[$TPU_CMD_NAME queue] reaping orphan rsync pid=$_op (prior-attempt stage leftover).\033[0m" >&2
+          timeout 5 kill "$_op" 2>/dev/null
+          ;;
+      esac
+    done
+    local _stage_ok=0 _stage_try=0 _stage_max=3
+    # Every stage-path FS op is FUSE and can hang in request_wait_answer when
+    # srcfsd thrashes. Bound each with `timeout` so a hang costs seconds+retry,
+    # not the whole 1800s Submitter wall (de6cae ate the wall >=4x here).
+    # Tunables (env-overridable): rm 120s, rsync 300s per try.
+    local _RM_TIMEOUT="${TPU_STAGE_RM_TIMEOUT:-120}"
+    local _RSYNC_TIMEOUT="${TPU_STAGE_RSYNC_TIMEOUT:-300}"
+    while [ "$_stage_try" -lt "$_stage_max" ]; do
+      _stage_try=$((_stage_try + 1))
+      # STAGE-SOURCE GUARD, CALL 2 OF 2 -- re-checked at the point of use, and
+      # deliberately ABOVE the `rm -rf` rather than merely above the rsync: this
+      # loop's first act is destructive, so a guard placed under it would refuse
+      # only after the damage. Not redundant with call 1: minutes can pass in
+      # between (the stage lock waits up to 900s, and a retry follows a 300s
+      # rsync timeout), and the CWD can be severed inside that window -- an
+      # srcfsd restart does exactly that, which is how this bug re-arms.
+      # Quiet on success so a 3-try loop does not print the ok line three times.
+      if ! _tpu_stage_src_guard "." "$abs_stagedir" "pre-rsync try $_stage_try/$_stage_max" 1; then
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+        cd "$orig_dir" 2>/dev/null
+        return 1
+      fi
+      # Start each attempt from a clean dir so a prior partial write cannot
+      # masquerade as success (stale BUILD from a half-done earlier try).
+      #
+      # RM -RF TARGET ASSERTION. The guard above validates the SOURCE; this
+      # validates the thing about to be DELETED, which is a different claim and
+      # deserves its own check -- `rm -rf` is one arithmetic slip away from a
+      # catastrophe and it sits one line above the rsync. An empty or `/`-valued
+      # $abs_stagedir, or one that lost its trailing path components, would
+      # otherwise expand to a delete of a workspace root.
+      #
+      # The test is the wrapper's OWN naming invariant, not a guess about what
+      # looks dangerous: this loop only ever runs on the fresh-build path, where
+      # abs_stagedir is by construction
+      # `${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages/eqr_run_<ts>`.
+      # So require exactly that -- a strict descendant of the staging parent
+      # whose basename starts with `eqr_run_`. Anything else means abs_stagedir
+      # was computed wrong, which is the only way this can fire.
+      #
+      # Deliberately NOT tested: the presence of a `WORKSPACE` file. It reads
+      # like a natural "never delete a workspace root" belt, but rsync copies a
+      # bazel project's own top-level WORKSPACE INTO the stagedir, so from try 2
+      # onward it would refuse a perfectly healthy re-stage -- a guard that
+      # breaks the healthy path is how guards get switched off. `.citc` is safe
+      # to test because it is in the rsync --exclude list and therefore cannot
+      # appear inside a stagedir; only a real workspace root has one.
+      # Stated as an EQUALITY, not a prefix test: dirname(target) must BE the
+      # staging parent. A prefix test would also accept `<parent>/sub/eqr_run_x`
+      # -- still a bug in abs_stagedir, and the assertion exists precisely to
+      # catch paths nobody predicted, so it must not quietly widen.
+      local _stage_rm_target _stage_rm_parent _stage_rm_base _stage_rm_dir
+      _stage_rm_target=$(timeout 20 realpath -m -- "$abs_stagedir" 2>/dev/null)
+      _stage_rm_parent=$(timeout 20 realpath -m -- "${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages" 2>/dev/null)
+      _stage_rm_base="${_stage_rm_target##*/}"
+      _stage_rm_dir="${_stage_rm_target%/*}"
+      if [ -z "$_stage_rm_target" ] || [ -z "$_stage_rm_parent" ] \
+         || [ "$_stage_rm_target" = "/" ] \
+         || [ "$_stage_rm_dir" != "${_stage_rm_parent%/}" ] \
+         || [ "${_stage_rm_base#eqr_run_}" = "$_stage_rm_base" ] \
+         || [ -e "$_stage_rm_target/.citc" ]; then
+        echo -e "\033[31m[$TPU_CMD_NAME queue] REFUSING to stage: 'rm -rf' target is not a stagedir.\033[0m" >&2
+        echo -e "\033[31m  would delete : ${_stage_rm_target:-<unresolvable: $abs_stagedir>}\033[0m" >&2
+        echo -e "\033[31m  must be     : a directory named eqr_run_* directly under\033[0m" >&2
+        echo -e "\033[31m                ${_stage_rm_parent:-<unresolvable>}/\033[0m" >&2
+        echo -e "\033[33m  This is an internal invariant, not a user error: abs_stagedir was computed wrong.\033[0m" >&2
+        echo "[[STAGE_RM_REFUSED]] target=${_stage_rm_target:-$abs_stagedir} parent=${_stage_rm_parent:-?} -- abs_stagedir computed wrong" >&2
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+        cd "$orig_dir" 2>/dev/null
+        return 1
+      fi
+      # timeout -k 5: SIGTERM at the limit, SIGKILL 5s later if it ignores it.
+      timeout -k 5 "$_RM_TIMEOUT" rm -rf "$abs_stagedir" 2>/dev/null
+      mkdir -p "$abs_stagedir" 2>/dev/null
+      timeout -k 5 "$_RSYNC_TIMEOUT" rsync -aL --exclude={'bazel-*','.citc','.git','.jj','.venv','__pycache__','*.npy','*.npz','*.ckpt','*.pth','*.pt','*.safetensors','data','logs','wandb'} ./ "$abs_stagedir/"
+      _rsync_rc=$?
+      if [ "$_rsync_rc" -eq 124 ] || [ "$_rsync_rc" -eq 137 ]; then
+        # DO NOT RETRY A TIMEOUT. This `continue` used to be unconditional, and
+        # it is the direct cause of the 2026-08-28 steady state: with a source
+        # too large to copy in 300s, every attempt wrote ~1 GB, timed out, and
+        # came back to `rm -rf` it and write it again -- a write/delete/write
+        # cycle that burned the CreateSnapshot bucket for the whole fleet and
+        # never converged. Retrying assumes the timeout was transient jitter,
+        # but the two things that actually cause it -- a source too big, and a
+        # wedged srcfsd -- are both STATES, and neither clears inside the few
+        # seconds before the identical next attempt. So fail now, with the two
+        # knobs that would make a retry meaningful, and let the caller decide.
+        # (TPU_STAGE_RETRY_ON_TIMEOUT=1 restores the old behaviour.)
+        if [ "${TPU_STAGE_RETRY_ON_TIMEOUT:-0}" = "1" ]; then
+          echo -e "\033[33m[$TPU_CMD_NAME queue] rsync TIMED OUT (rc=$_rsync_rc) on stage try $_stage_try/$_stage_max; retrying clean (TPU_STAGE_RETRY_ON_TIMEOUT=1).\033[0m" >&2
+          continue
+        fi
+        echo -e "\033[31m[$TPU_CMD_NAME queue] REFUSING to build: rsync TIMED OUT (rc=$_rsync_rc) after ${_RSYNC_TIMEOUT}s staging into $abs_stagedir.\033[0m" >&2
+        echo -e "\033[31m  Not retrying: an identical copy of the same source would hit the same wall,\033[0m" >&2
+        echo -e "\033[31m  and each attempt first 'rm -rf's what the last one wrote -- that write/delete/write\033[0m" >&2
+        echo -e "\033[31m  cycle is what drained the shared CreateSnapshot bucket on 2026-08-28.\033[0m" >&2
+        echo -e "\033[33m  If the source is genuinely large and the copy just needs longer:\033[0m" >&2
+        echo -e "\033[33m    TPU_STAGE_RSYNC_TIMEOUT=<seconds>   (raise the wall; default ${_RSYNC_TIMEOUT}s)\033[0m" >&2
+        echo -e "\033[33m    TPU_STAGE_RETRY_ON_TIMEOUT=1        (restore the old retry-on-timeout)\033[0m" >&2
+        echo -e "\033[33m  If srcfsd is thrashing instead, wait for it to settle, or export STAGE_WS_ROOT=<healthy workspace google3 root>.\033[0m" >&2
+        echo "[[STAGE_RSYNC_TIMEOUT]] rc=$_rsync_rc after ${_RSYNC_TIMEOUT}s src=$PWD dst=$abs_stagedir -- not retried on purpose" >&2
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+        cd "$orig_dir" 2>/dev/null
+        return 1
+      fi
+      if [ ! -f "$abs_stagedir/config.sh" ] && [ -f "$HOME/work/tpu_cmd/config.sh" ]; then
+        cp "$HOME/work/tpu_cmd/config.sh" "$abs_stagedir/"
+      fi
+      if [ ! -f "$abs_stagedir/xm_launcher.py" ] && [ -f "$HOME/work/tpu_cmd/xm_launcher.py" ]; then
+        cp "$HOME/work/tpu_cmd/xm_launcher.py" "$abs_stagedir/"
+      fi
+      if [ -f "$abs_stagedir/config.sh" ]; then
+        sed -i "s|export TARGET_LABEL=.*|export TARGET_LABEL=\"//${stagedir}:main\"|g" "$abs_stagedir/config.sh"
+      fi
+      # sync + settle: give srcfsd a moment to flush, then read back COLD.
+      sync 2>/dev/null
+      # VERIFY the exact artifacts the build reads. A drop-write fails one of
+      # these even though the commands above returned 0.
+      if [ -f "$abs_stagedir/BUILD" ] \
+         && [ -f "$abs_stagedir/main.py" ] \
+         && [ -f "$abs_stagedir/config.sh" ] \
+         && grep -q "export TARGET_LABEL=\"//${stagedir}:main\"" "$abs_stagedir/config.sh" 2>/dev/null; then
+        _stage_ok=1
+        [ "$_stage_try" -gt 1 ] && echo -e "\033[33m[$TPU_CMD_NAME queue] stagedir verified after $_stage_try tries (srcfsd drop-write retried).\033[0m"
+        break
+      fi
+      echo -e "\033[33m[$TPU_CMD_NAME queue] stagedir INCOMPLETE after stage try $_stage_try/$_stage_max (srcfsd drop-write?): missing BUILD/config.sh or TARGET_LABEL not rewritten. Retrying...\033[0m"
+      sleep 3
+    done
+    if [ "$_stage_ok" != "1" ]; then
+      echo -e "\033[31m[$TPU_CMD_NAME queue] REFUSING to build: stagedir $abs_stagedir still incomplete after $_stage_max stage tries (srcfsd is dropping writes). Failing fast so a corrupt stagedir does not burn a build attempt or hold the build lane. Retry when srcfsd is healthy (or export STAGE_WS_ROOT=<healthy workspace google3 root>).\033[0m"
+      [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+      cd "$orig_dir" 2>/dev/null
+      return 1
     fi
     
     export TPU_STAGEDIR="$abs_stagedir"
@@ -973,6 +1393,41 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       echo "Submitting into group: $alloc"
       echo "Running: ${xm_args[*]}"
       local log_file="${logdir}/xm_launch.log"
+      # GETCWD-CRASH GUARD (srcfsd drop-write defense, downstream of patch-2).
+      # The XManager CLI is a PAR whose Python startup runs `import sysconfig`,
+      # which unconditionally calls os.getcwd() at import time. If our CWD is the
+      # fresh stagedir and srcfsd has dropped/reclaimed it under swap-thrash
+      # (the same drop-write that truncates rsync -- observed: stage vanishes
+      # seconds after creation), getcwd() raises FileNotFoundError ->
+      # get_runfiles_dir_helper.cc SIGABRT, and EVERY fresh-build launch dies
+      # before it can create an experiment (resume survives only because it
+      # reuses an old, still-present stagedir). The launcher does NOT need the
+      # stagedir as CWD: TARGET_LABEL is an absolute //label and the stagedir is
+      # located via $TPU_STAGEDIR. So chdir to a STABLE google3 root before
+      # launching. Fall back to $HOME if even that is unreadable.
+      #
+      # THE $HOME FALLBACK IS A LAST RESORT, NOT AN EQUAL ALTERNATIVE -- and it
+      # was deliberately NOT promoted to the primary (proposal reviewed and
+      # rejected 2026-08-28, on the theory that landing in STAGE_WS_ROOT is what
+      # re-arms the recursive-copy bug after an srcfsd restart severs a CWD).
+      # It does not, and the swap would break every launch:
+      #   * the recursive copy is a STAGING bug (rsync's source is the CWD at
+      #     the top of `tpu queue`). This chdir happens AFTER staging is
+      #     finished, purely so the launcher's own getcwd() has somewhere to
+      #     stand; nothing rsyncs from here, and the stage-source guard now
+      #     refuses that shape at its actual origin.
+      #   * xmanager infers WHICH CitC workspace to build from by walking up
+      #     from its CWD looking for a `.citc/` directory
+      #     (source_snapshot.cc::GetCitcPathComponents -> client_workspace
+      #     ::get_client_workspace_info). $HOME has no `.citc` at any ancestor,
+      #     so from there the build stops being a CitC build and falls back to
+      #     a mainline/`mint:` CL that does not contain the freshly staged
+      #     package -- "no such package" instead of a clean failure.
+      # Verified against a live launch the same day: the in-flight build's
+      # xmanager process had cwd=/google/src/cloud/qiaos/lyy_arc/google3, a
+      # workspace root. Keep the workspace root first; $HOME only exists so a
+      # totally unreadable root still lets the launcher start and report.
+      cd "$STAGE_WS_ROOT" 2>/dev/null || cd "$HOME" 2>/dev/null
       "${xm_args[@]}" 2>&1 | tee "$log_file"
 
       # THE LAUNCH IS NOT DONE UNTIL XMANAGER SAYS SO. `tee` makes `$?` the exit
@@ -1047,6 +1502,9 @@ PYEOF
         if [ "${_TPU_LAUNCH_RETRIED:-0}" != "1" ]; then
           echo -e "\033[33m[launch] Retrying once (a fresh process re-mmaps /google/bin).\033[0m"
           export _TPU_LAUNCH_RETRIED=1
+          # Re-assert the getcwd-crash guard on the retry too (CWD may still be
+          # the vanished stagedir; see the guard at the first launch above).
+          cd "$STAGE_WS_ROOT" 2>/dev/null || cd "$HOME" 2>/dev/null
           # -a: the retry must not overwrite the first attempt's log. It used
           # to, which erased the evidence of whatever killed attempt one.
           "${xm_args[@]}" 2>&1 | tee -a "$log_file"
@@ -1782,8 +2240,12 @@ EOF
         local AGE=$(($(date +%s) - $(stat -c %Y "$CACHE_DIR/default.txt")))
         if [ "$AGE" -gt 300 ]; then
             echo -e "\033[31m[$TPU_CMD_NAME quota] 🚨 ALERT: quota data is stale (last updated ${AGE}s ago, over the 5-minute limit)!\033[0m"
-            echo -e "\033[33mLikely cause: LOAS / gcert credentials expired, or the background poller died.\033[0m"
-            echo -e "\033[36m[auto-recovery] Restarting the tpu-daemon background tmux session...\033[0m"
+            echo -e "\033[33mLikely causes (most common first): (1) the quota_check binary is crashing --\033[0m"
+            echo -e "\033[33m    run it directly to see: blaze-bin/experimental/users/qiaos/tpu_utils/quota_check\033[0m"
+            echo -e "\033[33m    (an ImportError/traceback usually means a code edit needs a rebuild:\033[0m"
+            echo -e "\033[33m     cd .../run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils:quota_check);\033[0m"
+            echo -e "\033[33m  (2) the background poller/daemon died;  (3) LOAS/gcert expired (check: gcertstatus).\033[0m"
+            echo -e "\033[36m[auto-recovery] Restarting the tpu-daemon background tmux session (fixes #2 only)...\033[0m"
             
             _tpu_restart_check_daemon
             
@@ -1815,8 +2277,12 @@ EOF
         local AGE=$(($(date +%s) - $(stat -c %Y "$CACHE_DIR/money.txt")))
         if [ "$AGE" -gt 300 ]; then
             echo -e "\033[31m[$TPU_CMD_NAME money] 🚨 ALERT: bidding power / price data is stale (last updated ${AGE}s ago, over the 5-minute limit)!\033[0m"
-            echo -e "\033[33mLikely cause: LOAS / gcert credentials expired, or the background poller died.\033[0m"
-            echo -e "\033[36m[auto-recovery] Restarting the tpu-daemon background tmux session...\033[0m"
+            echo -e "\033[33mLikely causes (most common first): (1) the money_check binary is crashing --\033[0m"
+            echo -e "\033[33m    run it directly to see: blaze-bin/experimental/users/qiaos/tpu_utils/money_check\033[0m"
+            echo -e "\033[33m    (an ImportError/traceback usually means a code edit needs a rebuild:\033[0m"
+            echo -e "\033[33m     cd .../run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils:money_check);\033[0m"
+            echo -e "\033[33m  (2) the background poller/daemon died;  (3) LOAS/gcert expired (check: gcertstatus).\033[0m"
+            echo -e "\033[36m[auto-recovery] Restarting the tpu-daemon background tmux session (fixes #2 only)...\033[0m"
             
             _tpu_restart_check_daemon
             
@@ -1835,7 +2301,7 @@ EOF
     shift
     if [ ! -x "$_PREFLIGHT_CLI_BIN" ]; then
       echo -e "\033[31mPreflight binary not built. Run:\033[0m"
-      echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:preflight_cli)"
+      echo "  (cd /google/src/cloud/qiaos/run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:preflight_cli)"
       return 1
     fi
     "$_PREFLIGHT_CLI_BIN" "$@"
@@ -1844,7 +2310,7 @@ EOF
     shift
     if [ ! -x "$_ROUTER_CLI_BIN" ]; then
       echo -e "\033[31mRouter binary not built. Run:\033[0m"
-      echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:router_cli)"
+      echo "  (cd /google/src/cloud/qiaos/run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils/preflight:router_cli)"
       return 1
     fi
     "$_ROUTER_CLI_BIN" "$@"
@@ -1858,7 +2324,7 @@ EOF
     shift
     if [ ! -x "$_INFRA_CHECK_BIN" ]; then
       echo -e "\033[31minfra_check binary not built. Run:\033[0m"
-      echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils:infra_check)"
+      echo "  (cd /google/src/cloud/qiaos/run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils:infra_check)"
       return 1
     fi
     "$_INFRA_CHECK_BIN" clear "$@"
@@ -1905,7 +2371,7 @@ EOF
       # and is easy to observe. Sub-actions: start (default) / stop / status / run.
       if [ ! -x "$_ROUTE_CHECK_BIN" ]; then
         echo -e "\033[31mRouter binary not built. Run:\033[0m"
-        echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils:route_check)"
+        echo "  (cd /google/src/cloud/qiaos/run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils:route_check)"
         return 1
       fi
       local wsess="${TPU_BUILD_WORKER_SESSION:-tpu-build-worker}"
@@ -1986,14 +2452,14 @@ EOF
     elif [[ "$sub" == "route-tick" ]]; then
       if [ ! -x "$_ROUTE_CHECK_BIN" ]; then
         echo -e "\033[31mRouter tick binary not built. Run:\033[0m"
-        echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils:route_check)"
+        echo "  (cd /google/src/cloud/qiaos/run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils:route_check)"
         return 1
       fi
       "$_ROUTE_CHECK_BIN" --queue_file="$qfile" "$@"
     else
       if [ ! -x "$_QUEUE_CLI_BIN" ]; then
         echo -e "\033[31mLocal-queue CLI not built. Run:\033[0m"
-        echo "  (cd /google/src/cloud/qiaos/xm_test/google3 && blaze build experimental/users/qiaos/tpu_utils:queue_cli)"
+        echo "  (cd /google/src/cloud/qiaos/run_amply_workspace/google3 && blaze build experimental/users/qiaos/tpu_utils:queue_cli)"
         return 1
       fi
       # queue-status has an alias `qs`; the binary understands both.
