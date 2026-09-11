@@ -44,11 +44,52 @@ _LOCUS_TABLE: dict[str, dict[int, str]] = {
     'v5e': {8: '2_4', 16: '4_4', 32: '4_8', 64: '8_8'},
     # v4lite = puffylite (dragonfish)
     'v4lite': {},  # Explicitly no support; historically rejects slice=8.
+    # ★NVIDIA GPUs. The "locus" of a GPU slice is an NVLink DOMAIN, not a
+    # torus, so the value is a plain device count and never a 2x2x2-style
+    # string. Ceiling is the board: 8 for HGX/Neutron (h100/h200/b200/b300),
+    # 72 for Oberon NVL72 racks (gb200/gb300), 16 for the odd a100-40G.
+    # Per tpu_reference.md §NVIDIA GPUs.
+    'a100': {1: '1', 2: '2', 4: '4', 8: '8', 16: '16'},
+    'a100_80gib': {1: '1', 2: '2', 4: '4', 8: '8'},
+    'h100': {1: '1', 2: '2', 4: '4', 8: '8'},
+    'h200': {1: '1', 2: '2', 4: '4', 8: '8'},
+    'b200': {1: '1', 2: '2', 4: '4', 8: '8'},
+    'b300': {1: '1', 2: '2', 4: '4', 8: '8'},
+    'gb200': {1: '1', 2: '2', 4: '4', 8: '8', 72: '72'},
+    'gb300': {1: '1', 2: '2', 4: '4', 8: '8', 72: '72'},
 }
+
+# ★The GPU families this workstation is allowed to route to. Operator directive
+# (2026-09-03): a GPU job runs on a GPU, never on a power-equivalent TPU, and
+# only these two cards are in play. Everything else stays reachable by naming it
+# explicitly with --archs; it is just not something the router will pick for you.
+GPU_ROUTABLE: tuple[str, ...] = ('b200', 'h100')
+
+# All GPU families we know shapes for -- used to answer "is this arch a GPU?"
+# so the router can keep GPU and TPU in separate candidate sets. Being a GPU is
+# a property of the card, not of whether we would route to it, so this is
+# deliberately wider than GPU_ROUTABLE.
+GPU_FAMILIES: frozenset[str] = frozenset(
+    ('a100', 'a100_80gib', 'h100', 'h200', 'b200', 'b300', 'gb200', 'gb300'))
+
+
+def is_gpu(arch: str) -> bool:
+  """True if ``arch`` names an NVIDIA GPU rather than a TPU."""
+  return arch.lower() in GPU_FAMILIES
 
 # Borg ScalarResource.Key enum name for each arch. Used when calling
 # GoodputService.GetCellAvailability.
 BORG_PLATFORM_KEY: dict[str, str] = {
+    # ★GPU keys are the ScalarResource.Key enum names, verified against
+    # borg/common/scalar_resource.proto (same table avail_provider.py uses).
+    'a100': 'GPU_TESLA_A100_40GIB',
+    'a100_80gib': 'GPU_TESLA_A100_80GIB',
+    'h100': 'GPU_NVIDIA_H100',
+    'h200': 'GPU_NVIDIA_H200',
+    'b200': 'GPU_NVIDIA_B200',
+    'b300': 'GPU_NVIDIA_B300',
+    'gb200': 'GPU_NVIDIA_GB200',
+    'gb300': 'GPU_NVIDIA_GB300',
     'v4': 'PUFFERFISH',
     'v5p': 'VIPERFISH',
     'v6p': 'GHOSTFISH',
@@ -61,6 +102,11 @@ BORG_PLATFORM_KEY: dict[str, str] = {
 # XManager-side codenames used by xm.JobRequirements() (matches money_check.py
 # `map_tpu_types`). Preserved for `resource_service` cross-references.
 XM_ACCELERATOR_KEY: dict[str, str] = {
+    # GPUs: xm.JobRequirements takes the bare card name (see gpu_on_borg.md).
+    'a100': 'a100', 'a100_80gib': 'a100_80gib',
+    'h100': 'h100', 'h200': 'h200',
+    'b200': 'b200', 'b300': 'b300',
+    'gb200': 'gb200', 'gb300': 'gb300',
     'v4': 'tpu_pufferfish',
     'v5p': 'tpu_viperfish',
     'v6p': 'tpu_ghostfish',

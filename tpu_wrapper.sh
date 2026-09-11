@@ -64,18 +64,121 @@ get_group_id_by_alloc() {
 
 # Preflight & router blaze targets (built once, reused). If missing, tpu queue
 # will still work but skip the pre-flight check with a warning.
-_PREFLIGHT_CLI_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/preflight_cli"
-_ROUTER_CLI_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/preflight/router_cli"
-_INFRA_CHECK_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/infra_check"
+#
+# ★ NEVER RESOLVE THESE THROUGH `blaze-bin`. `blaze-bin` is a symlink whose
+# SECOND hop is re-published by every build in the shared workspace, so a GPU
+# line's `--config=cuda` build silently repoints it at `k8-fastbuild-cuda/bin`
+# -- a layer that contains NONE of these tools. Nothing errors: the binaries are
+# still on disk under `k8-fastbuild/bin`, the link just points elsewhere, and
+# every `tpu` subcommand that needs one dies with "Router binary not built".
+#
+# MEASURED 2026-08-29: a cuda build at 16:01 repointed the link; `tpu
+# build-worker` went down fleet-wide, and two codi launches (XID 284695265,
+# 284702633) were left as 0-work-unit zombie shells -- an XID, a cell and a
+# limit order, but `build_started_at: None` because no worker could ever claim
+# them. `tpu check` reported them SUBMITTED for 37 min while XM said
+# NOT_RUNNING. The fix is to resolve the ABSOLUTE output path and treat
+# `blaze-bin` as a hint, never as the answer.
+_TPU_G3="/google/src/cloud/qiaos/run_amply_workspace/google3"
+# ---------------------------------------------------------------------------
+# infra-v15 2026-08-30: resolve binaries by SEARCHING REAL OUTPUT ROOTS, never
+# by trusting `blaze-out`/`blaze-bin`.
+#
+# The previous version listed three "absolute output layers" and claimed they
+# were "real directories: a concurrent build in another config cannot move
+# them". That was false: all three were written as "$_TPU_G3/blaze-out/<cfg>/
+# bin/$rel", and `blaze-out` is ITSELF a symlink blaze rewrites on every build.
+# The three layers were ONE layer wearing three hats, so they missed together.
+#
+# Mechanism (measured 2026-08-30): blaze names an output_base after
+# md5(workspace_directory), and a buildrabbit-style environment ($BUILD_EXECROOT)
+# uses the "<md5>_buildrabbit" sibling. Two build environments against the SAME
+# checkout therefore own two roots, and whoever builds last repoints blaze-out at
+# their own. The tpu binaries live in one root; a build of any OTHER target from
+# the other environment flips the symlink and every `tpu` subcommand answers
+# "not built" while the binaries sit untouched. Measured six times in one shift;
+# it also self-heals when the symlink swings back, which is why it read as a
+# random "drift". A long-lived worker is unaffected either way: it keeps running
+# the inode it started from.
+#
+# So: enumerate the real roots from three independent sources and take the
+# NEWEST candidate that actually exists. Fails CLOSED (rc=1 + conventional path)
+# when nothing exists anywhere, so callers' "not built" message still works.
+_tpu_bin_roots() {
+  # Print candidate ".../blaze-out" roots, most-authoritative first, deduped.
+  local seen="" r h
+  _tpu_emit_root() {
+    case ":$seen:" in *":$1:"*) ;; *) seen="$seen:$1"; echo "$1";; esac
+  }
+  [ -n "$BUILD_EXECROOT" ] && _tpu_emit_root "$BUILD_EXECROOT/blaze-out"
+  h=$(printf '%s' "$_TPU_G3" | md5sum | cut -d' ' -f1)
+  for r in "/usr/local/google/_blaze_qiaos/${h}_buildrabbit" \
+           "/usr/local/google/_blaze_qiaos/${h}"; do
+    _tpu_emit_root "$r/execroot/google3/blaze-out"
+  done
+  r=$(readlink "$_TPU_G3/blaze-out" 2>/dev/null) && [ -n "$r" ] && _tpu_emit_root "$r"
+  unset -f _tpu_emit_root
+}
+
+# ★CANCELLATION MUST NOT DEPEND ON AN INHERITED SHELL FUNCTION.
+# `xmanager` is a shell function that only exists in an INTERACTIVE login shell
+# (it arrives via BASH_FUNC_xmanager in the environment). This wrapper never
+# defined it, so anything started from a bare environment -- cron, setsid, a
+# supervisor, an agent's non-interactive shell -- ran `tpu cancel` and got
+# `xmanager: command not found (127)`. That is exactly how the budget enforcer
+# spent a day unable to stop a single job while every liveness check stayed
+# green: it could DETECT overspend and never ACT on it.
+#   Verify with the environment, not with `ps`:
+#     tr '\0' '\n' < /proc/<pid>/environ | grep -c '^BASH_FUNC_xmanager'
+# Prefer the inherited function when it is there (it carries the operators'
+# own defaults), else fall back to the absolute .par path -- which is what the
+# function ultimately runs anyway. `xmanager.par` is NOT on PATH, so the bare
+# name is not a usable fallback: it exits 127 and, behind a pipe, reads exactly
+# like "nothing to stop".
+_TPU_XMANAGER_PAR="${_TPU_XMANAGER_PAR:-/google/bin/releases/xmanager/cli/xmanager.par}"
+_tpu_xmanager() {
+  if [ "$(type -t xmanager 2>/dev/null)" = "function" ]; then
+    xmanager "$@"
+    return $?
+  fi
+  if [ -x "$_TPU_XMANAGER_PAR" ]; then
+    "$_TPU_XMANAGER_PAR" "$@"
+    return $?
+  fi
+  echo "[tpu] cannot resolve xmanager: no inherited function and no binary at" \
+       "$_TPU_XMANAGER_PAR" >&2
+  return 127
+}
+
+_tpu_resolve_bin() {
+  # $1 = path under .../tpu_utils, e.g. "route_check" or "preflight/router_cli"
+  local rel="experimental/users/qiaos/tpu_utils/$1" root cfg cand best="" bestt=0 t
+  for root in $(_tpu_bin_roots); do
+    for cfg in k8-fastbuild k8-opt k8-fastbuild-cuda; do
+      cand="$root/$cfg/bin/$rel"
+      [ -x "$cand" ] || continue
+      t=$(stat -c %Y "$cand" 2>/dev/null) || continue
+      if [ "$t" -gt "$bestt" ]; then bestt="$t"; best="$cand"; fi
+    done
+  done
+  [ -n "$best" ] && { echo "$best"; return 0; }
+  # Nothing found anywhere: return the conventional path so the caller's own
+  # "not built, run blaze build ..." message still names something sensible.
+  echo "$_TPU_G3/blaze-bin/$rel"
+  return 1
+}
+_PREFLIGHT_CLI_BIN="$(_tpu_resolve_bin preflight/preflight_cli)"
+_ROUTER_CLI_BIN="$(_tpu_resolve_bin preflight/router_cli)"
+_INFRA_CHECK_BIN="$(_tpu_resolve_bin infra_check)"
 # The local-queue smart-router CLI (tpu enqueue / queue-status / dequeue) and
 # the router tick (tpu route-tick). Side-by-side with `tpu queue`; never
 # replaces it. Built by: blaze build experimental/users/qiaos/tpu_utils:{queue_cli,route_check}
-_QUEUE_CLI_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/queue_cli"
-_ROUTE_CHECK_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/route_check"
+_QUEUE_CLI_BIN="$(_tpu_resolve_bin queue_cli)"
+_ROUTE_CHECK_BIN="$(_tpu_resolve_bin route_check)"
 # Smart cell picker: makes `tpu queue` pin the best placeable cell by default.
 # Fail-safe -- if missing/erroring, tpu queue falls back to the allocator.
 # Built by: blaze build experimental/users/qiaos/tpu_utils:pick_cell
-_PICK_CELL_BIN="/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/pick_cell"
+_PICK_CELL_BIN="$(_tpu_resolve_bin pick_cell)"
 _MACH_LOCALITY="/usr/local/bin/mach_locality"
 # Default must track xm_launcher.py's --bucket default; only used to work out
 # which continent the data is in when the caller does not pass --bucket.
@@ -235,8 +338,30 @@ _tpu_restart_check_daemon() {
     echo -e "\033[33m  '$TPU_CMD_NAME' will not restart it — ask sqa to run 'tmux attach -t tpu-daemon'.\033[0m"
     return 1
   fi
+  # ★INVOKE VIA `bash`, NEVER BY EXECUTING THE PATH. tpu_check_daemon.sh is mode
+  # 0640 (no exec bit) and ~/work/tpu_check_daemon.sh is only a symlink to it, so
+  # the old form -- running the path directly -- died with `Permission denied`
+  # every single time. The loop then printed "Daemon crashed, restarting in 5s"
+  # and span forever: MEASURED at 26h of a pane that never once started a daemon.
+  # It looked harmless only by accident, and it read as SUCCESS: the board kept
+  # refreshing because a DIFFERENT, hand-started daemon (ppid=1, outside tmux)
+  # was doing the work, so every autoheal "repair" self-verified against someone
+  # else's output. `kill-session` cannot reach that one either, which is why the
+  # bug survived: the thing being killed and rebuilt was always the empty shell.
+  # ★Do NOT "fix" this by chmod +x on the script instead. Several stale loops of
+  # this exact shape exist; giving the file an exec bit would start ALL of them
+  # at once, and two daemons draining one queue is what produced five concurrent
+  # 8-card jobs (see the header of tpu_check_daemon.sh).
+  # ★Refuse when a daemon is already running: this function is reached from four
+  # auto-recovery sites, and a stale cache is not evidence that nobody is working
+  # -- the healthy daemon lives outside tmux, so `has-session` cannot see it.
+  if pgrep -f 'bash .*tpu_cmd/tpu_check_daemon\.sh' >/dev/null 2>&1; then
+    echo -e "\033[33m  A tpu_check_daemon is already running (outside tmux); not starting a second one.\033[0m" >&2
+    echo -e "\033[33m  Two daemons on one cache is a real failure mode, not a redundancy.\033[0m" >&2
+    return 1
+  fi
   tmux kill-session -t tpu-daemon 2>/dev/null || true
-  tmux new-session -d -s tpu-daemon 'bash -c "while true; do /usr/local/google/home/qiaos/work/tpu_check_daemon.sh; echo Daemon crashed, restarting in 5s...; sleep 5; done"'
+  tmux new-session -d -s tpu-daemon 'bash -c "while true; do bash /usr/local/google/home/qiaos/work/tpu_cmd/tpu_check_daemon.sh; echo Daemon exited, restarting in 15s...; sleep 15; done"'
 }
 
 # Intercepts 'tpu queue' and forwards everything else to the check/quota logic or original tpu system command.
@@ -515,6 +640,22 @@ _tpu_stage_src_guard() {
 tpu() {
   if [ "$1" = "queue" ] || [ "$1" = "q" ]; then
     shift
+    # ---- DEPRECATED (operator, 2026-08-29): soft retirement of one-shot queue.
+    # `enqueue` is strictly more capable: it takes --power TOGETHER WITH an
+    # --archs list and lets the router satisfy the compute target with whichever
+    # family has capacity; `queue` can only take one fixed shape (--power and
+    # --tpu_type are mutually exclusive here) into one cell, and it races any
+    # concurrent build into the zombie-XID failure.
+    # ★SOFT, not removed, and deliberately so: `enqueue` only PARKS a job -- a
+    # serial `build-worker` drains it -- so when that worker is down (its binary
+    # vanished twice today when the blaze output root drifted) this is the only
+    # synchronous path left. Removing it also breaks `enqueue` itself, whose
+    # --launch args are documented as passed VERBATIM to `tpu queue` at submit.
+    # Warning goes to STDERR so no script parsing stdout changes behaviour.
+    echo -e "\033[33m[$TPU_CMD_NAME queue] DEPRECATED -- use '$TPU_CMD_NAME enqueue' + a serial '$TPU_CMD_NAME build-worker'.\033[0m" >&2
+    echo -e "\033[33m  enqueue takes --power AND --archs=<list> together and routes to whichever family has capacity; queue cannot.\033[0m" >&2
+    echo -e "\033[33m  Read: ~/work/wiki_agents/jobs.md  \u00a7'The Local Queue: tpu enqueue + Serial Build-Worker'\033[0m" >&2
+    echo -e "\033[33m  Keep using queue ONLY when no build-worker is running and you need a synchronous XID.\033[0m" >&2
     # Opportunistic daemon self-heal (throttled to ~3min; restarts only a truly
     # dead/hung daemon, never a slow-but-alive one -- see _tpu_daemon_autoheal).
     _tpu_daemon_autoheal
@@ -671,7 +812,7 @@ tpu() {
         # min 1024 / max 40000 milligcu, and a best-effort job then finds no
         # machine and sits in DISABLED reporting what looks like a cell capacity
         # problem. Absent => XManager's own behaviour, unchanged.
-        --load_from=*|--wandb_resume_id=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--borg_max_task_evictions=*|--tmp_ram_fs_gib=*|--ram_gib=*|--replicas=*|--autopilot=*)
+        --load_from=*|--wandb_resume_id=*|--restart_from=*|--restart_step=*|--borg_max_task_failures=*|--borg_max_per_task_failures=*|--borg_max_task_evictions=*|--tmp_ram_fs_gib=*|--ram_gib=*|--replicas=*|--autopilot=*)
           passthrough_args+=("$1")
           shift
           ;;
@@ -679,7 +820,7 @@ tpu() {
           passthrough_args+=("$1")
           shift
           ;;
-        --load_from|--wandb_resume_id|--borg_max_task_failures|--borg_max_per_task_failures|--borg_max_task_evictions|--tmp_ram_fs_gib|--ram_gib|--replicas)
+        --load_from|--wandb_resume_id|--restart_from|--restart_step|--borg_max_task_failures|--borg_max_per_task_failures|--borg_max_task_evictions|--tmp_ram_fs_gib|--ram_gib|--replicas)
           passthrough_args+=("$1=$2")
           shift 2
           ;;
@@ -923,21 +1064,11 @@ print(d['group'], d['tpu_type'], d['status'],
     # ${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages must exist.
     # NOTE: any workspace can be drained -- keep launches SERIAL regardless.
     #
-    # v6 2026-08-28: moved elt_jax -> run_amply_workspace (qiaos/402). Measured:
-    # elt_jax (qiaos/3202) held 92,091 drop records, every other one of the 18
-    # workspaces sat at the empty 49-byte header. The control is real rather
-    # than a traffic artefact -- lyy_arc staged 69 dirs today with 0 drops
-    # against elt_jax's 40 with 92,091 -- and lyy's lane escaped the whole
-    # incident precisely because it always exported STAGE_WS_ROOT explicitly.
-    # Caveat kept deliberately visible: 75.6% of those drops belong to 8
-    # stagedirs that were being fed a RECURSIVE COPY OF THE DEPOT (their dropped
-    # paths are depot top-level dirs like abuse/, third_party/ inside the
-    # stagedir), i.e. mostly the bug the guard above now blocks, not proof the
-    # tree is diseased. The remaining 22,208 drops across 43 ordinary stagedirs
-    # are the part that is genuinely workspace-level, and they are still ~22k
-    # more than anywhere else -- which is why this moves. Revert by exporting
-    # STAGE_WS_ROOT, or by re-checking the two files with the recipe above.
-    local STAGE_WS_ROOT="${STAGE_WS_ROOT:-/google/src/cloud/qiaos/run_amply_workspace/google3}"
+    # run_amply_workspace (qiaos/402) currently rolls back source writes with
+    # CreateSnapshot error 104. clip_probe persists overwrites and has passed
+    # both the router test build and a real maze128 package build. Keep explicit
+    # STAGE_WS_ROOT overrides, including the NPU operator's workspace, intact.
+    local STAGE_WS_ROOT="${STAGE_WS_ROOT:-/google/src/cloud/qiaos/clip_probe/google3}"
 
     # STAGE-SOURCE GUARD, CALL 1 OF 2 -- the EARLIEST point at which both ends
     # of the copy are known, and deliberately BEFORE the claim loop below: fail
@@ -1031,7 +1162,7 @@ print(d['group'], d['tpu_type'], d['status'],
     # timeout we log and proceed (degrade to today's unlocked behaviour rather
     # than refuse to launch).
     local _stage_lock="/tmp/tpu_stage.$(id -u).lock"
-    exec 200>"$_stage_lock" 2>/dev/null
+    { exec 200>"$_stage_lock"; } 2>/dev/null
     if flock -w 900 200 2>/dev/null; then
       _stage_locked=1
       echo -e "\033[2m[$TPU_CMD_NAME queue] stage lock acquired ($_stage_lock); serial stage-write (per-user, all workspaces).\033[0m"
@@ -1056,7 +1187,7 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
         echo -e "\033[31m  Looked in $TPU_JOBS_FILE and $TPU_JOBS_LEGACY_FILE.\033[0m"
         echo -e "\033[31m  Refusing to package the current checkout: a resume must re-run the\033[0m"
         echo -e "\033[31m  original snapshot. Pass --stagedir=<path> if you know it.\033[0m"
-        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; { exec 200>&-; } 2>/dev/null; }
         return 1
       fi
       stagedir="$prior_stagedir"
@@ -1106,7 +1237,7 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
         echo -e "\033[31m[resume] Recorded stagedir is gone: $abs_stagedir\033[0m"
         echo -e "\033[31m  Cannot resume XID $resume_xid without the code it ran.\033[0m"
         echo -e "\033[2m  (also searched the other CitC workspaces for ${stagedir})\033[0m"
-        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; { exec 200>&-; } 2>/dev/null; }
         return 1
       fi
       echo -e "\033[32m[resume] Re-using the ORIGINAL snapshot (not the working tree):\033[0m"
@@ -1173,7 +1304,7 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       # srcfsd restart does exactly that, which is how this bug re-arms.
       # Quiet on success so a 3-try loop does not print the ok line three times.
       if ! _tpu_stage_src_guard "." "$abs_stagedir" "pre-rsync try $_stage_try/$_stage_max" 1; then
-        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; { exec 200>&-; } 2>/dev/null; }
         cd "$orig_dir" 2>/dev/null
         return 1
       fi
@@ -1222,7 +1353,7 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
         echo -e "\033[31m                ${_stage_rm_parent:-<unresolvable>}/\033[0m" >&2
         echo -e "\033[33m  This is an internal invariant, not a user error: abs_stagedir was computed wrong.\033[0m" >&2
         echo "[[STAGE_RM_REFUSED]] target=${_stage_rm_target:-$abs_stagedir} parent=${_stage_rm_parent:-?} -- abs_stagedir computed wrong" >&2
-        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; { exec 200>&-; } 2>/dev/null; }
         cd "$orig_dir" 2>/dev/null
         return 1
       fi
@@ -1256,13 +1387,22 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
         echo -e "\033[33m    TPU_STAGE_RETRY_ON_TIMEOUT=1        (restore the old retry-on-timeout)\033[0m" >&2
         echo -e "\033[33m  If srcfsd is thrashing instead, wait for it to settle, or export STAGE_WS_ROOT=<healthy workspace google3 root>.\033[0m" >&2
         echo "[[STAGE_RSYNC_TIMEOUT]] rc=$_rsync_rc after ${_RSYNC_TIMEOUT}s src=$PWD dst=$abs_stagedir -- not retried on purpose" >&2
-        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; { exec 200>&-; } 2>/dev/null; }
         cd "$orig_dir" 2>/dev/null
         return 1
       fi
-      if [ ! -f "$abs_stagedir/config.sh" ] && [ -f "$HOME/work/tpu_cmd/config.sh" ]; then
-        cp "$HOME/work/tpu_cmd/config.sh" "$abs_stagedir/"
-      fi
+      # ★NO config.sh BACKFILL. This used to `cp $HOME/work/tpu_cmd/config.sh` in when the
+      # staged copy was missing, and that one line cross-wired two lines' jobs on 2026-08-28:
+      # a dropped write removed config.sh from the stagedir, the backfill supplied a GLOBAL
+      # file belonging to whoever staged last (elt), the sed below rewrote its TARGET_LABEL to
+      # this stagedir so the completeness check PASSED, and jobs from parcae-torch and
+      # codi-torch were built from elt's target. XM reported RUNNING; every structural check
+      # was green; the only symptom was output that never appeared.
+      #
+      # The backfill turned a MISSING file (diagnosable, and retried three lines below) into a
+      # WRONG one (silent, and indistinguishable from correct). A stagedir without the
+      # project's own config.sh is simply not staged yet: fall through to the verify + retry
+      # loop, which is what it is for.
       if [ ! -f "$abs_stagedir/xm_launcher.py" ] && [ -f "$HOME/work/tpu_cmd/xm_launcher.py" ]; then
         cp "$HOME/work/tpu_cmd/xm_launcher.py" "$abs_stagedir/"
       fi
@@ -1273,20 +1413,44 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       sync 2>/dev/null
       # VERIFY the exact artifacts the build reads. A drop-write fails one of
       # these even though the commands above returned 0.
+      # ★Which source file the entry point is called is PER-PACKAGE: the BUILD
+      # target is always named `main`, but its `srcs` need not be `main.py`
+      # (elt_dit_pkg's is `main_eqr.py`). Hard-coding `main.py` here silently
+      # condemned every such package: the gate failed, the build never started,
+      # and the queue recorded `found[]`/no-XID -- which reads as a scheduler or
+      # concurrency fault, not a filename mismatch. Six PROD build attempts were
+      # spent on that misreading (elt-reproduction-v3, 2026-08-30, who found it).
+      # So: ask the BUILD file what the entry source actually is, and verify THAT.
+      # Falling back to `main.py` only when the parse yields nothing keeps the
+      # check strict -- the point is still to catch a half-written stagedir, so a
+      # blanket `*.py` match is deliberately NOT used.
+      _entry_src=$(sed -n '/name = "main"/,/)/p' "$abs_stagedir/BUILD" 2>/dev/null \
+                   | grep -oE 'srcs = \["[^"]+"' | grep -oE '"[^"]+"' | tr -d '"' | head -1)
+      [ -n "$_entry_src" ] || _entry_src=main.py
       if [ -f "$abs_stagedir/BUILD" ] \
-         && [ -f "$abs_stagedir/main.py" ] \
+         && [ -f "$abs_stagedir/$_entry_src" ] \
          && [ -f "$abs_stagedir/config.sh" ] \
          && grep -q "export TARGET_LABEL=\"//${stagedir}:main\"" "$abs_stagedir/config.sh" 2>/dev/null; then
         _stage_ok=1
         [ "$_stage_try" -gt 1 ] && echo -e "\033[33m[$TPU_CMD_NAME queue] stagedir verified after $_stage_try tries (srcfsd drop-write retried).\033[0m"
         break
       fi
-      echo -e "\033[33m[$TPU_CMD_NAME queue] stagedir INCOMPLETE after stage try $_stage_try/$_stage_max (srcfsd drop-write?): missing BUILD/config.sh or TARGET_LABEL not rewritten. Retrying...\033[0m"
+      # ★Name the artifact that is actually missing. The old text listed only
+      # "BUILD/config.sh or TARGET_LABEL", so the one condition that failed in
+      # practice -- the entry source -- was not even mentioned in its own error.
+      _missing=""
+      [ -f "$abs_stagedir/BUILD" ] || _missing="$_missing BUILD"
+      [ -f "$abs_stagedir/$_entry_src" ] || _missing="$_missing $_entry_src(entry src from BUILD)"
+      [ -f "$abs_stagedir/config.sh" ] || _missing="$_missing config.sh"
+      grep -q "export TARGET_LABEL=\"//${stagedir}:main\"" "$abs_stagedir/config.sh" 2>/dev/null \
+        || _missing="$_missing TARGET_LABEL-not-rewritten"
+      echo -e "\033[33m[$TPU_CMD_NAME queue] stagedir INCOMPLETE after stage try $_stage_try/$_stage_max (srcfsd drop-write?): missing:${_missing:- (unknown)}. Retrying...\033[0m"
+      echo "[[STAGE_INCOMPLETE]] try=$_stage_try/$_stage_max missing:${_missing:- unknown} dir=$abs_stagedir" >&2
       sleep 3
     done
     if [ "$_stage_ok" != "1" ]; then
       echo -e "\033[31m[$TPU_CMD_NAME queue] REFUSING to build: stagedir $abs_stagedir still incomplete after $_stage_max stage tries (srcfsd is dropping writes). Failing fast so a corrupt stagedir does not burn a build attempt or hold the build lane. Retry when srcfsd is healthy (or export STAGE_WS_ROOT=<healthy workspace google3 root>).\033[0m"
-      [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; exec 200>&- 2>/dev/null; }
+      [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; { exec 200>&-; } 2>/dev/null; }
       cd "$orig_dir" 2>/dev/null
       return 1
     fi
@@ -1302,7 +1466,7 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
     # checkout). Everything past here (build, launch, registration) is unlocked.
     if [ "${_stage_locked:-0}" = "1" ]; then
       flock -u 200 2>/dev/null
-      exec 200>&- 2>/dev/null
+      { exec 200>&-; } 2>/dev/null
       echo -e "\033[2m[$TPU_CMD_NAME queue] stage lock released (staging done; build/launch proceeds unlocked).\033[0m"
     fi
 
@@ -1331,7 +1495,7 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
     if [ "${TPU_SERIAL_BUILD:-1}" = "1" ]; then
       local _build_lock="/tmp/tpu_build.host.lock"
       local _build_wait="${TPU_SERIAL_BUILD_WAIT:-1800}"
-      exec 201>"$_build_lock" 2>/dev/null
+      { exec 201>"$_build_lock"; } 2>/dev/null
       echo -e "\033[2m[$TPU_CMD_NAME queue] waiting for host build lock ($_build_lock; serial build is default, TPU_SERIAL_BUILD=0 to opt out)...\033[0m"
       if flock -w "$_build_wait" 201 2>/dev/null; then
         _build_locked=1
@@ -1353,13 +1517,15 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       if [ -z "$alloc" ]; then
         echo "Error: Unknown group number: $g"
         # Release the host build lock on this early-return, else it wedges the fleet.
-        if [ "${_build_locked:-0}" = "1" ]; then flock -u 201 2>/dev/null; exec 201>&- 2>/dev/null; fi
+        if [ "${_build_locked:-0}" = "1" ]; then flock -u 201 2>/dev/null; { exec 201>&-; } 2>/dev/null; fi
         cd "$orig_dir"
         return 1
       fi
       
+      # Dispatch workers may have PATH=/usr/bin:/bin and no exported shell
+      # functions. Use the same absolute-PAR fallback as cancellation.
       local xm_args=(
-        "xmanager" "launch" "$HOME/work/tpu_cmd/xm_launcher.py" "--"
+        "_tpu_xmanager" "launch" "$HOME/work/tpu_cmd/xm_launcher.py" "--"
         "--tpu_type=${tpu_type}"
         "--xm_resource_alloc=${alloc}"
       )
@@ -1516,6 +1682,9 @@ PYEOF
           echo -e "\033[31m[launch] Still no experiment after a retry. Nothing was submitted.\033[0m"
           echo -e "\033[2m  If the BinFS signature appeared, the cache is likely over its limit:\033[0m"
           echo -e "\033[2m    grep 'bigger than desired size' /usr/local/google/tmp/binfsd.INFO | tail -1\033[0m"
+          echo "[launch] Full launcher output: $log_file"
+          echo "[launch] Last launcher lines:"
+          tail -n 8 "$log_file"
         fi
       fi
       if [ -n "$xid" ]; then
@@ -1593,7 +1762,7 @@ EOF
     # are done -- the next queued build (bare/guarded/worker) can proceed.
     if [ "${_build_locked:-0}" = "1" ]; then
       flock -u 201 2>/dev/null
-      exec 201>&- 2>/dev/null
+      { exec 201>&-; } 2>/dev/null
       echo -e "\033[2m[$TPU_CMD_NAME queue] host build lock released.\033[0m"
     fi
     cd "$orig_dir"
@@ -2001,9 +2170,27 @@ def main():
     # STALENESS: the board is a cache the background daemon refreshes. If the
     # daemon is dead, hung, or its round is timing out, the cache silently ages
     # and the board shows a stale world as if it were live. Surface it loudly
-    # rather than let a stopped daemon read as an idle queue. 300s matches the
-    # money/quota alarm; the daemon's fast lane refreshes every ~40s.
-    STALE_S = 300
+    # rather than let a stopped daemon read as an idle queue.
+    #
+    # ★★TEMPORARY VALUE -- MUST GO BACK TO 300 ONCE ~/.tpu_jobs.json IS CLEANED.
+    # This board is written by the daemon's SLOW lane (run_infra_check), not the
+    # The writer of this cache is the daemon's SLOW lane (run_infra_check), not
+    # the fast lane -- an old comment named the wrong lane, and that is how a
+    # threshold got set against the wrong period. infra_check issues ONE SERIAL
+    # XManager RPC PER TRACKED JOB, so the period scales with the size of
+    # ~/.tpu_jobs.json: at 340 entries, 59 consecutive intervals measured p50
+    # 441s / max 5092s and 98% over 300s, i.e. the alarm was always on, and an
+    # alarm that is always on cannot report a daemon that has actually died.
+    # After that file was pruned to ~31 entries, three adjacent intervals
+    # measured 130s / 157s / 157s, so 300 leaves ~1.9x headroom and is restored.
+    # ★Re-measure before changing this: the period follows the entry count, so
+    # if ~/.tpu_jobs.json grows back into the hundreds this threshold is wrong
+    # again. Read the gaps between 'Successfully updated infra cache' lines in
+    # ~/work/.monitor_watch/tpu_check_daemon_v16.log, and only count lines from
+    # AFTER the current pass started -- older ones describe a different regime.
+    # Overridable so the live file can be positive-controlled without editing
+    # it; the default is the contract.
+    STALE_S = int(os.environ.get("TPU_CHECK_STALE_S", "300"))
     import time as _time
     if not os.path.exists(cache_file):
         sys.stderr.write(_c(
@@ -2013,11 +2200,18 @@ def main():
     else:
         age = _time.time() - os.path.getmtime(cache_file)
         if age > STALE_S:
+            # ★State what happened, not why. The previous wording asserted "the
+            # daemon is dead, hung, or its round is timing out" -- three guesses
+            # hardcoded into a log line, and on 2026-09-01 all three were wrong
+            # (the daemon was healthy; its slow lane simply takes longer than
+            # the threshold). It also pointed at `tmux -t tpu-daemon`, which is
+            # a DIFFERENT daemon from the one that writes this cache.
             sys.stderr.write(_c(
                 "\n\U0001f6a8 [tpu check] board is STALE: cache last refreshed "
-                "%dm%ds ago (over the %ds limit). The daemon is dead, hung, or "
-                "its round is timing out -- statuses below may be wrong. Check "
-                "it: tmux capture-pane -t tpu-daemon -p | tail\n"
+                "%dm%ds ago (over the %ds limit); statuses below may be wrong. "
+                "Cause NOT diagnosed by this line -- the writer is the daemon's "
+                "slow lane (run_infra_check). Check it: grep 'infra' "
+                "~/work/.monitor_watch/tpu_check_daemon_v16.log | tail\n"
                 % (age // 60, age % 60, STALE_S), "\033[31m"))
 
 if __name__ == "__main__":
@@ -2081,7 +2275,14 @@ for e in sorted(rows, key=lambda e: (_order.get(e.get('state'), 9), -e.get('prio
     if st == 'SUBMITTED':
         why = f"xid={e.get('xid')} {e.get('cell') or '?'} {e.get('arch') or ''}-{e.get('chips') or ''}".strip()
     lock = ' \033[35m[lock]\033[0m' if e.get('topology_locked') else ''
-    print(f"  {name:30s} {disp} {str(e.get('power','')):9s} {archs:10s} {why}{lock}")
+    # reroute count: shown for every row so a churning job is visible at a glance
+    # (the give-up->HELD bound was removed 2026-09-11; a high count is now the
+    # signal for a human to step in). Yellow from 3, red from 6.
+    rr = int(e.get('reroutes', 0) or 0)
+    rr_txt = f"rr:{rr}"
+    rr_col = '\033[31m' if rr >= 6 else ('\033[33m' if rr >= 3 else '\033[2m')
+    rr_disp = f"{rr_col}{rr_txt}\033[0m" + ' ' * max(0, 6 - len(rr_txt))
+    print(f"  {name:30s} {disp} {str(e.get('power','')):9s} {archs:10s} {rr_disp} {why}{lock}")
 print("\033[2m  Full live view: tpu queue-status\033[0m")
 LQEOF
     fi
@@ -2180,7 +2381,7 @@ EOF
       echo -e "\033[36m[$TPU_CMD_NAME cancel] Stopping XID(s) ${ids} via 'xmanager stop'...\033[0m"
     fi
     local cancel_log="/tmp/tpu_cancel_$$.log"
-    xmanager stop "${stop_args[@]}" > "$cancel_log" 2>&1
+    _tpu_xmanager stop "${stop_args[@]}" > "$cancel_log" 2>&1
     local stop_status=$?
     # The CLI prints ~20 lines of build/absl preamble before the result table.
     grep -vE "^(INFO:absl|WARNING: Logging|W[0-9]{4} |Built |Build |Currently running)" "$cancel_log"

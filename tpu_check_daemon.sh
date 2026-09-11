@@ -10,6 +10,61 @@
 #   TPU_CHECK_CACHE_FILE=~/lyy-work/.npu_check_cache.txt \
 #   TPU_CHECK_TIME_FILE=~/lyy-work/.npu_check_time.txt \
 #     bash tpu_check_daemon.sh
+# ============================================================================
+# ★TPU LANE DISABLED -- scheduler rewrite in progress (infra-v12, 2026-08-28)
+# ============================================================================
+# The TPU scheduler was replaced today (one job, one chain; version-CAS writes;
+# the queue now lives in ~/.tpu_jobs_v2.json). This daemon still reads the OLD
+# queue ~/.tpu_local_queue.json, so if it runs alongside the new dispatcher the
+# two of them drain two different files -- which is how one config produced
+# five concurrent 8-card jobs earlier today.
+#
+# It was stopped three times and restarted three times (22:22Z it got as far as
+# dispatching a real job). Chasing the restarter through the process tree does
+# not work: every candidate is a `bash -c` under the shared tmux server, and a
+# setsid'd child loses the link. So the fix is the same one applied to the
+# poisoned bucket: REFUSE, rather than guess who will make the mistake.
+#
+# ★NPU lane is unaffected and must stay that way -- lyy's board depends on it.
+# The discriminator is TPU_LOCAL_QUEUE_FILE, which the NPU launcher always sets
+# and the TPU side never does. NOT the script path: ~/work/tpu_check_daemon.sh
+# is a symlink to this same file, so both lanes run identical bytes.
+#
+# TO RE-ENABLE: delete this block (infra-v12 will, at the end of the rewrite),
+# or export TPU_DAEMON_FORCE=1 for a one-off deliberate run.
+case "${TPU_LOCAL_QUEUE_FILE:-}" in
+  *npu_local_queue*) : ;;                      # NPU lane: carry on
+  *)
+    # ★READ-ONLY LANES STAY ON; ONLY THE WRITERS ARE GATED (infra-v16, 2026-08-30).
+    #
+    # infra-v12 blocked this daemon with a bare `exit 0` while the scheduler was
+    # rewritten. That was too wide: the thing it needed to stop was the DISPATCH
+    # pass (a second drainer on the old queue), but `exit 0` also killed the
+    # infra/quota/money passes, which only READ and then refresh caches.
+    #
+    # Cost of the over-block, measured 2026-08-30: `~/.tpu_check_cache.txt` froze
+    # for 41h, so `tpu check` rendered 66 "active" jobs that were mostly dead
+    # (284831213 showed SUBMITTED for 12h27m while XM had it NOT_RUNNING), and
+    # budget_enforcer -- which prices the fleet from that same cache -- built kill
+    # lists out of corpses and "reclaimed" credits that were never being spent.
+    # A stale cache is not a display bug; anything that budgets off it is wrong.
+    #
+    # So: run the read-only passes, and pin the two writer passes OFF. The
+    # standalone `route_check --dispatch_worker` (tpu-build-worker) remains the
+    # SOLE drainer, which is exactly what TPU_ROUTE_INLANE_PLACE=0 already means.
+    # An explicit env value still wins, so a deliberate override is unchanged.
+    if [ "${TPU_DAEMON_FORCE:-0}" != "1" ]; then
+      : "${TPU_ROUTE_INLANE_PLACE:=0}"
+      : "${TPU_ROUTE_INLANE_REROUTE:=0}"
+      export TPU_ROUTE_INLANE_PLACE TPU_ROUTE_INLANE_REROUTE
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [tpu_check_daemon] TPU lane: read-only passes" \
+           "ON (infra/quota/money refresh the caches that \`tpu check\` and" \
+           "budget_enforcer read); dispatch+reroute passes PINNED OFF --" \
+           "tpu-build-worker is the sole drainer of the local queue." >&2
+    fi
+    ;;
+esac
+
 : "${TPU_JOBS_FILE:=$HOME/.tpu_jobs.json}"
 : "${TPU_CHECK_CACHE_FILE:=$HOME/.tpu_check_cache.txt}"
 : "${TPU_CHECK_TIME_FILE:=$HOME/.tpu_check_time.txt}"
@@ -18,20 +73,41 @@ CACHE_FILE="$TPU_CHECK_CACHE_FILE"
 TMP_FILE="$TPU_CHECK_CACHE_FILE.tmp"
 TIME_FILE="$TPU_CHECK_TIME_FILE"
 
-# SMART-ROUTER LANE (4th lane), OFF BY DEFAULT. When TPU_ROUTE_ENABLED=1 the
-# daemon drains the local queue (~/.tpu_local_queue.json) into the XM queue on
-# each round and re-routes jobs stuck PENDING past the deadline. Left unset it
-# is a complete no-op -- the daemon behaves exactly as before. TPU_ROUTE_DRYRUN=1
-# (default) makes the lane plan-and-log only; set TPU_ROUTE_DRYRUN=0 to actually
-# submit and cancel. The queue file is operator-scoped like the registry.
-: "${TPU_ROUTE_ENABLED:=0}"
-: "${TPU_ROUTE_DRYRUN:=1}"
+# SMART-ROUTER LANE (4th lane), ON BY DEFAULT (operator decision 2026-08-24).
+# The daemon drains the local queue (~/.tpu_local_queue.json) into the XM queue
+# on each round (place pass) and re-routes jobs stuck PENDING past the deadline
+# (reroute pass): a SUBMITTED job still PENDING > TPU_ROUTE_REROUTE_AFTER_S is
+# cancelled and returned to QUEUED, with its stuck cell cooled so the next plan
+# avoids it. Set TPU_ROUTE_ENABLED=0 to disable the whole lane. TPU_ROUTE_DRYRUN
+# now defaults to 0 (live: actually submit and cancel); set TPU_ROUTE_DRYRUN=1
+# to fall back to plan-and-log only. The queue file is operator-scoped.
+: "${TPU_ROUTE_ENABLED:=1}"
+: "${TPU_ROUTE_DRYRUN:=0}"
 : "${TPU_LOCAL_QUEUE_FILE:=$HOME/.tpu_local_queue.json}"
 : "${TPU_ROUTE_GROUP:=9}"
+# Placement group PREFERENCE ORDER (operator 2026-08-24: lean on the free vqfree
+# pool before the paid g9 floor). The place pass tries these groups in order and
+# only lets what an earlier group cannot place fall through to the next. Default
+# "5,9": vqfree first, g9 floor as fallback. Set to a single group (e.g. "9") to
+# restore the old single-group behaviour.
+: "${TPU_ROUTE_GROUP_ORDER:=5,9}"
 : "${TPU_ROUTE_REROUTE_AFTER_S:=600}"
+# in-lane reroute pass (Step2 Phase B): default 1 = daemon runs its own reroute
+# pass in the route lane (historical behavior). Set to 0 to SKIP it -- used when a
+# standalone `route_check --reroute_loop` process (tmux tpu-reroute) owns reroute
+# + XM-truth reconcile, so the daemon must not double-run it. Env-scoped: only the
+# tpu-daemon session sets =0; npu (no standalone reroute) keeps the default 1.
+: "${TPU_ROUTE_INLANE_REROUTE:=1}"
+# in-lane place pass (Step3): default 1 = daemon drains QUEUED->submit in the route
+# lane (historical behavior). Set to 0 to SKIP it -- used when the standalone
+# `route_check --dispatch_worker` (tpu-build-worker) is the SOLE drainer
+# (router-dispatch + serial build in one loop), so the daemon must not also place
+# (kills R1's two-drain-path incoherence). Env-scoped: only tpu-daemon sets =0;
+# npu keeps default 1 (its build-worker is the classic --worker, daemon still places).
+: "${TPU_ROUTE_INLANE_PLACE:=1}"
 export TPU_LOCAL_QUEUE_FILE
 
-cd /google/src/cloud/qiaos/xm_test/google3 || {
+cd /google/src/cloud/qiaos/run_amply_workspace/google3 || {
     echo "Directory not found!"
     sleep 60
     exit 1
@@ -58,7 +134,7 @@ echo "tpu_check daemon started. Refreshing every ~20s after each round..."
 # perfectly built, for 17 hours of "checker not built" and stale prices.
 #
 # So: resolve ONE hop at startup, and follow the objfs hop at every use.
-G3="/google/src/cloud/qiaos/xm_test/google3"
+G3="/google/src/cloud/qiaos/run_amply_workspace/google3"
 CHECKER_SUBDIR="experimental/users/qiaos/tpu_utils"
 CHECKER_NAMES="money_check quota_check infra_check"
 BLAZE_BIN="$(readlink ./blaze-bin 2>/dev/null || echo "$G3/blaze-bin")"
@@ -70,6 +146,19 @@ BUILD_HINT_ROUTE="(cd $G3 && blaze build $CHECKER_SUBDIR:route_check)"
 # back to the live symlink so a config change cannot strand the daemon.
 checkerbin() {
   local name="$1" c
+  # DURABLE OVERRIDE (money_check only): the xm_test blaze-bin read-path is on a
+  # read-only objfs FUSE mount that holds an OLD (08-24) binary which HANGS, and
+  # its srcfsd is wedged on negative lookups. Worse, this daemon cd's INTO the
+  # wedged xm_test dir, and a par resolves runfiles relative to CWD -- so any
+  # money_check launched from here D-state-hangs scanning the wedged CWD.
+  #
+  # money_check_wrapper.sh fixes both: it cd's to the HEALTHY run_amply workspace
+  # and execs a money_check built there (live blaze-bin -> persistent local
+  # execroot par -> self-heal rebuild), every probe timeout-guarded. Scope is
+  # money_check ONLY; quota_check/infra_check keep their xm_test paths below.
+  if [ "$name" = money_check ] && [ -x "$HOME/.tpu_bin/money_check_wrapper.sh" ]; then
+    echo "$HOME/.tpu_bin/money_check_wrapper.sh"; return 0
+  fi
   for c in "$CHECKER_DIR/$name" "$G3/blaze-bin/$CHECKER_SUBDIR/$name"; do
     if [ -x "$c" ]; then echo "$c"; return 0; fi
   done
@@ -134,12 +223,40 @@ run_infra_check() {
     echo "$(date):         Build it:  $BUILD_HINT"
     return 1
   }
-  "$bin" 2>/dev/null | grep -Ev "274311238|274310306|274303586|274276782|274276523|274275526|274274881|274274856|274269375|274256617|274256088|274255958|274456072|274454581" > "$TMP_FILE"
-  if [ -s "$TMP_FILE" ]; then
-    mv "$TMP_FILE" "$CACHE_FILE"
-    date +%s > "$TIME_FILE"
-    echo "$(date): Successfully updated infra cache"
+  # ★PRIVATE SCRATCH + LOCKED PUBLISH. Two daemons on the same cache used to
+  # share ONE `$CACHE.tmp` with no lock: the 165s `infra_check` of one could be
+  # truncated by the other starting its own redirect, and whoever `mv`d last
+  # won. A half-written cache is not merely a display bug -- budget_enforcer
+  # prices the fleet from this file and would cancel against a partial fleet.
+  # The pid suffix makes the scratch file unshareable; the lock covers only the
+  # rename, so a slow checker never blocks the other daemon's publish.
+  # ★$BASHPID, NOT $$: this function runs backgrounded (`run_infra_check &`),
+  # and `$$` stays the PARENT shell's pid inside a subshell -- two concurrent
+  # rounds would pick the SAME scratch name and overwrite each other, which is
+  # the exact bug the suffix is meant to prevent. Verified: with `$$` the two
+  # writers produced one file holding 5 lines of A followed by 15 of B.
+  local tmp="${TMP_FILE}.${BASHPID:-$$}"
+  "$bin" 2>/dev/null | grep -Ev "274311238|274310306|274303586|274276782|274276523|274275526|274274881|274274856|274269375|274256617|274256088|274255958|274456072|274454581" > "$tmp"
+  if [ -s "$tmp" ]; then
+    # Capture the subshell's status IMMEDIATELY: any statement in between --
+    # including an echo -- resets `$?`.
+    (
+      flock -w 30 9 || exit 1
+      mv "$tmp" "$CACHE_FILE"
+      date +%s > "$TIME_FILE"
+    ) 9>"${CACHE_FILE}.lock"
+    local rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "$(date): Successfully updated infra cache"
+    else
+      # The previous cache is still intact and its age keeps ticking, which is
+      # the honest signal; publishing a partial file would not be.
+      echo "$(date): Error - infra cache publish failed (rc=$rc, lock busy >30s?);" \
+           "previous cache kept. Retrying next round..."
+      rm -f "$tmp"
+    fi
   else
+    rm -f "$tmp"
     echo "$(date): Error - infra output is empty. Retrying next round..."
   fi
 }
@@ -158,13 +275,21 @@ run_route_lane() {
     return 1
   }
   if [ "$TPU_ROUTE_DRYRUN" = "0" ]; then dry_flag="--nodry_run"; else dry_flag="--dry_run"; fi
-  echo "$(date): route lane - place pass ($dry_flag, queue=$TPU_LOCAL_QUEUE_FILE)"
-  "$bin" --queue_file="$TPU_LOCAL_QUEUE_FILE" --group="$TPU_ROUTE_GROUP" "$dry_flag" 2>&1 \
-    | sed 's/^/  [route:place] /'
-  echo "$(date): route lane - reroute pass ($dry_flag, after ${TPU_ROUTE_REROUTE_AFTER_S}s)"
-  "$bin" --queue_file="$TPU_LOCAL_QUEUE_FILE" --reroute \
-    --reroute_after_s="$TPU_ROUTE_REROUTE_AFTER_S" "$dry_flag" 2>&1 \
-    | sed 's/^/  [route:reroute] /'
+  if [ "$TPU_ROUTE_INLANE_PLACE" = "1" ]; then
+    echo "$(date): route lane - place pass ($dry_flag, queue=$TPU_LOCAL_QUEUE_FILE, group_order=$TPU_ROUTE_GROUP_ORDER)"
+    "$bin" --queue_file="$TPU_LOCAL_QUEUE_FILE" --group="$TPU_ROUTE_GROUP" --group_order="$TPU_ROUTE_GROUP_ORDER" "$dry_flag" 2>&1 \
+      | sed 's/^/  [route:place] /'
+  else
+    echo "$(date): route lane - place pass SKIPPED (TPU_ROUTE_INLANE_PLACE=0; standalone tpu-dispatch-worker owns dispatch+build)"
+  fi
+  if [ "$TPU_ROUTE_INLANE_REROUTE" = "1" ]; then
+    echo "$(date): route lane - reroute pass ($dry_flag, after ${TPU_ROUTE_REROUTE_AFTER_S}s)"
+    "$bin" --queue_file="$TPU_LOCAL_QUEUE_FILE" --reroute \
+      --reroute_after_s="$TPU_ROUTE_REROUTE_AFTER_S" "$dry_flag" 2>&1 \
+      | sed 's/^/  [route:reroute] /'
+  else
+    echo "$(date): route lane - reroute pass SKIPPED (TPU_ROUTE_INLANE_REROUTE=0; standalone tpu-reroute owns reroute+reconcile)"
+  fi
   echo "$(date): route lane - done"
 }
 
@@ -188,8 +313,32 @@ run_named_check() {
   # Capture status from the BINARY. `local out=$(...)` would set $? from the
   # `local` builtin, not from the command -- the old code declared `local out`
   # separately for exactly this reason, so keep the two statements apart.
-  out=$("$bin" 2>&1)
+  #
+  # TIMEOUT GUARD. A checker can hang inside its par launcher. money + quota
+  # share a single `wait "$PID_QUOTA" "$PID_MONEY"` barrier in the round loop, so
+  # ONE hung lane freezes the WHOLE round -- money.txt then ages past the 300s
+  # staleness alarm and `tpu money`'s autoheal pointlessly restarts a daemon that
+  # was never the problem. Bound every checker: SIGTERM at the deadline, SIGKILL
+  # 10s later. A hung lane fails its own round and the barrier still clears, so
+  # the other lane keeps refreshing every round.
+  #
+  # ★DEADLINE IS 300s, NOT 120s, AND THE MESSAGE NAMES NO CAUSE. Both changes
+  # come from the same incident (2026-08-31): money_check takes ~51s of wall
+  # clock on an IDLE machine, so 120s left barely 2.4x of headroom and every
+  # busy round tripped it. The message used to read "likely the xm_test srcfs
+  # wedge" -- a guess hardcoded into the log line, naming a workspace that no
+  # longer exists on this machine. Three shifts read it as a measurement and
+  # hunted a filesystem wedge; the real cause was four callers each running
+  # their own copy of an identical ~51s job (fixed in money_check_wrapper.sh,
+  # which now shares one run). A log line must report WHAT HAPPENED and where
+  # to look; the moment it asserts WHY, it is a hypothesis wearing the clothes
+  # of evidence, and it will outlive the condition that inspired it.
+  out=$(timeout -k 10 "${CHECKER_TIMEOUT_S:-300}" "$bin" 2>&1)
   rc=$?
+  if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
+    echo "$(date): Error - $2 check TIMED OUT (killed after ${CHECKER_TIMEOUT_S:-300}s; cause NOT diagnosed by this line -- check the checker's own stderr above, and \`pgrep -a money_check\` for a concurrent copy). Round continues."
+    return $rc
+  fi
   if [ $rc -eq 0 ]; then
     echo "$(date): Successfully updated $2 cache directory"
     return 0
@@ -213,6 +362,41 @@ trap '[ -n "${INFRA_PID:-}" ] && kill "$INFRA_PID" 2>/dev/null; [ -n "${ROUTE_PI
 
 while true; do
   ROUND_START=$(date +%s)
+
+  # RE-ESTABLISH THE CWD EVERY ROUND.
+  #
+  # The `cd` at line 42 runs once at startup. When the xm_test srcfs mount is
+  # remounted underneath us -- which happens -- the handle this process holds
+  # goes stale, `/proc/PID/cwd` starts reading `/cloud/...(deleted)`, and EVERY
+  # CHILD INHERITS IT. Python dies during interpreter start, before any of our
+  # code runs:
+  #
+  #     File "/<embedded stdlib>/sysconfig/__init__.py", line 198
+  #       _PROJECT_BASE = _safe_realpath(os.getcwd())
+  #     OSError: [Errno 107] Transport endpoint is not connected
+  #
+  # Measured 2026-08-25/26, three separate outages from this one cause: the
+  # infra lane froze the check cache for 12 hours; a restart fixed it; then the
+  # router lane inherited the same dead CWD and parked SEVEN queue entries as
+  # HELD ("build produced no XID") -- entries that had nothing wrong with them
+  # and that nothing retries once parked.
+  #
+  # A `cd` to the absolute path costs one syscall and re-opens a live handle,
+  # so a remount now costs at most one round instead of poisoning the daemon
+  # until someone notices and restarts it. Failure is non-fatal on purpose: if
+  # the mount is down right now, the round should still try (money/quota read
+  # their own paths and may well succeed) rather than the daemon exiting.
+  cd /google/src/cloud/qiaos/run_amply_workspace/google3 2>/dev/null || {
+    # srcfs mount is wedged right now. Do NOT stay on the poisoned CWD
+    # (/cloud/...(deleted)) -- every Python child would die at interpreter
+    # start on os.getcwd() (Errno 107). Fall back to local ext4 ($HOME) so the
+    # round's children at least start; money/quota read their own absolute
+    # paths and can still succeed. This mirrors the patch-3 getcwd guard in
+    # tpu_wrapper.sh. Added 2026-08-26 after the route lane parked the board
+    # stale ~24h on this exact crash.
+    cd "$HOME" 2>/dev/null || cd /
+    echo "$(date): WARN - cannot cd to xm_test/google3 (mount wedged?); fell back to CWD=$(pwd) so children can still start"
+  }
 
   # Repair a missing binary before the round rather than logging about it.
   self_heal_checkers
@@ -398,7 +582,13 @@ if os.path.exists(mapping_file):
         traceback.print_exc()
 EOF
 
-  # A round now costs ~60s wall time instead of ~216s. Sleeping 20s keeps the
-  # worst-case cache age well under the 180s threshold in tpu_wrapper.sh.
-  sleep 20
+  # Poll cadence between fast-lane rounds. money/quota only need ~2-minute
+  # freshness (the user-facing staleness alarm in tpu_wrapper.sh is 300s), and
+  # each round is seconds of wall time, so a 20s spin was needlessly hot: it
+  # spawned money_check ~3x/min, adding objfs churn + build pressure on a shared
+  # host. 120s keeps worst-case cache age (~interval + round wall ~= 135-180s)
+  # comfortably under the 300s alarm while cutting checker spawns ~6x. Env-
+  # overridable. (Autoheal judges liveness by ROUND PROGRESS, not cache age, so
+  # a slower cadence does not trip it.)
+  sleep "${TPU_DAEMON_POLL_SEC:-120}"
 done

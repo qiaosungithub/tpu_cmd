@@ -64,6 +64,14 @@ class CapacityResult:
   # thinks of as 'my quota'.
   alloc_scoped_quota: int = 0
   alloc_scoped_used: int = 0
+  # False when the floor_v2 read FAILED (RPC error, unknown tier), as opposed
+  # to succeeding and reporting no floor. Both used to arrive as quota == 0,
+  # which printed as a confident "0" in the router table and was read as "this
+  # alloc has no capacity" -- an instrument failure wearing the costume of a
+  # world state. Anything that DISPLAYS quota must branch on this; anything
+  # that RANKS on it may keep treating unreadable as zero, which is the
+  # conservative direction.
+  quota_readable: bool = True
   # The GQM ResourcePool this alloc lives in (e.g. 'deepmind-dynamic-pool').
   # Carried out of the check because market prices and limit orders are BOTH
   # keyed by pool: the same (cell, chip, tier) cleared at 20.20 credits in
@@ -227,7 +235,7 @@ def check_capacity(alloc: str, tier: str, xm_accelerator_key: str,
 
   # Alloc-scoped quota (via floor_v2): what the user sees in tpu quota.
   # This is stricter than the pool-wide obtainable_capacity from GoodputService.
-  alloc_quota, alloc_used = _fetch_alloc_scoped_quota(
+  alloc_quota, alloc_used, quota_readable = _fetch_alloc_scoped_quota(
       alloc, tier, xm_accelerator_key)
 
   warnings = []
@@ -243,6 +251,7 @@ def check_capacity(alloc: str, tier: str, xm_accelerator_key: str,
         ok=False, cells_ok=(), cells_insufficient=cells_insufficient,
         total_pool_capacity=total_cap, total_obtainable=total_obt,
         alloc_scoped_quota=alloc_quota, alloc_scoped_used=alloc_used,
+        quota_readable=quota_readable,
         pool=pool, hard_error=hard_error, warnings=tuple(warnings))
 
   # Heuristic: warn if the user's own alloc quota is thin vs the request.
@@ -257,14 +266,21 @@ def check_capacity(alloc: str, tier: str, xm_accelerator_key: str,
           f"If quota was granted per cell, submission may still fail on a "
           f"single-cell shortage even though the sum is enough.")
   elif tier.upper() == 'PROD' and alloc_quota == 0:
-    warnings.append(
-        f"Could not read PROD quota for {xm_accelerator_key} in {alloc} "
-        f"(floor_v2 reported 0). Cannot verify headroom.")
+    if quota_readable:
+      warnings.append(
+          f"{alloc} holds no PROD floor for {xm_accelerator_key} "
+          f"(floor_v2 read OK, reported 0). It can still run here on the "
+          f"market; there is just no guaranteed claim to verify against.")
+    else:
+      warnings.append(
+          f"Could not read PROD quota for {xm_accelerator_key} in {alloc} "
+          f"(floor_v2 lookup FAILED). Headroom is unknown, not zero.")
 
   return CapacityResult(
       ok=True, cells_ok=cells_ok, cells_insufficient=cells_insufficient,
       total_pool_capacity=total_cap, total_obtainable=total_obt,
       alloc_scoped_quota=alloc_quota, alloc_scoped_used=alloc_used,
+      quota_readable=quota_readable,
       pool=pool, warnings=tuple(warnings))
 
 
@@ -332,11 +348,15 @@ def _fetch_forecast_cells(alloc: str, tier: str,
   return out
 
 
-_quota_cache: dict[tuple[str, str, str], tuple[float, tuple[int, int]]] = {}
+# Value is (timestamp, (quota, used, readable)). Only SUCCESSFUL reads are
+# stored, so the cached `readable` is always True; a failed read returns
+# without touching the cache, which is what lets the next call retry.
+_quota_cache: dict[tuple[str, str, str],
+                   tuple[float, tuple[int, int, bool]]] = {}
 
 
 def _fetch_alloc_scoped_quota(alloc: str, tier: str,
-                              xm_accelerator_key: str) -> tuple[int, int]:
+                              xm_accelerator_key: str) -> tuple[int, int, bool]:
   """Reads this alloc's own guaranteed floor and its live usage.
 
   Quota comes from ``ResourceAllocationDetails.floor_v2``, which is scoped to
@@ -346,13 +366,16 @@ def _fetch_alloc_scoped_quota(alloc: str, tier: str,
   alloc's quota by orders of magnitude and are nearly identical across every
   group sharing that pool.
 
-  Returns (quota, used) as integer chip counts. Returns (0, 0) if the call
-  fails or the alloc/type has no quota.
+  Returns (quota, used, readable) as integer chip counts plus a flag that is
+  False when the lookup FAILED. A failed read and a genuine absence of floor
+  both yield quota == 0 and are NOT the same fact: the third element is the
+  only thing that tells them apart, and a caller that displays the number must
+  branch on it rather than printing a confident 0.
   """
   tier_map = {'PROD': 'HighlyAvailable', 'BATCH': 'NonProd', 'SPOT': 'BestEffort'}
   p_name = tier_map.get(tier.upper())
   if not p_name:
-    return (0, 0)
+    return (0, 0, False)
   ck = (alloc, p_name, xm_accelerator_key)
   now = time.time()
   hit = _quota_cache.get(ck)
@@ -372,8 +395,10 @@ def _fetch_alloc_scoped_quota(alloc: str, tier: str,
       used = int(chips_u)
     except Exception:
       pass
-    result = (quota, used)
+    result = (quota, used, True)
     _quota_cache[ck] = (now, result)
     return result
   except Exception:
-    return (0, 0)
+    # Deliberately NOT cached: a transient RPC failure must not pin "unknown"
+    # for the whole TTL when the next call would succeed.
+    return (0, 0, False)

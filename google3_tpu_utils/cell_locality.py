@@ -33,7 +33,7 @@ Dependency-free by design (stdlib only, no google3, no I/O at import) so every
 layer -- launcher, router, training binary, dataloader -- can import the same
 module and cannot disagree.
 
-MEASURED 2026-08-28T17:37:46Z over 254 candidate cells: 254 resolved, 0 unresolved.
+MEASURED 2026-08-30T03:03:42Z over 259 candidate cells: 259 resolved, 0 unresolved.
 """
 
 from __future__ import annotations
@@ -105,6 +105,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'wh':          ('bru', 'eu', 'gbl'),
     'wi':          ('bru', 'eu', 'gbl'),
     'wq':          ('bru', 'eu', 'gbl'),
+    'yubrupd-c':   ('bru', 'eu', 'gbl'),
     'ra':          ('dhr', 'eu', 'agr'),
     'rb':          ('dhr', 'eu', 'agr'),
     'dg':          ('dub', 'eu', 'ppk'),
@@ -186,6 +187,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'yucbfab':     ('cbf', 'na', 'srp'),
     'yucbfac':     ('cbf', 'na', 'uno'),
     'yucbfad':     ('cbf', 'na', 'uno'),
+    'yucbfad-c-staging': ('cbf', 'na', 'uno'),
     'yucbfcd':     ('cbf', 'na', 'uno'),
     'yucbfiv':     ('cbf', 'na', 'sln'),
     'yucbflq':     ('cbf', 'na', 'sln'),
@@ -239,6 +241,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'yucmhty':     ('cmh', 'na', 'clb'),
     'yucmhty-d':   ('cmh', 'na', 'clb'),
     'yucmhwf':     ('cmh', 'na', 'nby'),
+    'lcdfwlf':     ('dfw', 'na', 'lcr'),
     'rq':          ('dfw', 'na', 'mdn'),
     'rr':          ('dfw', 'na', 'mdn'),
     'rs':          ('dfw', 'na', 'mdn'),
@@ -247,6 +250,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'rw':          ('dfw', 'na', 'mdn'),
     'rw-d':        ('dfw', 'na', 'mdn'),
     'yudfwra':     ('dfw', 'na', 'red'),
+    'yudfwra-c':   ('dfw', 'na', 'red'),
     'pw':          ('dls', 'na', 'dls'),
     'px':          ('dls', 'na', 'dls'),
     'py':          ('dls', 'na', 'dls'),
@@ -309,6 +313,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'yutulrf':     ('tul', 'na', 'pry'),
     'gc':          ('uos', 'na', 'wck'),
     'gd':          ('uos', 'na', 'wck'),
+    'gd-c':        ('uos', 'na', 'wck'),
     'gd-d':        ('uos', 'na', 'wck'),
     'ge':          ('uos', 'na', 'wck'),
     'ge-d':        ('uos', 'na', 'wck'),
@@ -321,7 +326,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'lcscld':      ('scl', 'sa', 'cno'),
 }
 
-MEASURED_AT = '2026-08-28T17:37:46Z'
+MEASURED_AT = '2026-08-30T03:03:42Z'
 MEASURE_COMMAND = 'mach_locality -k {kind} {cell}'
 
 
