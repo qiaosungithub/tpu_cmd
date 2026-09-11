@@ -125,6 +125,7 @@ _CELL_LOCALITY = {
     'wh':          ('bru', 'eu'),
     'wi':          ('bru', 'eu'),
     'wq':          ('bru', 'eu'),
+    'yubrupd-c':   ('bru', 'eu'),
     'ra':          ('dhr', 'eu'),
     'rb':          ('dhr', 'eu'),
     'dg':          ('dub', 'eu'),
@@ -192,6 +193,7 @@ _CELL_LOCALITY = {
     'yucbfab':     ('cbf', 'na'),
     'yucbfac':     ('cbf', 'na'),
     'yucbfad':     ('cbf', 'na'),
+    'yucbfad-c-staging': ('cbf', 'na'),
     'yucbfcd':     ('cbf', 'na'),
     'yucbfiv':     ('cbf', 'na'),
     'yucbflq':     ('cbf', 'na'),
@@ -238,12 +240,14 @@ _CELL_LOCALITY = {
     'yucmhsu':     ('cmh', 'na'),
     'yucmhty':     ('cmh', 'na'),
     'yucmhwf':     ('cmh', 'na'),
+    'lcdfwlf':     ('dfw', 'na'),
     'rq':          ('dfw', 'na'),
     'rr':          ('dfw', 'na'),
     'rs':          ('dfw', 'na'),
     'rt':          ('dfw', 'na'),
     'rw':          ('dfw', 'na'),
     'yudfwra':     ('dfw', 'na'),
+    'yudfwra-c':   ('dfw', 'na'),
     'pw':          ('dls', 'na'),
     'px':          ('dls', 'na'),
     'py':          ('dls', 'na'),
@@ -299,6 +303,7 @@ _CELL_LOCALITY = {
     'yutulrf':     ('tul', 'na'),
     'gc':          ('uos', 'na'),
     'gd':          ('uos', 'na'),
+    'gd-c':        ('uos', 'na'),
     'ge':          ('uos', 'na'),
     'gg':          ('uos', 'na'),
     'lcyulk':      ('yul', 'na'),
@@ -539,15 +544,36 @@ def _local_bucket() -> str:
 
     bucket = f'/cns/{storage_cell}/{_BUCKET_SUFFIX}'
     metro = _metro_of(cell)
-    note = ''
+    # 5. PERSONAL-ONLY METROS ARE REFUSED, NOT WARNED ABOUT.
+    #    This used to print a NOTE saying "fine for a smoke test" and launch
+    #    anyway. That advice expired: the personal quota is at 468G of its
+    #    500 GiB ceiling and its handle is poisoned, so a write there fails
+    #    with resource_exhausted AND LEAVES A 0-BYTE FILE -- the loss looks
+    #    like a file that exists, and `tpu check` still reports SUBMITTED.
+    #    ★This is the worst of the three metro outcomes: a metro in neither
+    #    dict SystemExits into an inert zero-work-unit shell, which is at
+    #    least visibly broken; phx/ske launch, bill, and destroy their own
+    #    output while looking healthy. A warning is the wrong instrument for
+    #    a failure that already looks like success -- nobody reads a NOTE on
+    #    a launch that appears to work.
+    #    Escape hatch: an explicit --bucket returns at step 1 above and never
+    #    reaches here, so a caller who has deliberately chosen a group-billed
+    #    path in these metros is unaffected.
     if metro in _PERSONAL_ONLY_METROS:
-        note = ('  NOTE: this metro has no GROUP storage registration, so the '
-                'write lands on the personal 500 GiB per-cell ceiling. Fine for '
-                'a smoke test; exhausting it poisons every write in the cell.')
+        raise SystemExit(
+            f'[locality] REFUSING to launch: cell {cell!r} is in metro '
+            f'{metro!r}, which has NO GROUP storage registration -- writes '
+            f'land on the PERSONAL {_PERSONAL_ONLY_METROS[metro]} quota '
+            f'(500 GiB per cell, currently ~468G used and poisoned). A write '
+            f'there fails with resource_exhausted and still leaves a 0-byte '
+            f'file, so the job looks like it produced output.\n'
+            f'  Fix, in order of preference:\n'
+            f'    * run in a metro with group storage: '
+            f'{", ".join(sorted(_METRO_STORAGE_CELL))}; or\n'
+            f'    * pass --bucket=<group-billed root> explicitly if you have '
+            f'chosen this location on purpose.')
     print(f'[locality] cell={cell} (metro {metro}, continent '
           f'{_continent_of(cell)}): co-located bucket {bucket}')
-    if note:
-        print(note)
     return bucket
 
 
@@ -571,10 +597,17 @@ _MAX_TASK_FAILURES = flags.DEFINE_integer(
     'restarts; use --borg_max_task_evictions for those.'
 )
 _MAX_PER_TASK_FAILURES = flags.DEFINE_integer(
-    'borg_max_per_task_failures', 1,
+    'borg_max_per_task_failures', 3,
     'Failures tolerated per individual task before that task is declared dead. '
     'Combined with the credit period below this reads as "recover from at most '
-    'one failure per task every N seconds".'
+    'THREE failures per task every N seconds". Raised 1 -> 3 by operator order '
+    '(2026-08-31 01:27Z). At 1, a single transient CUDA/NCCL hiccup on one rank '
+    'killed a multi-hour multi-host run outright; the other two budgets '
+    '(borg_max_task_failures / borg_max_task_evictions) are already -1 = '
+    'unlimited, so this was the only counter that could end a healthy job. The '
+    'credit period still decays the count, so a genuinely broken task -- one '
+    'failing faster than the decay -- is still declared dead rather than '
+    'restarted forever.'
 )
 _MAX_TASK_EVICTIONS = flags.DEFINE_integer(
     'borg_max_task_evictions', -1,
@@ -999,6 +1032,29 @@ _WANDB_RESUME_ID = flags.DEFINE_string(
     'wandb_resume_id', '',
     'Run id to resume experiment tracking under. Exported as $WANDB_RESUME_ID.'
 )
+# TRAINING RESUME (ELT): distinct from --load_from. load_from is READ-ONLY (eval
+# / warm-start) and makes workdir=load_from, so an orbax manager that prunes
+# deletes the very checkpoints it resumed from. A training run that keeps
+# checkpointing must resume via a READ/WRITE SPLIT: read the OLD run's workdir,
+# write the NEW car's own $CHECKPOINT_BUCKET, self-clearing once it saves its
+# first checkpoint. These two feed config.train.restart_from via
+# configs/load_config.py::_apply_restart_from_env (proven by :restart_from_test
+# / RESTART_FROM_OK). Ported from the ELT checkout copy 2026-09-10: the shared
+# launcher forwarded --restart_from/--restart_step to the trainer as UNDECLARED
+# flags (silently dropped), so every ELT resume through this launcher
+# cold-started (xid 288423570, and sibling 288408898).
+_RESTART_FROM = flags.DEFINE_string(
+    'restart_from', '',
+    'WORKDIR of a previous run to resume from -- the directory CONTAINING '
+    '`checkpoints/`, never the leaf step dir. Exported as $ELT_RESTART_FROM. '
+    'Requires --restart_step. Writes still go to $CHECKPOINT_BUCKET.'
+)
+_RESTART_STEP = flags.DEFINE_string(
+    'restart_step', '',
+    'Step to resume from, named explicitly. Exported as $ELT_RESTART_STEP. '
+    'Mandatory with --restart_from: an unnamed step resolves silently and a '
+    'wrong resume point reads as training instability, not a launch error.'
+)
 _CELL_PREFER = flags.DEFINE_string(
     'cell_prefer', 'auto',
     "Where the scheduler may place this job, best-first. 'auto' (default) uses "
@@ -1268,6 +1324,7 @@ def main(argv) -> None:
         print(f"[launcher] config.sh={_config_path} -> package_mode={package_mode!r} "
               f"target_label={target_label!r} project_name={project_name!r}")
 
+        print("[trace] A/executors-init", flush=True)   # TEMP probe 2026-08-31 chipwatch; remove after resume_xid diagnosed
         executors = []
         is_tpu_job = False
         tpu_types = [t.strip() for t in _TPU_TYPE.value.split(',')]
@@ -1330,6 +1387,20 @@ def main(argv) -> None:
             elif arg.startswith('--group='):
                 group_val = arg.split('=', 1)[1]
                 alloc_str = _GROUP_MAP.get(group_val, f'group:{group_val}')
+
+        # Megacore (v4/pufferfish ONLY). v4 exposes 2 TensorCores per chip, so
+        # JAX sees 2 devices/chip and jax.make_mesh() aborts at init with
+        # "Creating meshes for TPU >v3 requires one device per chip (megacore
+        # mode)" (observed: XIDs 288531077/288568565 on v4-256 died here while
+        # the identical code ran fine to 28k steps on v6p, which is 1 core/chip).
+        # deepsea_chip_config_name=megacore_dense fuses the two cores into one
+        # logical device so device_count halves and the mesh builds -- the exact
+        # fix paligemma's launcher uses (//third_party/py/big_vision/launch.py
+        # :290, `if device_type == "pf": exe_args[...]="megacore_dense"`).
+        # megacore is pufferfish-only (ghostfish/-lite and viperfish reject it),
+        # and the flag is one job-wide executable arg (not per-executor), so we
+        # only set it for a v4-ONLY job and warn on a mixed Fallback.
+        _tpu_res_names = []
 
         for tpu_str in tpu_types:
             if '-' in tpu_str and not '=' in tpu_str:
@@ -1554,9 +1625,12 @@ def main(argv) -> None:
             if not _is_gpu and (res_name in FISH_MAP.values()
                                 or res_name.startswith('tpu')):
                 is_tpu_job = True
+            _tpu_res_names.append(res_name)
 
+        print("[trace] B/tpu-loop-done", flush=True)   # TEMP probe 2026-08-31 chipwatch; remove after resume_xid diagnosed
         final_executor = xm.Fallback(executors) if len(executors) > 1 else executors[0]
     
+        print("[trace] C/got-xid", flush=True)   # TEMP probe 2026-08-31 chipwatch; remove after resume_xid diagnosed
         xid = experiment.experiment_id
         import time
         time_str = time.strftime("%Y%m%d_%H%M%S")
@@ -1632,6 +1706,7 @@ def main(argv) -> None:
             except Exception as e:
                 print(f"Warning: could not write mapping file: {e}")
 
+        print("[trace] D/before-resume-block", flush=True)   # TEMP probe 2026-08-31 chipwatch; remove after resume_xid diagnosed
         if _RESUME_XID.value:
             # LOOK IN THE ARCHIVE TOO. `tpu clear` advertises itself as archiving
             # rather than deleting -- it moves entries to ~/.tpu_jobs_legacy.json --
@@ -1640,6 +1715,7 @@ def main(argv) -> None:
             # message: it fell through to the long-dead ~/xm_job_to_bucket/ path
             # and raised FileNotFoundError on a file nothing has written since
             # 2026-07-26.
+            print("[trace] D1/enter-branch", flush=True)   # TEMP probe 2026-08-31 chipwatch
             want = str(_RESUME_XID.value)
             bucket_cp_path = ""
             for source in (read_mapping(), _read_legacy_mapping()):
@@ -1647,6 +1723,7 @@ def main(argv) -> None:
                     bucket_cp_path = source[want].get("bucket_cp_path", "")
                     if bucket_cp_path:
                         break
+            print("[trace] D2/mapping-looked-up", flush=True)   # TEMP probe 2026-08-31 chipwatch
             if not bucket_cp_path:
                 # Last resort: the pre-2026-07-26 one-file-per-xid layout.
                 legacy_file = os.path.join(
@@ -1659,6 +1736,7 @@ def main(argv) -> None:
                         f"Pass --bucket=<its bucket_cp_path> explicitly if you know it.")
                 with open(legacy_file, "r") as f:
                     bucket_cp_path = f.read().strip()
+            print("[trace] D3/have-bucket", flush=True)   # TEMP probe 2026-08-31 chipwatch
             vm_workdir = f"/tmp/eqr_log/resume_{xid}_{time_str}_{project_name}_{exp_name}"
             # PRE-FLIGHT: does the config we are about to package actually
             # describe the checkpoint we are about to resume?
@@ -1670,8 +1748,10 @@ def main(argv) -> None:
             # against a maze config and died on arrival, after ten minutes of
             # packaging and queueing. Checking here costs one small read of the
             # checkpoint's `extra.json` and fails in seconds instead.
+            print("[trace] D4/before-preflight-cfg", flush=True)   # TEMP probe 2026-08-31 chipwatch
             _preflight_resume_config(bucket_cp_path, xid)
             # And a resume does not stop what is already running on this XID.
+            print("[trace] D5/before-warn-active", flush=True)   # TEMP probe 2026-08-31 chipwatch
             _warn_if_work_units_still_active(experiment, xid)
         else:
             bucket_cp_path = f"{_local_bucket()}/logs/{project_name}/{folder_name}"
@@ -1680,6 +1760,7 @@ def main(argv) -> None:
         # The registry entry is written AFTER `experiment.add(job)`, at the end
         # of this function -- see the comment there. Building it here, where the
         # values are in scope, keeps that move a pure reordering.
+        print("[trace] E/resume-block-done", flush=True)   # TEMP probe 2026-08-31 chipwatch; remove after resume_xid diagnosed
         registry_entry = {
             "bucket_cp_path": bucket_cp_path,
             "logdir": os.environ.get("TPU_LOGDIR", ""),
@@ -1719,6 +1800,23 @@ def main(argv) -> None:
         # See //depot/google3/third_party/py/xmanager/contrib/internal/xm_jax.py.
         if is_tpu_job:
             executable_args.update(xm_jax.JaxFlags().flags())
+            # v4/pufferfish megacore fix (see note at `_tpu_res_names =` above).
+            # Set megacore_dense ONLY when the job is v4-only; a mixed Fallback
+            # cannot carry a per-executor value, so warn rather than break the
+            # non-v4 arms.
+            _v4_res = [r for r in _tpu_res_names if r == 'pufferfish']
+            _distinct_res = set(_tpu_res_names)
+            if _v4_res and len(_distinct_res) == 1:
+                executable_args['deepsea_chip_config_name'] = 'megacore_dense'
+                print('[launcher] v4/pufferfish: deepsea_chip_config_name='
+                      'megacore_dense (fuse 2 cores/chip -> 1 device so '
+                      'jax.make_mesh() works).')
+            elif _v4_res:
+                print('[launcher] WARNING: v4/pufferfish is mixed with other '
+                      f'archs ({sorted(_distinct_res)}); deepsea_chip_config_name '
+                      'is one job-wide flag and cannot be set per-executor, so '
+                      'the v4 arm would hit the megacore mesh assertion. Enqueue '
+                      'v4 as its own single-arch job to get megacore_dense.')
             # Prefer failing over running degraded: an ICI-resilient slice
             # costs ~35% throughput, and being rescheduled onto a healthy slice
             # beats finishing 1.5x slower. (mesh_diffusion launch_lib.py:372)
@@ -1746,6 +1844,7 @@ def main(argv) -> None:
                 # config schema dies at startup instead.
                 if arg.startswith(('--cell=', '--load_from=', '--config.load_from=',
                                    '--wandb_resume_id=', '--config.wandb_resume_id=',
+                                   '--restart_from=', '--restart_step=',
                                    '--borg_max_task_failures=', '--borg_max_per_task_failures=',
                                    '--borg_max_task_evictions=',
                                    '--tmp_ram_fs_gib=', '--ram_gib=', '--replicas=',
@@ -1763,6 +1862,7 @@ def main(argv) -> None:
         # group-wide than threading flags through every config"). main.py's
         # _ENV_CONFIG_OVERRIDES already consumes exactly these names, and env
         # wins over any seed value written in the yaml config.
+        print("[trace] F/env-vars", flush=True)   # TEMP probe 2026-08-31 chipwatch; remove after resume_xid diagnosed
         job_env_vars = {'PYTHONPATH': pkg_path}
         load_from = _LOAD_FROM.value
         # NOTE: --resume_xid deliberately does NOT set LOAD_FROM.
@@ -1788,6 +1888,18 @@ def main(argv) -> None:
             job_env_vars['LOAD_FROM'] = load_from
         if _WANDB_RESUME_ID.value:
             job_env_vars['WANDB_RESUME_ID'] = _WANDB_RESUME_ID.value
+        # TRAINING RESUME env delivery. Fail closed on a half-specified resume:
+        # a path with no step would otherwise reach the job and raise there,
+        # burning a build + a slice. The trainer's _apply_restart_from_env reads
+        # exactly these two names.
+        if _RESTART_FROM.value or _RESTART_STEP.value:
+            if not (_RESTART_FROM.value and _RESTART_STEP.value):
+                raise ValueError(
+                    '--restart_from and --restart_step must be given TOGETHER; '
+                    f'got restart_from={_RESTART_FROM.value!r} '
+                    f'restart_step={_RESTART_STEP.value!r}')
+            job_env_vars['ELT_RESTART_FROM'] = _RESTART_FROM.value
+            job_env_vars['ELT_RESTART_STEP'] = _RESTART_STEP.value
         # Where the job should persist its own checkpoints. workdir lives on
         # the task's local disk, which is wiped on every Borg task restart, so
         # a durable copy has to go to GCS for a restart to be able to resume.
@@ -1802,6 +1914,7 @@ def main(argv) -> None:
             print(f'[gcs-publish] enabled: {_ROBOTWIN_EVAL_BUCKET}/runs/{xid}')
         
 
+        print("[trace] G/before-bazel-package", flush=True)   # TEMP probe 2026-08-31 chipwatch; remove after resume_xid diagnosed
         if package_mode == "bazel":
             # BASE build flags for every bazel job. A GPU job additionally
             # needs CUDA compiled IN: torch's CUDA kernels are `if_cuda`-gated
@@ -1882,6 +1995,7 @@ def main(argv) -> None:
         # "ValueError: coordinator_address should be defined."
         # Compare //depot/google3/third_party/py/maxtext/xm_launch.py, which
         # passes args to xm.Job.
+        print("[trace] H/before-experiment-add", flush=True)   # TEMP probe 2026-08-31 chipwatch; remove after resume_xid diagnosed
         job = xm.Job(executable, final_executor, args=executable_args, name=_JOB_NAME)
         experiment.add(job)
 
