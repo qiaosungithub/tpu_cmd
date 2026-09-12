@@ -139,6 +139,83 @@ check('leave a message with no prefix alone',
       infra_check._strip_job_prefix('Queued, no reason reported'),  # pylint: disable=protected-access
       'Queued, no reason reported')
 
+# --- `tpu clear` archive behaviour: board + local-queue cascade. -------------
+# Exercise the real _clear_jobs against temp board/legacy/queue files (not a
+# mock): the whole point of the change is that the two stores move together, and
+# that a LIVE queue row is never dropped.
+
+import json as _json           # pylint: disable=g-import-not-at-top
+import os as _os               # pylint: disable=g-import-not-at-top
+import tempfile as _tempfile   # pylint: disable=g-import-not-at-top
+
+from google3.experimental.users.qiaos.tpu_utils import route_check as _RC  # pylint: disable=g-import-not-at-top
+from google3.experimental.users.qiaos.tpu_utils import route_lib as _RL    # pylint: disable=g-import-not-at-top
+
+_NO_MAP = '/no/such/mapping/dir'
+
+
+def _clear_setup(board=None, queue_rows=None):
+  """Point infra_check at fresh temp board/legacy files and a temp queue."""
+  bd = _tempfile.mkstemp(suffix='.jobs.json')[1]
+  lg = _tempfile.mkstemp(suffix='.legacy.json')[1]
+  q = _tempfile.mkstemp(suffix='.queue.json')[1]
+  with open(bd, 'w') as f:
+    _json.dump(board or {}, f)
+  with open(lg, 'w') as f:
+    _json.dump({}, f)
+  infra_check._JOBS_FILE = bd     # pylint: disable=protected-access
+  infra_check._LEGACY_FILE = lg   # pylint: disable=protected-access
+  _RC.save_queue(q, queue_rows or [])
+  _os.environ['TPU_LOCAL_QUEUE_FILE'] = q
+  return bd, lg, q
+
+
+def _qrow(job_id, state, xid):
+  e = _RL.QueueEntry(job_id=job_id, power='v7-32', allowed_archs=['v7'])
+  e.state = state
+  e.xid = xid
+  return e
+
+
+# `tpu clear all` must be REFUSED -- a blanket sweep is the one un-undoable
+# mistake this command must not make easy.
+bd, lg, q = _clear_setup(board={'111': {'name': 'r1'}},
+                         queue_rows=[_qrow('j', _RL.JobState.DONE, '111')])
+infra_check._clear_jobs(['all'], _NO_MAP)  # pylint: disable=protected-access
+check('clear all leaves the board untouched', '111' in _json.load(open(bd)), True)
+check('clear all leaves the queue untouched', len(_RC.load_queue(q)), 1)
+
+# A FINISHED run: board entry AND queue row archived together, into one legacy
+# record carrying both views.
+bd, lg, q = _clear_setup(board={'111': {'name': 'r1'}},
+                         queue_rows=[_qrow('j1', _RL.JobState.DONE, '111')])
+infra_check._clear_jobs(['111'], _NO_MAP)  # pylint: disable=protected-access
+_live = _json.load(open(bd))
+_leg = _json.load(open(lg))
+check('finished: board entry removed', '111' in _live, False)
+check('finished: archived to legacy', '111' in _leg, True)
+check('finished: legacy record folds in the queue row',
+      'queue_row' in _leg.get('111', {}), True)
+check('finished: queue row removed', len(_RC.load_queue(q)), 0)
+
+# A LIVE run (RUNNING queue row): the board is still tidied, but the queue row is
+# REFUSED -- dropping it would strand a job on the cluster.
+bd, lg, q = _clear_setup(board={'222': {'name': 'r2'}},
+                         queue_rows=[_qrow('j2', _RL.JobState.RUNNING, '222')])
+infra_check._clear_jobs(['222'], _NO_MAP)  # pylint: disable=protected-access
+check('live: board entry still archived', '222' in _json.load(open(bd)), False)
+check('live: queue row NOT removed', len(_RC.load_queue(q)), 1)
+check('live: refused row not folded as queue_row',
+      'queue_row' in _json.load(open(lg)).get('222', {}), False)
+
+# A board-ONLY XID (no queue row at all -- the common case): archived cleanly,
+# no error, nothing reported missing.
+bd, lg, q = _clear_setup(board={'333': {'name': 'r3'}}, queue_rows=[])
+infra_check._clear_jobs(['333'], _NO_MAP)  # pylint: disable=protected-access
+check('board-only: archived off the board',
+      '333' not in _json.load(open(bd)), True)
+check('board-only: present in legacy', '333' in _json.load(open(lg)), True)
+
 if _FAILURES:
   print(f'\n{len(_FAILURES)} check(s) FAILED')
   sys.exit(1)

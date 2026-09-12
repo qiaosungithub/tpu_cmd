@@ -42,36 +42,50 @@ def _load_json(path):
 
 
 def _clear_jobs(job_ids, mapping_dir):
-    """Archive tracked jobs out of the status board.
+    """Archive named jobs off the status board AND out of the local queue.
 
     Entries are MOVED to ~/.tpu_jobs_legacy.json rather than deleted: the record
     carries the checkpoint bucket, staging dir and launch log, which is the only
     way back to a finished run's artefacts. `tpu check` reads only the live
     file, so archiving is enough to clean the board.
 
-    `tpu clear all` archives every entry; otherwise pass explicit XIDs.
+    THE QUEUE HALF: `tpu clear` also archives the run's row out of the local
+    smart-router queue (~/.tpu_local_queue.json), folding that row into the SAME
+    legacy record under the same XID (an extra `queue_row` key) so one archive
+    holds both views and nothing is lost. It archives ONLY a genuinely-finished
+    (DONE/FAILED) queue row and REFUSES a live one -- the queue row is the
+    router's handle on a job still on the cluster, and dropping it strands the
+    work, exactly as `tpu dequeue` refuses a live row. A refused row is reported;
+    the board half still runs.
+
+    Pass explicit XIDs -- one or many. There is deliberately NO `tpu clear all`:
+    a single fat-fingered `all` would sweep the whole board (and the whole
+    queue), the one un-selectively-undoable mistake this command must not make
+    easy. Archiving is reversible per id; a blanket sweep is not.
     """
     if not job_ids:
-        print('Usage: tpu clear <xid> [xid...]   |   tpu clear all')
+        print('Usage: tpu clear <xid> [xid...]   (name the XIDs; there is no `all`)')
+        return
+    if len(job_ids) == 1 and str(job_ids[0]).lower() == 'all':
+        print('`tpu clear all` is no longer supported -- name the XIDs explicitly.')
+        print('  A blanket sweep of the whole board is too easy to trigger by')
+        print('  mistake and cannot be selectively undone. List them with')
+        print('  `tpu check`, then `tpu clear <xid> [xid ...]`.')
         return
 
+    requested = [str(x) for x in job_ids]
+    want = set(requested)
     live = _load_json(_JOBS_FILE)
     legacy = _load_json(_LEGACY_FILE)
+    now_iso = datetime.datetime.now().isoformat(timespec='seconds')
 
-    if len(job_ids) == 1 and job_ids[0] == 'all':
-        targets = sorted(live)
-        # Legacy bucket-mapping dir predates ~/.tpu_jobs.json; sweep it too.
-        if os.path.isdir(mapping_dir):
-            targets += [f for f in os.listdir(mapping_dir) if f not in targets]
-    else:
-        targets = job_ids
-
-    archived, missing = [], []
-    for xid in targets:
+    # --- board half: archive the named board entries (+ legacy mapping dir) ---
+    board_hit = set()
+    for xid in requested:
         found = False
         if xid in live:
             entry = dict(live.pop(xid))
-            entry['archived_at'] = datetime.datetime.now().isoformat(timespec='seconds')
+            entry['archived_at'] = now_iso
             legacy[xid] = entry
             found = True
         target_file = os.path.join(mapping_dir, xid)
@@ -80,17 +94,68 @@ def _clear_jobs(job_ids, mapping_dir):
                 'bucket_cp_path', open(target_file).read().strip())
             os.remove(target_file)
             found = True
-        (archived if found else missing).append(xid)
+        if found:
+            board_hit.add(xid)
 
-    if archived:
+    # --- queue half: archive the matching FINISHED local-queue rows into the
+    # SAME legacy record; refuse live ones. Deferred import so `tpu check` (the
+    # hot path) never pulls the router stack -- only `tpu clear` does. An import
+    # failure is a BUILD problem (route_check is always built and declared as a
+    # dep), reported distinctly from a runtime queue error so a missing dep is
+    # never mistaken for "no queue rows".
+    queue_archived, queue_refused, queue_matched = [], [], set()
+    route_check = route_lib = None
+    try:
+        from google3.experimental.users.qiaos.tpu_utils import route_check  # pylint: disable=g-import-not-at-top
+        from google3.experimental.users.qiaos.tpu_utils import route_lib  # pylint: disable=g-import-not-at-top
+    except ImportError as exc:
+        print(f'  [queue] router libs unavailable ({exc}); board handled, queue '
+              f'NOT touched. Rebuild :infra_check with the route_check dep.')
+    if route_check is not None and route_lib is not None:
+        queue_file = os.path.expanduser(
+            os.environ.get('TPU_LOCAL_QUEUE_FILE') or '~/.tpu_local_queue.json')
+        try:
+            res = route_check.archive_finished_queue_rows(queue_file, want)
+            queue_archived = res['archived']
+            queue_refused = res['refused']
+            queue_matched = set(res['matched_xids'])
+            for e in queue_archived:
+                row = e.to_dict()
+                for xid in (route_lib.entry_xids(e) & want):
+                    rec = legacy.setdefault(xid, {})
+                    rec.setdefault('archived_at', now_iso)
+                    rec['queue_row'] = row
+                    rec['queue_archived_at'] = now_iso
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f'  [queue] local queue not reachable ({exc}); board handled, '
+                  f'queue left unchanged.')
+
+    # --- persist once (board + merged legacy) ---
+    if board_hit or queue_archived:
         with open(_LEGACY_FILE, 'w') as f:
             json.dump(legacy, f, indent=2, sort_keys=True)
         with open(_JOBS_FILE, 'w') as f:
             json.dump(live, f, indent=2, sort_keys=True)
-        print(f'Archived {len(archived)} job(s) to {_LEGACY_FILE}')
-        print(f'  {len(live)} still tracked')
+        print(f'Archived {len(board_hit)} board entr(y/ies) and '
+              f'{len(queue_archived)} local-queue row(s) to {_LEGACY_FILE}')
+        print(f'  {len(live)} still tracked on the board')
+
+    if queue_refused:
+        print('  \u2605NOT archived -- these local-queue rows are still LIVE:')
+        for job_id, state, xid in queue_refused:
+            print(f'    {job_id} (state={state}'
+                  f'{", xid=" + xid if xid else ""}) left in the queue.')
+        print("    The row is the router's handle on a job on the cluster; "
+              'archiving it would strand the work.')
+        print('    Stop it with `tpu cancel <xid>` (verify against XManager, '
+              'not the queue), then clear it once it has ended.')
+
+    hit_anywhere = board_hit | queue_matched
+    missing = [x for x in requested if x not in hit_anywhere]
     if missing:
-        print(f'Not tracked: {", ".join(missing)}')
+        print(f'Not tracked (board/queue/mapping): {", ".join(missing)}')
+    if not (board_hit or queue_archived or queue_refused or missing):
+        print('Nothing to archive.')
 
 
 

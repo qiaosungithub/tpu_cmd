@@ -169,21 +169,40 @@ it off the board afterwards.
 `tpu check` renders the wrapper's CANCELLED immediately; the daemon's own
 view converges on the next ~60s cycle.
 
-### `tpu clear` — archive jobs off the status board
+### `tpu clear` — archive a finished run off the board AND the queue
 
 ```
-tpu clear <xid> [xid...]     # archive specific jobs
-tpu clear all                # archive everything currently tracked
+tpu clear <xid> [xid...]     # archive the named run(s), board + local queue
 ```
 
-Entries are **moved** from `~/.tpu_jobs.json` to `~/.tpu_jobs_legacy.json`,
-never deleted: the record holds the checkpoint bucket, staging dir and launch
-log, which is the only route back to a finished run's artefacts. An
-`archived_at` timestamp is added. `tpu check` reads only the live file, so
-archiving is all that is needed to clean the board.
+This is what "clean up a job" means: archive a finished run so it stops
+cluttering `tpu check` and `tpu queue-status`. Entries are **moved**, never
+deleted.
 
-`all` also sweeps the legacy `~/xm_job_to_bucket/` directory, preserving each
-file's bucket path into the archive before removing it.
+**Board half.** The `~/.tpu_jobs.json` entry moves to `~/.tpu_jobs_legacy.json`
+(with an `archived_at` timestamp). The record holds the checkpoint bucket,
+staging dir and launch log — the only route back to a finished run's artefacts,
+and config recovery still resolves an archived id. `tpu check` reads only the
+live file, so archiving is all that is needed to clean the board.
+
+**Queue half.** `tpu clear` also archives the run's row out of the local
+smart-router queue (`~/.tpu_local_queue.json`), matching by XID (current or a
+prior re-dispatch). The queue row is folded into the SAME legacy record under a
+`queue_row` key, so one archive holds both views and nothing is lost.
+
+**It only archives a FINISHED (DONE/FAILED) queue row, and refuses a live one.**
+A QUEUED / BUILDING / SUBMITTED / RUNNING / HELD row is the router's handle on a
+job still on the cluster; archiving it would strand the work, exactly as
+`tpu dequeue` refuses a live row. A refused row is reported and left in place —
+stop it first with `tpu cancel <xid>` (verify against XManager, not the queue),
+then clear it once it has ended. The board half still runs for a refused row.
+
+**There is no `tpu clear all`.** A blanket sweep of the whole board and queue is
+the one mistake that cannot be selectively undone, so it must be triggered on
+purpose, one id (or a named batch) at a time. `tpu clear all` prints a refusal.
+
+A cleared board entry also sweeps its legacy `~/xm_job_to_bucket/` mapping file,
+preserving the bucket path into the archive first.
 
 Allow one daemon cycle (60s) for `tpu check` to reflect the change — it renders
 from a cache, not from the file directly.
