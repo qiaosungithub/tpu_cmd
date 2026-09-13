@@ -410,34 +410,36 @@ _tpu_daemon_autoheal() {
   echo "$now" > "$stampf" 2>/dev/null
 
   # --- Judge liveness ---
+  # The real daemon may run OUTSIDE tmux (started via setsid+flock, ppid=1), so
+  # `tmux has-session -t tpu-daemon` is NOT a liveness test: it false-reports
+  # DEAD every round while a healthy out-of-tmux daemon keeps refreshing the
+  # cache, and the restart it then triggers is refused by _tpu_restart_check_daemon
+  # ("already running outside tmux") -- pure noise. Judge instead by the two
+  # things true wherever the daemon runs: (1) is a tpu_check_daemon.sh process
+  # alive (the same gate the restart fn checks before refusing), and (2) is the
+  # cache file it writes fresh. This is the wiki rule "diagnose by timestamp,
+  # not by liveness". The cache path is $TPU_CHECK_CACHE_FILE, which is scoped
+  # per operator (tpu vs npu), so the freshness test judges THIS operator's
+  # daemon even though the argv-level pgrep cannot tell the two apart.
   local verdict reason
-  if ! tmux has-session -t tpu-daemon 2>/dev/null; then
-    verdict=DEAD; reason="tmux session 'tpu-daemon' gone"
-  elif ! pgrep -f tpu_check_daemon.sh >/dev/null 2>&1; then
-    verdict=DEAD; reason="no tpu_check_daemon.sh process"
+  if ! pgrep -f 'tpu_check_daemon\.sh' >/dev/null 2>&1; then
+    verdict=DEAD; reason="no tpu_check_daemon.sh process (in or out of tmux)"
   else
-    # Alive session+process: judge by round progress. Parse the last timestamped
-    # line from the daemon pane; if it is older than 10min, the loop is hung.
-    local pane last_epoch age_round
-    pane=$(tmux capture-pane -t tpu-daemon -p 2>/dev/null | grep -E ': --- |Successfully updated|round took' | tail -1)
-    # daemon prints e.g. 'Sun Aug 23 05:15:13 PM UTC 2026: ...'
-    local ts
-    ts=$(echo "$pane" | grep -oE '[A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]+ [0-9:]+ [AP]M [A-Z]+ [0-9]{4}' | head -1)
-    if [ -n "$ts" ]; then
-      last_epoch=$(date -d "$ts" +%s 2>/dev/null || echo 0)
-    else
-      last_epoch=0
-    fi
-    if [ "$last_epoch" -gt 0 ]; then
-      age_round=$(( now - last_epoch ))
-      if [ "$age_round" -gt "${TPU_DAEMON_HUNG_SEC:-600}" ]; then
-        verdict=HUNG; reason="no round progress for ${age_round}s (>600s)"
+    # Process alive -> judge by cache freshness (the artifact), not a tmux pane
+    # (an out-of-tmux daemon has none). Stale cache + live process = hung loop.
+    local cache_age cache_mtime
+    if [ -f "$TPU_CHECK_CACHE_FILE" ]; then
+      cache_mtime=$(stat -c %Y "$TPU_CHECK_CACHE_FILE" 2>/dev/null || echo 0)
+      cache_age=$(( now - cache_mtime ))
+      if [ "$cache_age" -gt "${TPU_DAEMON_HUNG_SEC:-600}" ]; then
+        verdict=HUNG; reason="cache stale ${cache_age}s (>600s) though a daemon process is alive"
       else
-        verdict=ALIVE; reason="round progressed ${age_round}s ago (healthy; slow infra lane is not death)"
+        verdict=ALIVE; reason="cache refreshed ${cache_age}s ago (healthy; slow infra lane is not death)"
       fi
     else
-      # Can't parse a timestamp -- be conservative, do NOT restart on ambiguity.
-      verdict=ALIVE; reason="round timestamp unparseable; not restarting on ambiguity"
+      # A process is running but no cache yet -- likely its first round.
+      # Be conservative: do NOT restart on ambiguity.
+      verdict=ALIVE; reason="daemon process alive, cache not yet written; not restarting on ambiguity"
     fi
   fi
 

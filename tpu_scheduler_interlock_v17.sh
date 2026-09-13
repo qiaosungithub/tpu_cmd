@@ -18,7 +18,7 @@ set -u
 RR_SCRIPT="$HOME/work/tpu_cmd/tpu_reroute_loop_v17.sh"
 RR_LOCK=/tmp/tpu-reroute-loop.lock
 LOG="$HOME/work/.monitor_watch/tpu_interlock_v17.log"
-DISPATCH_SHELL_PID=2809021   # the while-true wrapper that respawns the worker
+DISPATCH_SHELL_PID=1400964   # the while-true wrapper that respawns the worker
 
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 
