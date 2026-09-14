@@ -1168,6 +1168,37 @@ def _preflight_resume_config(bucket_cp_path: str, xid: str) -> None:
     print(f"[resume] config matches {resume_from}")
 
 
+def _wandb_identity_from_cfg(cfg) -> dict:
+    """Extract the W&B identity a finished job needs to become a W&B run.
+
+    The unified config contract (2026-09-14) puts project/entity/notes/tags
+    under `config.wandb.*` in every xm-run repo. The on-Borg job never reaches
+    W&B -- it logs to the Flatboard datatable through a wandb *mock* -- so the
+    OFFLINE wandb-upload daemon is the only thing that ever creates the real
+    run, and it reconstructs the run's identity from the job registry. Recording
+    the block here, where `cfg` is already loaded, is what lets the daemon read
+    project/entity/notes/tags back by xid without re-parsing per-repo configs.
+
+    Returns {} when the config has no `wandb` block (a repo that has not
+    migrated yet), so the daemon simply falls back to its own defaults.
+    """
+    wb = getattr(cfg, 'wandb', None)
+    if wb is None:
+        return {}
+    out = {}
+    for key in ('project', 'entity', 'notes', 'run_name', 'tags'):
+        val = getattr(wb, key, None)
+        if val is None:
+            continue
+        if key == 'tags':
+            try:
+                val = list(val)
+            except TypeError:
+                continue
+        out[key] = val
+    return out
+
+
 def main(argv) -> None:
     # NORMALISE --config to the bare <mode>. The contract is a short mode name
     # (`remote_run`); load_config and the launcher then wrap it into
@@ -1771,6 +1802,11 @@ def main(argv) -> None:
             # "preempted, restart budget spent".
             "max_task_failures": _MAX_TASK_FAILURES.value,
             "max_task_evictions": _MAX_TASK_EVICTIONS.value,
+            # W&B identity for the OFFLINE upload daemon (unified config.wandb.*,
+            # 2026-09-14). The on-Borg job logs only to the datatable via a wandb
+            # mock; the daemon reads these fields back by xid to create the real
+            # run. Empty {} for a not-yet-migrated repo -> daemon uses fallbacks.
+            "wandb": _wandb_identity_from_cfg(cfg),
         }
     
         config_path_arg = f"configs/load_config.py:{_CONFIG.value}"
