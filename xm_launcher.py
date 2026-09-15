@@ -1777,7 +1777,11 @@ def main(argv) -> None:
                     merged = dict(existing)
                     for k, v in info.items():
                         # Overwrite empty / missing values; keep non-empty existing.
-                        if merged.get(k) in (None, "", 0) or k not in merged:
+                        # `{}` / `[]` count as empty too, so a pre-fix wandb={}
+                        # entry (or one another writer stubbed) is upgraded to a
+                        # real identity on a re-launch instead of being frozen
+                        # empty -- `{}` is not in the scalar-empty tuple below.
+                        if merged.get(k) in (None, "", 0, {}, []) or k not in merged:
                             merged[k] = v
                     data[key] = merged
                     f.seek(0)
