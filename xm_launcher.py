@@ -1199,6 +1199,47 @@ def _wandb_identity_from_cfg(cfg) -> dict:
     return out
 
 
+# Where a repo keeps the LIGHT declared-defaults config, relative to the launch
+# workdir. Only `ml_collections` is imported by these, so they load in the
+# launcher process even though the full `load_config.get_config()` cannot (it
+# pulls in the training stack -- jax / simple_diffusion / torch -- which is not
+# importable here). parcae keeps its package under torch_impl/.
+_DEFAULT_CONFIG_PATHS = (
+    'configs/default.py',
+    'torch_impl/configs/default.py',
+)
+
+
+def _load_default_wandb() -> dict:
+    """Best-effort W&B identity from the repo's LIGHT `default.py`, or {}.
+
+    The launcher's primary path, `load_config.get_config()`, imports the whole
+    training stack and therefore raises inside this launcher process, leaving
+    the registry's wandb block empty and the offline daemon with no identity to
+    upload under. Every migrated repo also exposes the same `config.wandb.*`
+    from a `default.py` whose only import is `ml_collections`, so load THAT
+    directly (by file path, not the `configs` package, to dodge a heavy
+    `configs/__init__.py`) and read the identity off it. Fail-soft: any error
+    yields {}, exactly as before.
+    """
+    import importlib.util  # local: only needed on this fallback path
+    for rel in _DEFAULT_CONFIG_PATHS:
+        path = os.path.join(os.getcwd(), rel)
+        if not os.path.exists(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location('_wandb_default', path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            cfg = module.get_config()
+        except Exception:  # noqa: BLE001 - best effort; {} is a safe answer
+            continue
+        identity = _wandb_identity_from_cfg(cfg)
+        if identity:
+            return identity
+    return {}
+
+
 def main(argv) -> None:
     # NORMALISE --config to the bare <mode>. The contract is a short mode name
     # (`remote_run`); load_config and the launcher then wrap it into
@@ -1223,16 +1264,25 @@ def main(argv) -> None:
     exp_name = _EXP_NAME.value
     # --- Auto-Load WandB name or fallbacks ---
     cfg = None
+    wandb_identity = {}
     try:
         from configs import load_config
         cfg = load_config.get_config(_CONFIG.value)
-        if getattr(cfg, 'wandb', None):
-            if getattr(cfg.wandb, 'notes', None):
-                exp_name = cfg.wandb.notes
-            elif getattr(cfg.wandb, 'run_name', None):
-                exp_name = cfg.wandb.run_name
+        wandb_identity = _wandb_identity_from_cfg(cfg)
     except Exception:
         pass
+    # PRIMARY PATH FAILS SILENTLY IN THIS PROCESS. get_config() imports the
+    # training stack (jax / simple_diffusion / torch), which is not importable
+    # in the launcher, so `cfg` is usually None here and the identity empty --
+    # which left every registry entry with wandb={} and the offline daemon with
+    # nothing to upload under. Fall back to the light `default.py`, which every
+    # migrated repo also carries and which imports only ml_collections.
+    if not wandb_identity:
+        wandb_identity = _load_default_wandb()
+    if wandb_identity.get('notes'):
+        exp_name = wandb_identity['notes']
+    elif wandb_identity.get('run_name'):
+        exp_name = wandb_identity['run_name']
     # ONCE, not per tpu_type: `--tpu_type=a,b` builds one executor per entry and
     # the answer is a property of the DATASET, so measuring inside that loop
     # would shell out to `fileutil du` once per candidate for one identical
