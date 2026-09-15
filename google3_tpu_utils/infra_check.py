@@ -535,8 +535,17 @@ def _read_log_tail(bucket: str, nbytes: int = 16384) -> str:
   """
   try:
     from etils import epath
-    logdir = epath.Path(bucket) / 'logs'
-    entries = [p for p in logdir.iterdir() if p.name.startswith('rank_')]
+    # Rank logs usually live in `<bucket>/logs/rank_*`, but HF-Trainer ports
+    # mirror them directly under `<bucket>/rank_*`. Try both, deepest first.
+    base = epath.Path(bucket)
+    entries = []
+    for d in (base / 'logs', base):
+      try:
+        entries = [p for p in d.iterdir() if p.name.startswith('rank_')]
+      except Exception:  # noqa: BLE001 - a missing dir is not fatal
+        entries = []
+      if entries:
+        break
     if not entries:
       return ''
 
@@ -1008,6 +1017,14 @@ _LOG_STEP_RE = re.compile(r'\bstep[ _=:]*(\d+)\b')
 # raft JSONL rows: `{"step": 72000, "steps_per_s": ...}` -- the quoted key
 # anchors on the real counter, never on `steps_per_s`/`num_steps`.
 _JSONL_STEP_RE = re.compile(r'"step"\s*:\s*(\d+)')
+# HuggingFace Trainer checkpoints: `<root>/ckpt/checkpoint-<N>/`, finalized by a
+# `trainer_state.json`. Torch-Trainer ports (qwen looped-vision) use this, not
+# the `checkpoints/step_<N>/` layout above.
+_HF_CKPT_RE = re.compile(r'^checkpoint-(\d+)$')
+# tqdm progress bar: ` 9%|x| 2805/30000 [1:17<11:56, 1.58s/it]`. HF Trainer /
+# torch loops emit no `step N` token, only this bar, so the current step is the
+# numerator. Anchored on `/<total> [` so it never matches a stray ratio.
+_TQDM_STEP_RE = re.compile(r'(\d+)/\d+\s*\[')
 
 
 def _step_from_checkpoints(root):
@@ -1082,6 +1099,38 @@ def _step_from_runs(root):
         return 0
 
 
+def _step_from_hf_checkpoints(root):
+    """Highest COMPLETE HuggingFace-Trainer checkpoint step, else 0.
+
+    HF Trainer writes `<root>/ckpt/checkpoint-<N>/` (not `checkpoints/step_<N>/`),
+    each finalized by a `trainer_state.json` that also carries `global_step`.
+    That marker is the completeness gate -- a dir still being written has no such
+    file -- the same rule `_step_from_checkpoints` applies to `extra.json`. This
+    is the layout the qwen looped-vision / torch-Trainer ports use. `checkpoints`
+    is also tried so an HF run that used the conventional dir name still counts.
+    """
+    try:
+        from etils import epath
+        for sub in ('ckpt', 'checkpoints'):
+            ckpt = epath.Path(root + '/' + sub)
+            try:
+                if not ckpt.is_dir():
+                    continue
+            except Exception:  # noqa: BLE001 - a missing dir is not fatal
+                continue
+            candidates = []
+            for child in ckpt.iterdir():
+                m = _HF_CKPT_RE.match(child.name)
+                if m:
+                    candidates.append((int(m.group(1)), child))
+            for step, child in sorted(candidates, reverse=True):
+                if (child / 'trainer_state.json').exists():
+                    return step
+        return 0
+    except Exception:  # pylint: disable=broad-except
+        return 0
+
+
 def _progress_step(tpu_info, log_tail=''):
     """Highest COMPLETE training step this job has reached, else 0.
 
@@ -1110,8 +1159,16 @@ def _progress_step(tpu_info, log_tail=''):
     if step:
         return step
 
+    step = _step_from_hf_checkpoints(root)
+    if step:
+        return step
+
     if log_tail:
         hits = _LOG_STEP_RE.findall(log_tail)
+        if hits:
+            return max(int(h) for h in hits)
+        # HF Trainer / torch loops: no `step N` token, only a tqdm bar.
+        hits = _TQDM_STEP_RE.findall(log_tail)
         if hits:
             return max(int(h) for h in hits)
 
