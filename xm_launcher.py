@@ -1856,7 +1856,12 @@ def main(argv) -> None:
             # 2026-09-14). The on-Borg job logs only to the datatable via a wandb
             # mock; the daemon reads these fields back by xid to create the real
             # run. Empty {} for a not-yet-migrated repo -> daemon uses fallbacks.
-            "wandb": _wandb_identity_from_cfg(cfg),
+            # run. Empty {} for a not-yet-migrated repo -> daemon uses fallbacks.
+            # Use the resolved `wandb_identity` (which falls back to the light
+            # default.py), NOT `_wandb_identity_from_cfg(cfg)` -- cfg is usually
+            # None here because get_config() imports the training stack and
+            # raises in this launcher process, which left the registry wandb={}.
+            "wandb": wandb_identity,
         }
     
         config_path_arg = f"configs/load_config.py:{_CONFIG.value}"
