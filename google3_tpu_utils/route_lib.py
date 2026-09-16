@@ -46,7 +46,88 @@ import enum
 import os
 import random
 import re
+import time
 from typing import Callable, Optional, Sequence
+
+
+# --------------------------------------------------------------------------
+# Local job identity (§5.1). job_id is an OPAQUE, generated primary key -- never
+# a human label. `mint_job_id` makes a time-ordered id whose random suffix
+# makes a collision astronomically unlikely even against the whole archive, so
+# "immutable + never-reused" is STRUCTURAL: no scan of the legacy/registry
+# files is needed (most of which key by XID and carry no job_id anyway), and it
+# does not clash with the intentional "re-used --job_name = clean-slate
+# snapshot" behavior, because a human re-uses the NAME and the id never repeats.
+# `resolve_job_refs` is the CLI inverse: a person types the readable name or a
+# git-style id SUFFIX, and we map it back to row(s), refusing an AMBIGUOUS
+# token rather than guessing which arm to act on.
+# --------------------------------------------------------------------------
+_JOB_ID_RE = re.compile(r'^\d{8}T\d{6}-[0-9a-f]{10}$')
+
+
+def mint_job_id(now: Optional[float] = None) -> str:
+  """A fresh opaque job_id: ``YYYYmmddTHHMMSS-<10 hex>`` (§5.1).
+
+  The time prefix makes ids sort by creation and stay greppable in logs; the
+  10 random hex digits (40 bits) make two ids minted in the SAME second still
+  not collide in practice (birthday bound ~1e-6 even at 1000 same-second
+  enqueues -- and realistically it is one). Because the id is NEVER derived
+  from `--job_name`, re-running a job under the same name later produces a
+  brand-new id: that is the whole point of the §5.1 split -- id immutability +
+  no reuse, with no history scan and no conflict with clean-slate-on-reuse.
+  """
+  t = time.time() if now is None else now
+  stamp = time.strftime('%Y%m%dT%H%M%S', time.localtime(t))
+  return f'{stamp}-{random.getrandbits(40):010x}'
+
+
+def resolve_job_refs(
+    entries: Sequence['QueueEntry'],
+    tokens,
+) -> tuple[set, list]:
+  """Map user-typed tokens to job_ids. Returns ``(matched_ids, errors)``.
+
+  A token resolves in priority tiers, exact-first so a real hit is never
+  overridden by an accidental suffix collision:
+
+    1. the full job_id, verbatim   (you pasted the whole id);
+    2. a row's readable `name`     (the common case: type the label);
+    3. a SUFFIX of the job_id      (git-style short id: paste the tail).
+
+  FAIL-CLOSED on ambiguity: a token that hits >1 row in its tier resolves to
+  NONE of them and produces an error naming the candidates, so `tpu dequeue` /
+  `cancel` never act on a guess -- the same discipline §5.4 uses for recovery.
+  `errors` also lists tokens that matched nothing. Pure: no I/O, no mutation.
+  """
+  by_id = {e.job_id: e for e in entries}
+  matched: set = set()
+  errors: list = []
+  for raw in tokens:
+    tok = (raw or '').strip()
+    if not tok:
+      continue
+    if tok in by_id:                                   # tier 1: exact id
+      matched.add(tok)
+      continue
+    named = [e.job_id for e in entries                 # tier 2: readable name
+             if (getattr(e, 'name', '') or '') == tok]
+    if len(named) == 1:
+      matched.add(named[0])
+      continue
+    if len(named) > 1:
+      errors.append(f'{tok!r} names {len(named)} rows {sorted(named)}; '
+                    f'use the id or a unique id suffix')
+      continue
+    suf = [jid for jid in by_id if jid.endswith(tok)]  # tier 3: id suffix
+    if len(suf) == 1:
+      matched.add(suf[0])
+      continue
+    if len(suf) > 1:
+      errors.append(f'{tok!r} is an ambiguous id suffix matching '
+                    f'{sorted(suf)}; type more characters')
+      continue
+    errors.append(f'{tok!r} matched no job (by id, name, or id suffix)')
+  return matched, errors
 
 
 # --------------------------------------------------------------------------
@@ -694,9 +775,24 @@ class QueueEntry:
   exp_name, ...) ride along in `launch_kwargs` untouched and are handed to
   `tpu queue` verbatim when the job is placed.
   """
-  job_id: str                       # local id, our own (NOT an XID)
+  job_id: str                       # local id, our own (NOT an XID). Since
+                                    # 2026-09-16 this is an OPAQUE, generated PK
+                                    # (mint_job_id: `YYYYmmddTHHMMSS-<10hex>`),
+                                    # never derived from a human label -- so it
+                                    # is unique across the queue AND history
+                                    # structurally, not by a scan (§5.1). The
+                                    # human name lives in `name`.
   power: str                        # 'v5p-32', 'v6e-16', or a bare int
   allowed_archs: list[str]          # ['v7', 'v6p'] -- families the job accepts
+  # ★HUMAN-READABLE LABEL (`tpu enqueue --job_name`), NOT an identity key. This
+  # is the handle a person reads in queue-status and TYPES to `tpu dequeue` /
+  # `cancel` / `requeue`; job_id is the opaque PK the router keys on. Splitting
+  # the two (they used to be the same string) is what lets job_id be a
+  # collision-proof hash while a run keeps its readable name -- and lets you
+  # re-run `parcae-140m-torch-fix` next week without the id ever repeating.
+  # Empty = a row enqueued before this split (from_dict leaves it '', and the
+  # display + ref-resolver both fall back to job_id, so old rows still work).
+  name: str = ''
   tier: str = 'PROD'                # PROD | BATCH
   allowed_metros: Optional[list[str]] = None   # None/[] = any metro
   priority: int = 0                 # router priority; higher first
@@ -1690,6 +1786,10 @@ def build_warm_restart_entry(dead: 'QueueEntry', checkpoint: str,
     prior.append(str(dead.xid))
   return QueueEntry(
       job_id=new_job_id,
+      # Carry the human label forward: a warm restart IS the same run, so it
+      # keeps its readable name. Only the opaque job_id is freshly minted (a new
+      # PK per §5.1), never the name -- so queue-status still shows what it is.
+      name=getattr(dead, 'name', '') or '',
       power=dead.power,
       allowed_archs=list(dead.allowed_archs),
       tier=dead.tier,

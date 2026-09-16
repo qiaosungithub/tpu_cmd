@@ -33,7 +33,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import uuid
 from typing import Callable, Optional, Protocol, Sequence
 
 from absl import app
@@ -1366,8 +1365,17 @@ class CnsRestartProbe:
 
 
 def _new_resume_job_id(power: str) -> str:
-  """A fresh local job_id for a warm-restart row, same shape as queue_cli's."""
-  return f'{power}-{uuid.uuid4().hex[:6]}'
+  """A fresh opaque local job_id for a warm-restart row (§5.1).
+
+  Delegates to route_lib.mint_job_id so the resume path mints the SAME
+  collision-proof `YYYYmmddTHHMMSS-<10hex>` id the enqueue path does -- not the
+  old `{power}-{uuid[:6]}` shape, whose 6 hex digits had a real birthday-bound
+  collision risk against the archive. `power` is no longer part of the id (it is
+  a scheduling attribute, not identity); it is kept as a parameter so the one
+  call site is untouched.
+  """
+  del power  # identity is opaque now; power lives on the row, not in the id
+  return route_lib.mint_job_id()
 
 
 def _find_newest_rank0_log(bucket: str, xid: str,

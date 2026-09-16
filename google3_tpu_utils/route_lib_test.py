@@ -1609,5 +1609,124 @@ class PartitionForArchiveTest(unittest.TestCase):
     self.assertEqual(R.entry_xids(e2), set())
 
 
+class MintJobIdTest(unittest.TestCase):
+  """The opaque job_id minter (§5.1): time-ordered prefix + random suffix, so
+  ids sort by creation, are greppable, and do not collide in practice -- which
+  is what makes "immutable + never-reused" structural rather than a history
+  scan."""
+
+  def test_shape_matches_the_documented_format(self):
+    jid = R.mint_job_id(now=1789500000.0)
+    self.assertRegex(jid, R._JOB_ID_RE)
+    self.assertRegex(jid, r'^\d{8}T\d{6}-[0-9a-f]{10}$')
+
+  def test_time_prefix_is_the_given_instant_and_sorts_by_creation(self):
+    early = R.mint_job_id(now=1789500000.0)
+    late = R.mint_job_id(now=1789600000.0)
+    # lexical sort == chronological, because the prefix is a zero-padded stamp
+    self.assertLess(early.split('-')[0], late.split('-')[0])
+
+  def test_suffix_is_random_across_mints_in_the_same_second(self):
+    # Same instant -> same prefix, but the 40-bit suffix must differ, or two
+    # jobs enqueued in one second would collide. Probability of a dup here is
+    # ~n^2/2^41; 200 draws is astronomically safe, so a hit means a real bug.
+    ids = {R.mint_job_id(now=1789500000.0) for _ in range(200)}
+    self.assertEqual(len(ids), 200)
+
+  def test_not_derived_from_any_name(self):
+    # The whole point of the split: the id carries no label, so re-running a
+    # job under the same --job_name later yields a brand-new id.
+    a = R.mint_job_id(now=1789500000.0)
+    b = R.mint_job_id(now=1789500000.0)
+    self.assertNotEqual(a, b)
+
+
+class ResolveJobRefsTest(unittest.TestCase):
+  """The CLI inverse of the opaque id: a person types a readable name, a full
+  id, or a git-style id SUFFIX, and we map it to row(s) -- refusing an
+  AMBIGUOUS token instead of guessing which arm to act on (§5.4 discipline)."""
+
+  def _rows(self):
+    return [
+        _entry(job_id='20260916T120000-aaaaaaaaaa', name='parcae-torch'),
+        _entry(job_id='20260916T130000-bbbbbbbbbb', name='parcae-jax'),
+        _entry(job_id='20260916T140000-abcabcabca', name='eqr-run'),
+    ]
+
+  def test_exact_id_wins(self):
+    rows = self._rows()
+    matched, errs = R.resolve_job_refs(rows, ['20260916T120000-aaaaaaaaaa'])
+    self.assertEqual(matched, {'20260916T120000-aaaaaaaaaa'})
+    self.assertEqual(errs, [])
+
+  def test_readable_name_resolves(self):
+    rows = self._rows()
+    matched, errs = R.resolve_job_refs(rows, ['eqr-run'])
+    self.assertEqual(matched, {'20260916T140000-abcabcabca'})
+    self.assertEqual(errs, [])
+
+  def test_unique_id_suffix_resolves_git_style(self):
+    rows = self._rows()
+    matched, errs = R.resolve_job_refs(rows, ['aaaaaaaaaa'])
+    self.assertEqual(matched, {'20260916T120000-aaaaaaaaaa'})
+    self.assertEqual(errs, [])
+
+  def test_ambiguous_suffix_fails_closed(self):
+    # Two ids ending in the same short tail: resolve NEITHER, and say so. The
+    # failure direction that matters -- never dequeue/cancel a guessed arm.
+    rows = [
+        _entry(job_id='20260916T120000-0000000abc', name='one'),
+        _entry(job_id='20260916T130000-1111111abc', name='two'),
+    ]
+    matched, errs = R.resolve_job_refs(rows, ['abc'])
+    self.assertEqual(matched, set())
+    self.assertEqual(len(errs), 1)
+    self.assertIn('ambiguous', errs[0])
+
+  def test_duplicate_name_across_two_rows_fails_closed(self):
+    # Should not happen for LIVE rows (enqueue enforces name-uniqueness), but if
+    # it ever does, a name that hits >1 row resolves to none, not a guess.
+    rows = [
+        _entry(job_id='20260916T120000-aaaaaaaaaa', name='dup'),
+        _entry(job_id='20260916T130000-bbbbbbbbbb', name='dup'),
+    ]
+    matched, errs = R.resolve_job_refs(rows, ['dup'])
+    self.assertEqual(matched, set())
+    self.assertEqual(len(errs), 1)
+    self.assertIn('names 2 rows', errs[0])
+
+  def test_unknown_token_is_reported_not_silently_dropped(self):
+    rows = self._rows()
+    matched, errs = R.resolve_job_refs(rows, ['nope'])
+    self.assertEqual(matched, set())
+    self.assertEqual(len(errs), 1)
+    self.assertIn('matched no job', errs[0])
+
+  def test_name_beats_suffix_when_both_could_match(self):
+    # A token that is BOTH a row's exact name and another row's id suffix must
+    # resolve by name (tier 2 before tier 3), deterministically.
+    rows = [
+        _entry(job_id='20260916T120000-000000eqr0', name='other'),
+        _entry(job_id='20260916T130000-bbbbbbbbbb', name='eqr0'),
+    ]
+    matched, errs = R.resolve_job_refs(rows, ['eqr0'])
+    self.assertEqual(matched, {'20260916T130000-bbbbbbbbbb'})
+    self.assertEqual(errs, [])
+
+  def test_mixed_batch_good_and_bad_tokens(self):
+    rows = self._rows()
+    matched, errs = R.resolve_job_refs(rows, ['parcae-torch', 'nope', 'eqr-run'])
+    self.assertEqual(
+        matched,
+        {'20260916T120000-aaaaaaaaaa', '20260916T140000-abcabcabca'})
+    self.assertEqual(len(errs), 1)  # only 'nope'
+
+  def test_empty_and_whitespace_tokens_are_skipped(self):
+    rows = self._rows()
+    matched, errs = R.resolve_job_refs(rows, ['', '  ', 'eqr-run'])
+    self.assertEqual(matched, {'20260916T140000-abcabcabca'})
+    self.assertEqual(errs, [])
+
+
 if __name__ == '__main__':
   unittest.main()
