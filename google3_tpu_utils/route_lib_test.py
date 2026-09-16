@@ -633,6 +633,85 @@ class SerdeTest(unittest.TestCase):
     self.assertIsNone(R.QueueEntry.from_dict(d).last_build_duration)
 
 
+class SubmissionsViewTest(unittest.TestCase):
+  """Phase 1 of the local-job-identity redesign: `submissions` is a DERIVED view
+  over the still-authoritative xid/prior_xids, so this whole class asserts two
+  things at once -- the v1->v2 migration is correct, AND it is a no-op on data
+  (xid/prior_xids stay the source of truth; only serialization gains a key)."""
+
+  def test_migration_from_prior_xids_and_current(self):
+    # A row re-routed once: prior_xids=[old] + current xid. The migration must
+    # yield oldest-first submissions, the old one SUPERSEDED, the current one
+    # carrying the row's live state + cell/arch/chips/group. This is the exact
+    # shape the attnfilm incident needed and did not have.
+    e = _entry(xid='289723858', prior_xids=['289686907'])
+    e.state = R.JobState.RUNNING
+    e.cell, e.arch, e.chips, e.group = 'sj', 'v6e', 32, '9'
+    e.submitted_at = 1789500000.0
+    subs = e.submissions
+    self.assertEqual([s.seq for s in subs], [1, 2])
+    self.assertEqual([s.xid for s in subs], ['289686907', '289723858'])
+    self.assertEqual(subs[0].state, 'SUPERSEDED')
+    self.assertEqual(subs[1].state, 'RUNNING')
+    self.assertEqual((subs[1].cell, subs[1].arch, subs[1].chips, subs[1].group),
+                     ('sj', 'v6e', 32, '9'))
+
+  def test_derived_helpers(self):
+    e = _entry(xid='3', prior_xids=['1', '2'])
+    e.state = R.JobState.SUBMITTED
+    self.assertEqual(e.all_xids, ['1', '2', '3'])       # oldest first, incl. current
+    self.assertIsNotNone(e.current_submission)
+    self.assertEqual(e.current_submission.xid, '3')     # newest = the one xid points at
+
+  def test_unplaced_row_has_no_submissions(self):
+    e = _entry()                                        # QUEUED, xid=None
+    self.assertEqual(e.submissions, [])
+    self.assertIsNone(e.current_submission)
+    self.assertEqual(e.all_xids, [])
+
+  def test_held_with_attempts_but_no_xid_has_no_submissions(self):
+    # The incident's false reason was "never produced an XID"; a row that truly
+    # never produced one has an EMPTY submissions list -- a computed HELD reason
+    # can trust that, where the hardcoded string could not.
+    e = _entry(attempts=3)
+    e.state = R.JobState.HELD
+    self.assertEqual(e.submissions, [])
+
+  def test_mid_reroute_current_xid_none_keeps_history(self):
+    # mark_reroute pushes the live xid into prior_xids and sets xid=None. The
+    # history must survive: all_xids still lists every id, none orphaned.
+    e = _entry(xid=None, prior_xids=['1', '2', '3'])
+    self.assertEqual(e.all_xids, ['1', '2', '3'])
+
+  def test_to_dict_publishes_submissions_and_is_deterministic(self):
+    # to_dict feeds merge_and_save_touched's baseline-equality check, so equal
+    # inputs MUST serialize equal -- a nondeterministic submissions view would
+    # make every tick look like a concurrent conflict.
+    e = _entry(xid='9', prior_xids=['7', '8'])
+    e.state = R.JobState.SUBMITTED
+    d = e.to_dict()
+    self.assertIn('submissions', d)
+    self.assertEqual([s['xid'] for s in d['submissions']], ['7', '8', '9'])
+    self.assertEqual(e.to_dict(), e.to_dict())          # deterministic
+
+  def test_v1_read_compat_submissions_key_is_derived_not_stored(self):
+    # A v2 file loaded by from_dict must ignore the serialized `submissions`
+    # (it is a projection) and rebuild it from the authoritative xid/prior_xids,
+    # so an OLD binary that never wrote the key and a NEW one round-trip to the
+    # SAME bytes. Also proves from_dict tolerates the extra key without error.
+    e = _entry(xid='2', prior_xids=['1'])
+    e.state = R.JobState.RUNNING
+    d = e.to_dict()
+    e2 = R.QueueEntry.from_dict(d)                       # loads a v2 dict
+    self.assertEqual(e2.xid, '2')
+    self.assertEqual(e2.prior_xids, ['1'])
+    self.assertEqual(e2.to_dict()['submissions'], d['submissions'])
+    d_v1 = dict(d)
+    del d_v1['submissions']                             # simulate a v1 row
+    e3 = R.QueueEntry.from_dict(d_v1)                    # must load fine
+    self.assertEqual(e3.all_xids, ['1', '2'])           # and re-derive the view
+
+
 
 class TopologyLockTest(unittest.TestCase):
 

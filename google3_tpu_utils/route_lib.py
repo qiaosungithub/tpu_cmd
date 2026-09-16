@@ -590,6 +590,106 @@ RECONCILABLE_STATES = frozenset(
 FINISHED_STATES = frozenset({JobState.DONE, JobState.FAILED})
 
 
+# ★One XManager experiment the router created for one job. A job owns an ORDERED
+# list of these (oldest first; see QueueEntry.submissions). This is the unit the
+# identity redesign is built on: instead of a scalar `xid` overwritten on every
+# re-route -- with a parallel `prior_xids` that one code path forgot to keep in
+# sync, which is exactly the 2026-09-15 attnfilm incident (a still-RUNNING first
+# experiment lost while the row claimed "never produced an XID") -- each
+# placement appends a record that keeps its OWN xid + cell/arch/chips/group +
+# timestamps, so no XID can be silently orphaned.
+#
+# ROLLOUT NOTE (schema v2, phase 1): the list is a DERIVED VIEW over the still-
+# authoritative xid/prior_xids (see derive_submissions), so it can never drift
+# from them the way an independently-stored copy could, and an older daemon that
+# only knows xid/prior_xids keeps working against the same file. A later phase
+# inverts this (submissions becomes the stored source of truth, xid derived).
+@dataclasses.dataclass
+class Submission:
+  seq: int                      # 1,2,3,... within this job_id; monotonic, oldest first
+  xid: Optional[str] = None     # captured EARLY at creation; refined on launch
+  state: str = 'CREATING'       # CREATING->SUBMITTED->RUNNING->{DONE,FAILED,CANCELLED,SUPERSEDED}
+  cell: Optional[str] = None
+  arch: Optional[str] = None
+  chips: Optional[int] = None
+  group: Optional[str] = None
+  created_at: Optional[float] = None    # epoch the experiment was created (early)
+  confirmed_at: Optional[float] = None  # epoch the launch line was seen (late)
+  ended_reason: str = ''
+
+  def to_dict(self) -> dict:
+    return dataclasses.asdict(self)
+
+  @classmethod
+  def from_dict(cls, d: dict) -> 'Submission':
+    known = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{k: v for k, v in d.items() if k in known})
+
+
+# Submission.state buckets. CREATING/SUBMITTED/RUNNING are live; the rest terminal.
+SUBMISSION_LIVE_STATES = frozenset({'CREATING', 'SUBMITTED', 'RUNNING'})
+SUBMISSION_TERMINAL_STATES = frozenset(
+    {'DONE', 'FAILED', 'CANCELLED', 'SUPERSEDED'})
+
+# ★Queue-file schema version, stamped into the payload by save_queue.
+#   v1: rows carry scalar xid + prior_xids (no `submissions` key).
+#   v2: rows ALSO carry a derived `submissions` list (§5.2/§5.6). xid/prior_xids
+#       remain present and authoritative in phase 1, so a v1-only daemon reading
+#       a v2 file (from_dict drops the key it does not know) and a v2 daemon
+#       reading a v1 file (derive_submissions rebuilds the list) both work --
+#       the migration is a no-op on data, only additive on serialization. Bump
+#       this only when a field's MEANING changes such that an old binary would
+#       mis-read it (not the case for v2).
+QUEUE_SCHEMA_VERSION = 2
+
+
+def _row_state_to_submission_state(row_state: 'JobState') -> str:
+  """State of a row's CURRENT (newest) submission, inferred from the row state.
+
+  Only meaningful for a row that actually holds an `xid`. A row mid-re-route
+  usually has xid=None (mark_reroute pushed the old id into prior_xids), so this
+  is asked mostly of SUBMITTED/RUNNING/DONE/FAILED rows; anything else that
+  still carries an xid was at least handed to XM, so it reads as SUBMITTED.
+  """
+  return {
+      JobState.SUBMITTED: 'SUBMITTED',
+      JobState.RUNNING: 'RUNNING',
+      JobState.DONE: 'DONE',
+      JobState.FAILED: 'FAILED',
+  }.get(row_state, 'SUBMITTED')
+
+
+def derive_submissions(entry: 'QueueEntry') -> list['Submission']:
+  """Build the submissions VIEW for a row from its authoritative xid/prior_xids.
+
+  This IS the v1->v2 migration (§5.6) written as a pure function: every id in
+  `prior_xids` becomes a SUPERSEDED submission (oldest first), and the current
+  `xid`, if any, becomes the newest submission -- its state taken from the row,
+  its cell/arch/chips/group/timestamps copied across (these are smeared onto the
+  single xid today and lost on re-route; here at least the current one keeps
+  them). Pure, deterministic, no I/O -- so QueueEntry.to_dict() stays byte-stable
+  for the baseline-equality check in merge_and_save_touched. Empty/None ids drop.
+  """
+  subs: list['Submission'] = []
+  seq = 0
+  for x in (getattr(entry, 'prior_xids', None) or []):
+    if not x:
+      continue
+    seq += 1
+    subs.append(Submission(seq=seq, xid=str(x), state='SUPERSEDED'))
+  cur = getattr(entry, 'xid', None)
+  if cur:
+    seq += 1
+    subs.append(Submission(
+        seq=seq, xid=str(cur),
+        state=_row_state_to_submission_state(entry.state),
+        cell=getattr(entry, 'cell', None), arch=getattr(entry, 'arch', None),
+        chips=getattr(entry, 'chips', None), group=getattr(entry, 'group', None),
+        created_at=getattr(entry, 'submitted_at', None),
+        confirmed_at=getattr(entry, 'submitted_at', None)))
+  return subs
+
+
 @dataclasses.dataclass
 class QueueEntry:
   """One desired run in the local queue.
@@ -748,9 +848,36 @@ class QueueEntry:
   # because the budget is meaningless if it resets whenever the process does.
   auto_resumes: int = 0
 
+  @property
+  def submissions(self) -> list['Submission']:
+    """Ordered (oldest-first) view of every experiment this row has ever had.
+
+    DERIVED (phase 1) from the authoritative xid/prior_xids via
+    derive_submissions -- not an independently mutable field, so it cannot drift
+    from xid/prior_xids the way a stored copy could. A later phase inverts this.
+    """
+    return derive_submissions(self)
+
+  @property
+  def current_submission(self) -> Optional['Submission']:
+    """The newest submission (the one `xid` points at), or None if never placed."""
+    subs = self.submissions
+    return subs[-1] if subs else None
+
+  @property
+  def all_xids(self) -> list[str]:
+    """Every XID this row has held, oldest first -- current plus history."""
+    return [s.xid for s in self.submissions if s.xid]
+
   def to_dict(self) -> dict:
     d = dataclasses.asdict(self)
     d['state'] = self.state.value
+    # ★schema v2: publish the submissions VIEW so external readers (tpu check,
+    # audits) and a newer binary can join job_id<->xid without re-deriving, and
+    # so the file upgrades in place on the next save. Derived + deterministic,
+    # so this does NOT perturb the baseline-equality check in
+    # merge_and_save_touched (same fields in => same submissions out).
+    d['submissions'] = [s.to_dict() for s in self.submissions]
     return d
 
   @classmethod

@@ -334,6 +334,7 @@ def save_queue(path: str, entries: list[route_lib.QueueEntry]) -> None:
   """Write the queue atomically: temp file + flock + rename."""
   tmp = f'{path}.tmp.{os.getpid()}'
   payload = {'entries': [e.to_dict() for e in entries],
+             'schema_version': route_lib.QUEUE_SCHEMA_VERSION,
              'updated': time.time()}
   with open(tmp, 'w') as f:
     fcntl.flock(f, fcntl.LOCK_EX)
