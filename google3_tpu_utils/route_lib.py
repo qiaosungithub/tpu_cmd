@@ -861,14 +861,10 @@ class QueueEntry:
                                     # a healthy job to another cell, not the job
                                     # failing to build (infra-v17).
   reroutes: int = 0                 # how many times the router moved this job
-  # ★SET BY reclaim_stale_building, CLEARED BY route_check.adopt_escaped_builds.
-  # Non-None means: this row's BUILDING claim went stale, so the build MIGHT have
-  # succeeded and left a live experiment behind under this name. Until the
-  # reconcile pass has looked that name up on XManager, the row is NOT claimable
-  # -- re-dispatching it would put a second writer on the first one's output
-  # path. Holding a row out of the build queue for one reconcile pass is cheap;
-  # two jobs writing one checkpoint path is silent and unrecoverable.
-  adopt_check_name: Optional[str] = None
+  # (adopt_check_name removed 2026-09-16: early binding (§5.4) persists the XID
+  # before the build returns, so reclaim_stale_building reads the row's current
+  # submission to tell an escaped build from a crashed one -- no out-of-band
+  # exp_name lookup, no claimability gate needed. See reclaim_stale_building.)
   # ★Which alloc group the ROUTER admitted this job under (operator 00:05Z:
   # "我反复要求过优先用 G5 / G3"). The dispatch and build stages are separate
   # processes, so the group chosen while checking budget must be carried ON THE
@@ -2519,56 +2515,90 @@ def building_is_stale(entry: QueueEntry, now: float, stale_after_s: float) -> bo
 
 def reclaim_stale_building(entries: list['QueueEntry'], now: float,
                            stale_after_s: float) -> list['QueueEntry']:
-  """Reset any stale BUILDING entry back to QUEUED (worker crashed mid-build).
-  Returns the list of entries reclaimed. Frees the single-build slot.
+  """Resolve any stale BUILDING entry (the worker died mid-build). Returns the
+  list of entries touched. Frees the single-build slot.
 
-  ★A stale claim does NOT prove the build failed. The other reading is that
-  the build SUCCEEDED, the experiment is running on XManager, and only the
-  write-back of the xid was lost -- observed 2026-09-02 on
-  elt-dit-50k-fid-v3b, whose row was reclaimed to QUEUED while xid 285706173
-  was RUNNING. Re-dispatching such a row puts a SECOND writer on the first
-  one's output path, which is silent and destroys both.
+  ★A stale claim does NOT prove the build failed. The other reading is that the
+  build SUCCEEDED, the experiment is running on XManager, and the worker died
+  before writing the xid back. Re-dispatching such a row puts a SECOND writer on
+  the first one's output path, which is silent and destroys both (observed
+  2026-09-02 on elt-dit-50k-fid-v3b, reclaimed to QUEUED while xid 285706173
+  was RUNNING).
 
-  This function cannot resolve that ambiguity itself: it runs inside the queue
-  flock, and an XManager RPC there would block every reader for the length of
-  a network call. So it records the suspicion instead -- `adopt_check_name`
-  carries the experiment name the reconcile pass must look up BEFORE the row
-  is allowed to build again. `route_check.adopt_escaped_builds` (outside the
-  lock) does the lookup and either adopts the live xid or clears the flag.
+  ★Early binding (§5.4) resolves that ambiguity WITHOUT a network call, so this
+  no longer needs the old `adopt_check_name` handshake. The worker persists a
+  CREATING submission carrying the XID the INSTANT the experiment is created --
+  before the multi-minute build returns -- so the row itself now says which case
+  we are in:
+
+    * current submission has a live XID  ->  the build escaped / is bound.
+      Do NOT requeue (that is the double-write). Move the row to SUBMITTED,
+      backfilling cell/arch/chips from the submission, and let reconcile verify
+      it against XManager truth. attempts is NOT bumped -- recovering a lost
+      binding is not a build failure (§5.5; the `attempts += 1` on this path is
+      part of what pushed the attnfilm row into HELD).
+
+    * no live XID bound  ->  the worker died before creating anything, so
+      nothing escaped. Requeue to QUEUED and bump attempts (a build slot was
+      consumed and produced nothing; the 3-strikes brake must still catch a job
+      that wedges the worker every time).
+
+  This is the whole replacement for adopt_check_name / adopt_escaped_builds:
+  with the XID persisted before the build, there is nothing to look up by
+  exp_name, and the double-write is prevented by reading the row, not by parking
+  it for an out-of-band lookup.
   """
-  reclaimed = []
+  touched = []
   for e in entries:
-    if building_is_stale(e, now, stale_after_s):
+    if not building_is_stale(e, now, stale_after_s):
+      continue
+    cur = e.current_submission
+    if cur is not None and cur.xid and cur.state in SUBMISSION_LIVE_STATES:
+      # The build created an experiment (early-bound). Trust the persisted XID;
+      # do not rebuild. Hand the row to reconcile as SUBMITTED to verify it.
+      e.state = JobState.SUBMITTED
+      e.build_started_at = None
+      e.worker_id = None
+      e.submitted_at = e.submitted_at or now
+      # ★BACKFILL THE PLACEMENT onto the ROW. open_creating recorded cell/arch/
+      # chips on the SUBMISSION, but apply_placement (the only writer of
+      # e.cell/arch/chips) never ran because the worker died. A row left
+      # cell=None wedges the liveness probes (has_running_vmgroup and
+      # _bucket_for_entry both go blind -- the exact defect that stuck xid
+      # 288485310 for 16h). The submission holds the resolved placement, so
+      # copy it across; never guess.
+      if e.cell is None and cur.cell is not None:
+        e.cell = cur.cell
+      if e.arch is None and cur.arch is not None:
+        e.arch = cur.arch
+      if e.chips is None and cur.chips is not None:
+        e.chips = cur.chips
+      e.last_reason = (
+          f'reclaimed: BUILDING claim went stale (>{int(stale_after_s)}s), but '
+          f'the build had already created xid={cur.xid} (early-bound before the '
+          f'build returned); NOT re-dispatching -- that would double-write its '
+          f'output path. Handed to reconcile to verify against XManager.')
+      touched.append(e)
+    else:
+      # No experiment was bound before the worker died -- nothing escaped, safe
+      # to rebuild.
       e.state = JobState.QUEUED
       e.build_started_at = None
       e.worker_id = None
       e.attempts += 1
-      # The name to look up. launch_kwargs is where `tpu queue` gets --exp_name,
-      # so it is the same string the experiment was created under.
-      e.adopt_check_name = (e.launch_kwargs or {}).get('exp_name') or None
-      if e.adopt_check_name:
-        e.last_reason = (
-            f'reclaimed: BUILDING claim went stale (>{int(stale_after_s)}s); '
-            f'HOLDING for adopt-check on {e.adopt_check_name} -- the build may '
-            f'have escaped to XManager and re-dispatching would double-write')
-      else:
-        e.last_reason = (
-            f'reclaimed: BUILDING claim went stale (>{int(stale_after_s)}s); '
-            f'no exp_name to adopt-check with, so an escaped build cannot be '
-            f'ruled out')
-      reclaimed.append(e)
-  return reclaimed
+      e.last_reason = (
+          f'reclaimed: BUILDING claim went stale (>{int(stale_after_s)}s) with '
+          f'no experiment bound (worker died before create); requeued to build '
+          f'again (attempt {e.attempts}).')
+      touched.append(e)
+  return touched
 
 
 def next_queued(entries: list['QueueEntry']) -> Optional['QueueEntry']:
   """The next QUEUED entry to build, highest priority first then FIFO-ish by
   list order. Returns None if nothing is queued. Does NOT consider whether a
   build is already in flight -- the caller enforces the single-build invariant."""
-  # A row awaiting its adopt-check is deliberately invisible here: see
-  # QueueEntry.adopt_check_name. This is the gate that actually prevents the
-  # double-write; the flag alone would only be a comment.
-  queued = [e for e in entries
-            if e.state == JobState.QUEUED and not e.adopt_check_name]
+  queued = [e for e in entries if e.state == JobState.QUEUED]
   if not queued:
     return None
   # highest priority wins; ties keep insertion order (stable sort)
@@ -2683,8 +2713,7 @@ def next_build_requested(entries: list['QueueEntry']) -> Optional['QueueEntry']:
   priority first then insertion order (mirrors next_queued). Returns None if the
   builder has drained this round. Does NOT enforce the single-build invariant --
   the caller checks can_claim_build first."""
-  reqd = [e for e in entries
-          if e.state == JobState.BUILD_REQUESTED and not e.adopt_check_name]
+  reqd = [e for e in entries if e.state == JobState.BUILD_REQUESTED]
   if not reqd:
     return None
   return max(reqd, key=lambda e: e.priority) if len(reqd) > 1 else reqd[0]

@@ -112,118 +112,13 @@ class _FakePlacementProbe:
     return self._by_xid.get(xid)
 
 
-class AdoptEscapedBuildTest(unittest.TestCase):
-  """A stale BUILDING claim has two readings and the old code saw only one.
-
-  Obvious: the worker died mid-build, so requeue. Expensive: the build
-  SUCCEEDED, the experiment is live, and only the xid write-back was lost --
-  then requeuing puts a SECOND writer on the first one's output path.
-  Observed 2026-09-02 (elt-dit-50k-fid-v3b reclaimed to QUEUED while xid
-  285706173 ran). These tests pin the three-way resolution.
-  """
-
-  def _stale_building(self, jid='j', exp_name='my_exp'):
-    e = R.QueueEntry(job_id=jid, power='v6p-32', allowed_archs=['v6p'],
-                             launch_kwargs={'exp_name': exp_name} if exp_name else {})
-    e.state = R.JobState.BUILDING
-    e.build_started_at = 1000.0
-    R.reclaim_stale_building([e], now=1000.0 + 3600, stale_after_s=1800.0)
-    return e
-
-  def test_reclaim_parks_the_row_for_an_adopt_check(self):
-    e = self._stale_building()
-    self.assertEqual(e.state, R.JobState.QUEUED)
-    self.assertEqual(e.adopt_check_name, 'my_exp')
-
-  def test_parked_row_is_not_claimable(self):
-    """★The gate. Without this the flag would be a comment, not a safeguard."""
-    e = self._stale_building()
-    self.assertIsNone(R.next_queued([e]))
-    e.state = R.JobState.BUILD_REQUESTED
-    self.assertIsNone(R.next_build_requested([e]))
-
-  def test_a_clean_row_is_still_claimable_alongside_a_parked_one(self):
-    """Negative control: the gate must not wedge the whole queue."""
-    parked = self._stale_building('parked')
-    clean = R.QueueEntry(job_id='clean', power='v6p-32',
-                                 allowed_archs=['v6p'])
-    self.assertIs(R.next_queued([parked, clean]), clean)
-
-  def test_live_experiment_is_adopted_not_rebuilt(self):
-    e = self._stale_building()
-    sub = _FakeSubmitter(name_lookup=('285706173', 'XM lookup matched 1 experiment(s)'))
-    RC.adopt_escaped_builds([e], submitter=sub, dry_run=False)
-    self.assertEqual(e.xid, '285706173')
-    self.assertEqual(e.state, R.JobState.SUBMITTED)
-    self.assertIsNone(e.adopt_check_name)
-
-  def test_lookup_ran_and_found_nothing_releases_the_row(self):
-    e = self._stale_building()
-    sub = _FakeSubmitter(name_lookup=(None, 'XM lookup ran and found no exact-name match'))
-    RC.adopt_escaped_builds([e], submitter=sub, dry_run=False)
-    self.assertIsNone(e.adopt_check_name)
-    self.assertIs(R.next_queued([e]), e)
-
-  def test_lookup_that_could_not_run_keeps_the_row_parked(self):
-    """★'I could not see it' must not read as 'it is not there'. If this ever
-    inverts, the double-write returns through the failure path."""
-    e = self._stale_building()
-    sub = _FakeSubmitter(name_lookup=(None, 'XM lookup itself timed out; remote state UNKNOWN'))
-    RC.adopt_escaped_builds([e], submitter=sub, dry_run=False)
-    self.assertEqual(e.adopt_check_name, 'my_exp')
-    self.assertIsNone(R.next_queued([e]))
-
-  def test_dry_run_mutates_nothing(self):
-    e = self._stale_building()
-    sub = _FakeSubmitter(name_lookup=('999', 'XM lookup matched 1 experiment(s)'))
-    RC.adopt_escaped_builds([e], submitter=sub, dry_run=True)
-    self.assertIsNone(e.xid)
-    self.assertEqual(e.adopt_check_name, 'my_exp')
-
-  def test_a_healthy_build_is_untouched(self):
-    e = R.QueueEntry(job_id='fresh', power='v6p-32', allowed_archs=['v6p'])
-    e.state = R.JobState.BUILDING
-    e.build_started_at = 1000.0
-    self.assertEqual(R.reclaim_stale_building([e], 1060.0, 1800.0), [])
-    self.assertEqual(e.state, R.JobState.BUILDING)
-
-  def test_no_exp_name_cannot_be_adopt_checked(self):
-    e = self._stale_building(exp_name=None)
-    self.assertIsNone(e.adopt_check_name)
-    self.assertIn('cannot be ruled out', e.last_reason)
-
-  def test_adoption_backfills_placement_from_xm(self):
-    # ★THE ROOT CAUSE OF xid 288485310's 16h wedge. Adoption sets the xid but
-    # NOT cell/arch/chips (apply_placement never ran), leaving a row both
-    # liveness probes are blind to. The placement_probe recovers the landing
-    # from XM's launch_args, so the adopted row is verifiable from the start.
-    e = self._stale_building()
-    sub = _FakeSubmitter(name_lookup=('285706173', 'XM lookup matched 1 experiment(s)'))
-    pp = _FakePlacementProbe({'285706173': ('sj', 'b200', 8)})
-    RC.adopt_escaped_builds([e], submitter=sub, dry_run=False, placement_probe=pp)
-    self.assertEqual(e.xid, '285706173')
-    self.assertEqual((e.cell, e.arch, e.chips), ('sj', 'b200', 8))
-    self.assertIn('from XM', e.last_reason)
-
-  def test_adoption_without_probe_leaves_placement_none(self):
-    # Backward-compatible: no probe supplied -> old behaviour (xid only). The
-    # reroute-side recovery is the second line of defence for this row.
-    e = self._stale_building()
-    sub = _FakeSubmitter(name_lookup=('285706173', 'XM lookup matched 1 experiment(s)'))
-    RC.adopt_escaped_builds([e], submitter=sub, dry_run=False)
-    self.assertEqual(e.xid, '285706173')
-    self.assertIsNone(e.cell)
-
-  def test_adoption_probe_none_does_not_crash(self):
-    # A probe that cannot read the placement (returns None) must not raise and
-    # must not fabricate a cell.
-    e = self._stale_building()
-    sub = _FakeSubmitter(name_lookup=('285706173', 'XM lookup matched 1 experiment(s)'))
-    pp = _FakePlacementProbe({})   # knows nothing
-    RC.adopt_escaped_builds([e], submitter=sub, dry_run=False, placement_probe=pp)
-    self.assertEqual(e.xid, '285706173')
-    self.assertIsNone(e.cell)
-
+# (AdoptEscapedBuildTest removed 2026-09-16 with the adopt_check_name /
+# adopt_escaped_builds machinery it exercised. The stale-BUILDING resolution it
+# used to cover now lives in route_lib.reclaim_stale_building -- reading each
+# row's early-bound submission to tell an escaped build from a crashed one --
+# and is tested by route_lib_test.ReclaimEarlyBoundTest. The last-resort
+# name lookup for a submit that timed out before the early XID line is still
+# tested by SubmitTimeoutRecoveryTest below.)
 
 class QueuePersistenceTest(unittest.TestCase):
 

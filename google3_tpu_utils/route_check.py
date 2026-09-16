@@ -72,9 +72,14 @@ class _Submitter(Protocol):
                        timeout_s: float = 120.0) -> tuple[Optional[str], str]:
     """Newest XID whose experiment name matches EXACTLY, or (None, why).
 
-    Part of the protocol because adopt_escaped_builds depends on it, and on the
-    WORDING of its second element: a caller must be able to tell 'the lookup ran
-    and saw nothing' (safe to rebuild) from 'the lookup could not run' (must not
+    Diagnostic-only recovery helper (§5.4). Since early binding, the routine
+    recovery paths key off the row's own submissions, not this lookup; the ONE
+    remaining caller is `_recover_timed_out_xid`, the last-resort probe after a
+    submit TIMES OUT before the early `Experiment id:` line was captured. It is
+    fail-closed for identity (route_check.find_xid_by_name adopts a UNIQUE match
+    and returns None on ambiguity -- never 'newest of N'), and callers depend on
+    the WORDING of its second element: 'the lookup ran and saw nothing' (safe to
+    rebuild) must be distinguishable from 'the lookup could not run' (must not
     rebuild -- the experiment may be there and unseen).
     """
     ...
@@ -1637,97 +1642,6 @@ def run_reconcile(
   return entries, log
 
 
-def adopt_escaped_builds(
-    entries: list[route_lib.QueueEntry],
-    submitter: '_Submitter',
-    dry_run: bool = True,
-    placement_probe: 'Optional[_PlacementProbe]' = None,
-) -> tuple[list[route_lib.QueueEntry], list[str]]:
-  """Resolve rows whose BUILDING claim went stale: adopt the experiment the
-  build may have left behind, or clear the flag so the row can build again.
-
-  WHY THIS EXISTS. A stale BUILDING claim has two readings, and the expensive
-  one is not the obvious one. Obvious: the worker crashed mid-build, so requeue.
-  Expensive: the build SUCCEEDED and the experiment is RUNNING, and only the
-  write-back of its xid was lost -- then requeuing puts a SECOND writer on the
-  first one's output path. Observed 2026-09-02: elt-dit-50k-fid-v3b was
-  reclaimed to QUEUED while xid 285706173 ran; it was adopted by hand.
-
-  reclaim_stale_building cannot make this call itself -- it runs inside the
-  queue flock, where a network RPC would block every reader -- so it parks the
-  row with `adopt_check_name` set and route_lib's claim selectors refuse to
-  build it. This pass, outside the lock, is what unparks it.
-
-  ★Only an EXACT name match adopts, and only a lookup that actually RAN
-  clears the flag. A lookup that timed out leaves the row parked: "I could not
-  see it" must not read as "it is not there", or the double-write we are
-  preventing comes back through the failure path.
-  """
-  log: list[str] = []
-  parked = [e for e in entries if e.adopt_check_name]
-  if not parked:
-    return entries, log
-  n_adopted = n_cleared = n_still_unknown = 0
-  for e in parked:
-    name = e.adopt_check_name
-    if not name:          # narrowed for the type checker; the filter guarantees it
-      continue
-    found, how = submitter.find_xid_by_name(name)
-    if found:
-      if dry_run:
-        log.append(f'[DRY][adopt] would adopt xid={found} for {e.job_id} '
-                   f'(exp_name={name}; {how})')
-        n_adopted += 1
-        continue
-      e.xid = found
-      e.state = route_lib.JobState.SUBMITTED   # reconcile promotes it if RUNNING
-      e.submitted_at = e.submitted_at or time.time()
-      e.adopt_check_name = None
-      # ★BACKFILL THE PLACEMENT. Adoption sets the xid but NOT cell/arch/chips --
-      # apply_placement (the only writer of those) never ran, because the build
-      # escaped instead of returning through the worker. A row left cell=None is
-      # the exact defect that wedged xid 288485310 for 16h: has_running_vmgroup
-      # and _bucket_for_entry both need the cell, so BOTH liveness probes go
-      # blind and reroute fails open to 'promoted forever'. XManager still holds
-      # the resolved placement in the experiment's launch_args, so recover it
-      # here. Best-effort: a probe that cannot read it leaves the fields None
-      # (reroute's own backfill, below, is the second line of defence), and we
-      # never guess.
-      placement_note = ''
-      if placement_probe is not None:
-        pl = placement_probe.placement_of(found)
-        if pl is not None:
-          e.cell, e.arch, e.chips = pl
-          placement_note = f'; placement {e.arch}-{e.chips}@{e.cell} from XM'
-      e.last_reason = (f'adopted escaped build: the stale BUILDING claim had '
-                       f'already produced xid={found} ({how}); re-dispatching '
-                       f'would have double-written its output path'
-                       f'{placement_note}')
-      log.append(f'[adopt] {e.job_id} -> xid={found} ({how})')
-      n_adopted += 1
-      continue
-    # No match. Distinguish "the lookup ran and saw nothing" (safe to release)
-    # from "the lookup could not run" (must stay parked).
-    ran = how.startswith('XM lookup ran')
-    if not ran:
-      n_still_unknown += 1
-      log.append(f'[adopt] {e.job_id} STAYS PARKED: {how}')
-      continue
-    if dry_run:
-      log.append(f'[DRY][adopt] would release {e.job_id} to build ({how})')
-      n_cleared += 1
-      continue
-    e.adopt_check_name = None
-    e.last_reason = (f'adopt-check clear: no XManager experiment named {name} '
-                     f'({how}), so the stale build left nothing behind; '
-                     f'releasing the row to build again')
-    log.append(f'[adopt] {e.job_id} released to build ({how})')
-    n_cleared += 1
-  log.append(f'[adopt] {len(parked)} parked row(s): {n_adopted} adopted, '
-             f'{n_cleared} released, {n_still_unknown} still unresolved.')
-  return entries, log
-
-
 # --- the re-route sweep ---------------------------------------------------
 def run_reroute(
     entries: list[route_lib.QueueEntry],
@@ -2730,24 +2644,9 @@ def main(argv):
     print(f'[reroute-loop] standalone reconcile+reroute on {_QUEUE_FILE.value}; '
           f'poll {_REROUTE_LOOP_POLL_S.value}s.', flush=True)
     while True:
-      # (A0) adopt-check pass. Rows whose BUILDING claim went stale are parked
-      # (route_lib.reclaim_stale_building sets adopt_check_name, and the claim
-      # selectors refuse to build them) until we know whether that build had
-      # already escaped to XManager. This runs FIRST so a row carrying a live
-      # xid is reconciled in the same round rather than sitting parked for one.
-      try:
-        snap = load_queue(_QUEUE_FILE.value)
-        baseline = {e.job_id: e.to_dict() for e in snap}
-        ad_entries, ad_log = adopt_escaped_builds(
-            snap, submitter=Submitter(), dry_run=_DRY_RUN.value,
-            placement_probe=XManagerPlacementProbe())
-        for line in ad_log:
-          print(f'  [reroute-loop:adopt] {line}', flush=True)
-        if ad_log and not _DRY_RUN.value:
-          merge_and_save_touched(_QUEUE_FILE.value, ad_entries, baseline=baseline)
-      except Exception as e:  # pylint: disable=broad-except
-        print(f'  [reroute-loop:adopt] pass FAILED (non-fatal): {e}',
-              flush=True)
+      # (adopt-check pass removed 2026-09-16: reclaim_stale_building now reads
+      # each row's early-bound submission to decide escaped-vs-crashed inline,
+      # so there is no parked-row backlog for a separate pass to unstick.)
       # (A) reconcile pass
       try:
         snap = load_queue(_QUEUE_FILE.value)

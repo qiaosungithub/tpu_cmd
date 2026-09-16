@@ -1013,6 +1013,101 @@ class SerialWorkerInvariantTest(unittest.TestCase):
     self.assertEqual(e.worker_id, 'w7')
 
 
+class ReclaimEarlyBoundTest(unittest.TestCase):
+  """§5.4: reclaim_stale_building resolves a stale BUILDING claim by READING the
+  row's early-bound submission -- no exp_name lookup, no adopt_check_name park.
+
+  The disaster this guards (2026-09-02, elt-dit-50k-fid-v3b): a build that
+  SUCCEEDED and is RUNNING on XManager, reclaimed to QUEUED and re-dispatched,
+  puts a SECOND writer on the first's output path. Early binding persists the
+  XID before the build returns, so the row itself says escaped-vs-crashed."""
+
+  def _building(self, job_id='j', started=1000.0):
+    e = _entry(job_id)
+    e.state = R.JobState.BUILDING
+    e.build_started_at = started
+    e.worker_id = 'w1'
+    return e
+
+  def test_escaped_build_is_adopted_not_rebuilt(self):
+    # The build created an experiment (early-bound CREATING submission carrying
+    # the xid) before the worker died. Reclaim must NOT requeue -- that is the
+    # double-write -- but move it to SUBMITTED for reconcile to verify.
+    e = self._building()
+    e.open_creating(xid='285706173', cell='sj', arch='v6p', chips=32,
+                    now=1000.0)
+    touched = R.reclaim_stale_building([e], now=3000.0, stale_after_s=1800.0)
+    self.assertEqual([x.job_id for x in touched], ['j'])
+    self.assertEqual(e.state, R.JobState.SUBMITTED)   # NOT QUEUED
+    self.assertEqual(e.xid, '285706173')
+    self.assertIsNone(e.build_started_at)
+    self.assertIsNone(e.worker_id)
+
+  def test_escaped_build_does_not_bump_attempts(self):
+    # §5.5: recovering a lost binding is not a build failure. The attnfilm row
+    # hit HELD partly because this path did attempts += 1.
+    e = self._building()
+    e.attempts = 1
+    e.open_creating(xid='285706173', cell='sj', arch='v6p', chips=32,
+                    now=1000.0)
+    R.reclaim_stale_building([e], now=3000.0, stale_after_s=1800.0)
+    self.assertEqual(e.attempts, 1)                   # unchanged
+
+  def test_escaped_build_backfills_placement_onto_row(self):
+    # apply_placement never ran (worker died), so e.cell/arch/chips are None.
+    # The submission holds the resolved landing; copy it across so the liveness
+    # probes are not blind (the xid 288485310 16h-wedge defect).
+    e = self._building()
+    e.open_creating(xid='285706173', cell='sj', arch='v6p', chips=32,
+                    now=1000.0)
+    self.assertIsNone(e.cell)
+    R.reclaim_stale_building([e], now=3000.0, stale_after_s=1800.0)
+    self.assertEqual((e.cell, e.arch, e.chips), ('sj', 'v6p', 32))
+
+  def test_crashed_before_create_is_requeued_and_bumps_attempts(self):
+    # No experiment was ever bound (no submission), so nothing escaped: safe to
+    # rebuild. This is the ordinary worker-crash case.
+    e = self._building()
+    e.attempts = 0
+    touched = R.reclaim_stale_building([e], now=3000.0, stale_after_s=1800.0)
+    self.assertEqual([x.job_id for x in touched], ['j'])
+    self.assertEqual(e.state, R.JobState.QUEUED)      # rebuild
+    self.assertEqual(e.attempts, 1)                   # bumped
+    self.assertIsNone(e.build_started_at)
+
+  def test_superseded_only_submission_is_treated_as_no_live_binding(self):
+    # A submission that is no longer live (e.g. SUPERSEDED) does not protect the
+    # row: current_submission is not in a live state, so this is the crash case.
+    e = self._building()
+    sub = e.open_creating(xid='111', now=1000.0)
+    sub.state = 'SUPERSEDED'
+    R.reclaim_stale_building([e], now=3000.0, stale_after_s=1800.0)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.attempts, 1)
+
+  def test_creating_submission_without_xid_is_not_trusted(self):
+    # open_creating can record a CREATING row with xid=None (the early line was
+    # never seen). With no xid there is nothing to double-write, so requeue.
+    e = self._building()
+    e.open_creating(xid=None, now=1000.0)
+    R.reclaim_stale_building([e], now=3000.0, stale_after_s=1800.0)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.attempts, 1)
+
+  def test_live_build_is_left_alone(self):
+    e = self._building(started=2900.0)
+    self.assertEqual(R.reclaim_stale_building([e], now=3000.0,
+                                              stale_after_s=1800.0), [])
+    self.assertEqual(e.state, R.JobState.BUILDING)
+
+  def test_no_adopt_check_name_attribute_remains(self):
+    # The field is gone: constructing a row and dataclasses.fields must not
+    # carry it, so a stray reference would fail loudly rather than silently.
+    import dataclasses
+    names = {f.name for f in dataclasses.fields(R.QueueEntry)}
+    self.assertNotIn('adopt_check_name', names)
+
+
 class BuildRequestedBackpressureTest(unittest.TestCase):
   """Step1: BUILD_REQUESTED handoff token + backpressure counting."""
 
