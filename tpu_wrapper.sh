@@ -516,6 +516,26 @@ _tpu_daemon_autoheal() {
 # Usage: _tpu_stage_src_guard <src> <dst> [<where>] [<quiet>]  0 = allow, 1 = REFUSE
 #   <where> names the call site in the message; <quiet>=1 suppresses only the
 #   "ok" line (a refusal is NEVER quiet).
+# Is content-addressed staging enabled for THIS operator's queue?
+#
+# Precedence: an EXPLICIT env var wins (TPU_CONTENT_ADDRESSED_STAGE=1 forces on,
+# =0 forces off -- the rollback switch), otherwise a per-queue SENTINEL FILE on
+# disk decides. The env var alone is NOT durable: the build-worker runs in tmux
+# and the ops watchdog respawns it WITHOUT the exported var after any crash/OOM,
+# silently reverting to the default staging path. The sentinel is the durable
+# enable -- route_check re-sources this wrapper on EVERY build, so creating or
+# removing the sentinel takes effect on the NEXT build with no restart, and any
+# future respawn inherits it. Keyed by the queue file basename so enabling tpu
+# (~/.tpu_local_queue.json) does not enable npu (~/lyy-work/.npu_local_queue.json).
+_tpu_ca_enabled() {
+  case "${TPU_CONTENT_ADDRESSED_STAGE:-}" in
+    1) return 0 ;;   # explicit ON
+    0) return 1 ;;   # explicit OFF (rollback), overrides the sentinel
+  esac
+  local _qf="${TPU_LOCAL_QUEUE_FILE:-$HOME/.tpu_local_queue.json}"
+  [ -f "${_qf%.json}.ca_enabled" ]
+}
+
 _tpu_stage_src_guard() {
   local src_raw="$1" dst_raw="$2" where="${3:-stage}" quiet="${4:-0}"
   local src dst rc check="" detail="" hint=""
@@ -1066,11 +1086,15 @@ print(d['group'], d['tpu_type'], d['status'],
     # ${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages must exist.
     # NOTE: any workspace can be drained -- keep launches SERIAL regardless.
     #
-    # run_amply_workspace (qiaos/402) currently rolls back source writes with
-    # CreateSnapshot error 104. clip_probe persists overwrites and has passed
-    # both the router test build and a real maze128 package build. Keep explicit
-    # STAGE_WS_ROOT overrides, including the NPU operator's workspace, intact.
-    local STAGE_WS_ROOT="${STAGE_WS_ROOT:-/google/src/cloud/qiaos/clip_probe/google3}"
+    # clip_probe (qiaos/2802) EXHAUSTED its revision history: the server rejects
+    # every write with "too many revisions since last keyframe (700001, max is
+    # 700000)" -> code 104, snapshot stuck at 13956. It cannot be repaired in
+    # place (deletes also count toward the limit; create_keyframe needs
+    # citc-impersonators), so it is RETAINED (365d) with its staging dirs and
+    # RETIRED as the default. run_amply_workspace (qiaos/15202) is healthy
+    # (dropped_resources.ascii at the 49-byte header, and the live build-workers
+    # already stage there). Keep explicit STAGE_WS_ROOT overrides intact.
+    local STAGE_WS_ROOT="${STAGE_WS_ROOT:-/google/src/cloud/qiaos/run_amply_workspace/google3}"
 
     # STAGE-SOURCE GUARD, CALL 1 OF 2 -- the EARLIEST point at which both ends
     # of the copy are known, and deliberately BEFORE the claim loop below: fail
@@ -1090,6 +1114,17 @@ print(d['group'], d['tpu_type'], d['status'],
         return 1
       fi
       # ---- claim a unique stagedir (guard has passed; nothing above created it)
+      if _tpu_ca_enabled; then
+        # CONTENT-ADDRESSED MODE (opt-in): do NOT pre-claim a random stagedir.
+        # The atomic publish below (in the staging branch) hashes the source and
+        # creates eqr_run_ca_<sha> via rename; pre-creating a dir here would
+        # defeat the cache and leave an empty dir to GC. We still derive a unique
+        # per-launch id so the LOGDIR / provenance stays 1:1 per launch (only the
+        # STAGEDIR dedups by content), matching the default logdir naming.
+        local _cahash=$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+        [ -n "$_cahash" ] || _cahash=$(printf '%04x%02x' "$RANDOM" "$((RANDOM % 256))")
+        now="${now}_${_cahash}"
+      else
       local _ts="$now"
       local _tries=0
       while : ; do
@@ -1104,6 +1139,7 @@ print(d['group'], d['tpu_type'], d['status'],
           return 1
         fi
       done
+      fi
     fi
     local logdir="$HOME/logs/eqr_run_${now}"
     mkdir -p "$logdir"
@@ -1245,6 +1281,64 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
       echo -e "\033[32m[resume] Re-using the ORIGINAL snapshot (not the working tree):\033[0m"
       echo -e "\033[32m  $abs_stagedir\033[0m"
       echo -e "\033[2m  Local edits are deliberately NOT packaged. Launch a new experiment for those.\033[0m"
+      export TPU_STAGEDIR="$abs_stagedir"
+      export TPU_LOGDIR="$logdir"
+      cd "$abs_stagedir"
+    elif _tpu_ca_enabled; then
+      # ================= CONTENT-ADDRESSED STAGE (opt-in) =================
+      # Hash the source tree, stage into a PRIVATE temp, then PUBLISH by atomic
+      # rename to eqr_run_ca_<sha>. Identical content -> identical dir -> blaze
+      # relink cache HITS (measured 89s cold -> 3s). Two DIFFERENT codes can
+      # never share a dir, a published dir is write-once (never overwritten), and
+      # correctness needs NO lock -- see ca_stage.py (fault-injection tested).
+      # Runs under the SAME stage lock (fd 200) as the default path, since the
+      # temp rsync still draws on the CreateSnapshot token bucket. The serial
+      # build-worker still serializes the BUILD (the output_base race is a
+      # separate hazard content-addressing does nothing about).
+      local _ca_py="" _c
+      for _c in "$HOME/work/tpu_cmd/ca_stage.py" "$(dirname "${BASH_SOURCE[0]:-$HOME/work/tpu_cmd/tpu_wrapper.sh}")/ca_stage.py"; do
+        [ -f "$_c" ] && { _ca_py="$_c"; break; }
+      done
+      if [ -z "$_ca_py" ]; then
+        echo -e "\033[31m[$TPU_CMD_NAME queue] REFUSING to build: TPU_CONTENT_ADDRESSED_STAGE=1 but ca_stage.py not found.\033[0m" >&2
+        echo "[[STAGE_INCOMPLETE]] ca_stage.py not found" >&2
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; { exec 200>&-; } 2>/dev/null; }
+        cd "$orig_dir" 2>/dev/null
+        return 1
+      fi
+      echo "Content-addressed stage: hashing $orig_dir and publishing atomically under ${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages/ ..."
+      local _ca_out _ca_rc
+      _ca_out=$(python3 "$_ca_py" publish \
+                  --source "$orig_dir" \
+                  --parent "${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages" \
+                  --rel-prefix "experimental/qiaos/eqr_jax_final_stages" \
+                  --rsync-timeout "${TPU_STAGE_RSYNC_TIMEOUT:-300}" \
+                  --xm-launcher "$HOME/work/tpu_cmd/xm_launcher.py" \
+                  --provenance-file "${TPU_CA_PROVENANCE_FILE:-$HOME/.tpu_ca_provenance.jsonl}")
+      _ca_rc=$?
+      if [ "$_ca_rc" -ne 0 ]; then
+        echo -e "\033[31m[$TPU_CMD_NAME queue] REFUSING to build: content-addressed stage failed (rc=$_ca_rc). See the [[STAGE_*]] marker above.\033[0m" >&2
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; { exec 200>&-; } 2>/dev/null; }
+        cd "$orig_dir" 2>/dev/null
+        return 1
+      fi
+      local _ca_dir _ca_rel _ca_sha _ca_reused _ca_fallback
+      _ca_dir=$(echo "$_ca_out" | grep -oE 'dir=[^ ]+' | head -1 | cut -d= -f2-)
+      _ca_rel=$(echo "$_ca_out" | grep -oE 'rel=[^ ]+' | head -1 | cut -d= -f2-)
+      _ca_sha=$(echo "$_ca_out" | grep -oE 'sha=[^ ]+' | head -1 | cut -d= -f2-)
+      _ca_reused=$(echo "$_ca_out" | grep -oE 'reused=[0-9]' | head -1 | cut -d= -f2-)
+      _ca_fallback=$(echo "$_ca_out" | grep -oE 'fallback=[0-9]' | head -1 | cut -d= -f2-)
+      if [ -z "$_ca_dir" ] || [ ! -d "$_ca_dir" ]; then
+        echo -e "\033[31m[$TPU_CMD_NAME queue] REFUSING to build: could not resolve content-addressed stagedir from: ${_ca_out}\033[0m" >&2
+        echo "[[STAGE_INCOMPLETE]] ca result unparseable: ${_ca_out}" >&2
+        [ "${_stage_locked:-0}" = "1" ] && { flock -u 200 2>/dev/null; { exec 200>&-; } 2>/dev/null; }
+        cd "$orig_dir" 2>/dev/null
+        return 1
+      fi
+      abs_stagedir="$_ca_dir"
+      stagedir="$_ca_rel"
+      echo -e "\033[32m[$TPU_CMD_NAME queue] content-addressed stage ready: ${stagedir}\033[0m"
+      echo -e "\033[2m    sha=${_ca_sha} reused=${_ca_reused:-?} fallback=${_ca_fallback:-?} (reused=1 => cache hit, skipped staging; fallback=1 => a valid final was absent/racey, staged a unique dir instead)\033[0m"
       export TPU_STAGEDIR="$abs_stagedir"
       export TPU_LOGDIR="$logdir"
       cd "$abs_stagedir"
@@ -2243,7 +2337,7 @@ EOF
     local _lq="${TPU_LOCAL_QUEUE_FILE:-$HOME/.tpu_local_queue.json}"
     if [ -s "$_lq" ]; then
       TPU_LQ_FILE="$_lq" python3 - << 'LQEOF'
-import json, os, sys
+import json, os, sys, time
 sys.path[:] = [p for p in sys.path if p not in ('', os.getcwd())]
 path = os.environ['TPU_LQ_FILE']
 try:
@@ -2256,18 +2350,26 @@ if not entries:
     sys.exit(0)
 from collections import Counter
 c = Counter(e.get('state', '?') for e in entries)
-COL = {'QUEUED': '\033[33m', 'BUILDING': '\033[1;35m', 'HELD': '\033[1;31m',
+COL = {'QUEUED': '\033[33m', 'BUILD_REQUESTED': '\033[95m', 'BUILDING': '\033[1;35m',
+       'HELD': '\033[1;31m', 'BUDGET_DEFERRED': '\033[2;33m',
        'SUBMITTED': '\033[36m', 'RUNNING': '\033[32m', 'FAILED': '\033[31m',
        'DONE': '\033[35m'}
 summary = '  '.join(f"{COL.get(k,'')}{k}:{v}\033[0m" for k, v in sorted(c.items()))
-print(f"\n\033[1;36m━━ Local Queue (smart router) ━━\033[0m   {summary}")
-# show BUILDING first (the one live build), then QUEUED and SUBMITTED; terminal
-# states stay collapsed into the count summary above.
-_order = {'BUILDING': 0, 'HELD': 1, 'QUEUED': 2, 'SUBMITTED': 3}
-rows = [e for e in entries if e.get('state') in ('QUEUED', 'BUILDING', 'HELD', 'SUBMITTED')]
+print(f"\n\033[1;36m━━ Local Queue ━━\033[0m   {summary}")
+# Render every NON-terminal state so each count in the summary has a matching
+# row (BUILDING, BUILD_REQUESTED, HELD, BUDGET_DEFERRED, QUEUED, SUBMITTED);
+# terminal states (RUNNING/DONE/FAILED) stay collapsed into the count summary.
+_order = {'BUILDING': 0, 'BUILD_REQUESTED': 1, 'HELD': 2, 'BUDGET_DEFERRED': 3,
+          'QUEUED': 4, 'SUBMITTED': 5}
+_render_states = ('QUEUED', 'BUILD_REQUESTED', 'BUILDING', 'HELD',
+                  'BUDGET_DEFERRED', 'SUBMITTED')
+rows = [e for e in entries if e.get('state') in _render_states]
+# Status column auto-widens to the longest state present (BUILD_REQUESTED /
+# BUDGET_DEFERRED are 15 chars) so every row stays aligned.
+_stw = max([9] + [len(str(e.get('state', ''))) for e in rows])
 for e in sorted(rows, key=lambda e: (_order.get(e.get('state'), 9), -e.get('priority', 0))):
     st = e.get('state', '?')
-    disp = f"{COL.get(st,'')}{st:9s}\033[0m"
+    disp = f"{COL.get(st,'')}{st:{_stw}s}\033[0m"
     # Show the experiment NAME (from launch_kwargs) as the primary id -- the
     # job_id is a random short hash that says nothing about which run this is.
     lk = e.get('launch_kwargs', {}) or {}
@@ -2276,6 +2378,8 @@ for e in sorted(rows, key=lambda e: (_order.get(e.get('state'), 9), -e.get('prio
     why = e.get('last_reason', '') or ''
     if st == 'SUBMITTED':
         why = f"xid={e.get('xid')} {e.get('cell') or '?'} {e.get('arch') or ''}-{e.get('chips') or ''}".strip()
+    elif st == 'BUILDING':
+        why = ''  # STATUS column already says BUILDING; the worker host:pid is noise
     lock = ' \033[35m[lock]\033[0m' if e.get('topology_locked') else ''
     # reroute count: shown for every row so a churning job is visible at a glance
     # (the give-up->HELD bound was removed 2026-09-11; a high count is now the
@@ -2286,6 +2390,42 @@ for e in sorted(rows, key=lambda e: (_order.get(e.get('state'), 9), -e.get('prio
     rr_disp = f"{rr_col}{rr_txt}\033[0m" + ' ' * max(0, 6 - len(rr_txt))
     print(f"  {name:30s} {disp} {str(e.get('power','')):9s} {archs:10s} {rr_disp} {why}{lock}")
 print("\033[2m  Full live view: tpu queue-status\033[0m")
+
+# BUILD SPEED (cache-only, same rows): the build in flight with LIVE elapsed
+# seconds, and the most-recent completed builds with their recorded duration.
+# Both come straight off the queue rows (build_started_at / last_build_duration),
+# so this stays instant like the rest of `tpu check` -- no RPC. build_started_at
+# is set at BUILDING and cleared at SUBMITTED; last_build_duration is written the
+# instant before that clear (route_check._submitted). A row built by a binary
+# that predates last_build_duration has it as None -- we OMIT it rather than
+# invent a number, so the "last N builds" list simply fills in as new builds land.
+_now = time.time()
+def _bname(e):
+    lk = e.get('launch_kwargs', {}) or {}
+    return (lk.get('exp_name') or lk.get('config') or str(e.get('job_id', '?')))[:30]
+def _bbar(sec, unit=3.0, cap=40):
+    # one '#' per `unit` seconds; capped with a trailing '+' so a slow outlier
+    # cannot wrap the terminal line.
+    n = int(round((sec or 0) / unit))
+    return '#' * min(n, cap) + ('+' if n > cap else '')
+_bldg = [e for e in entries if e.get('state') == 'BUILDING' and e.get('build_started_at')]
+_bdone = [e for e in entries if e.get('last_build_duration') is not None and e.get('submitted_at')]
+_bdone.sort(key=lambda e: e.get('submitted_at', 0), reverse=True)
+_brecent = _bdone[:6]
+if _bldg or _brecent:
+    print("\n\033[1;36m== Build speed ==\033[0m")
+    for e in _bldg:
+        _el = _now - e['build_started_at']
+        print(f"  \033[1;35mbuilding now\033[0m  {_bname(e):30s} {_el:5.0f}s \033[1;35m{_bbar(_el)}\033[0m")
+    if _brecent:
+        _durs = [e['last_build_duration'] for e in _brecent]
+        print(f"  \033[2mlast {len(_brecent)} build(s), newest first:\033[0m")
+        for e in _brecent:
+            _d = e['last_build_duration']
+            print(f"    {_bname(e):30s} {_d:5.0f}s \033[32m{_bbar(_d)}\033[0m")
+        _med = sorted(_durs)[len(_durs) // 2]
+        print(f"  \033[2mmedian {_med:.0f}s  range {min(_durs):.0f}-{max(_durs):.0f}s  "
+              f"(blaze floor ~40s; end-to-end incl. staging+submit is longer)\033[0m")
 LQEOF
     fi
 
@@ -2634,9 +2774,31 @@ EOF
             # just works), and forward the queue file + smart-cell opt-out too.
             local _sws="${STAGE_WS_ROOT:-}"
             local _nosc="${TPU_NO_SMART_CELL:-}"
+            # Content-addressed staging is OPT-IN: bake it into the worker env
+            # only when the caller exported it (`export
+            # TPU_CONTENT_ADDRESSED_STAGE=1; tpu build-worker start`). Unset =>
+            # the worker keeps the byte-identical default staging path, so this
+            # is a no-op for any worker (incl. npu) that did not ask for it.
+            local _cas="${TPU_CONTENT_ADDRESSED_STAGE:-}"
             local _envprefix="TPU_LOCAL_QUEUE_FILE='$qfile'"
             [ -n "$_sws" ]  && _envprefix="$_envprefix STAGE_WS_ROOT='$_sws'"
             [ -n "$_nosc" ] && _envprefix="$_envprefix TPU_NO_SMART_CELL='$_nosc'"
+            [ -n "$_cas" ]  && _envprefix="$_envprefix TPU_CONTENT_ADDRESSED_STAGE='$_cas'"
+            # REGISTRY SCOPING (2026-09-15): the worker REGISTERS each launched
+            # XID in $TPU_JOBS_FILE, ARCHIVES finished jobs to
+            # $TPU_JOBS_LEGACY_FILE, and PREFIXES the XM title with
+            # $TPU_JOB_NAME_PREFIX. `tmux new-session` attaches to the tmux
+            # SERVER's stale env, so -- exactly like STAGE_WS_ROOT above --
+            # these must be baked into the command. Without them an `npu
+            # build-worker` silently files lyy's jobs into sqa's registry
+            # (~/.tpu_jobs.json) with no `lyy-` prefix, invisible to `npu check`
+            # and to the npu wandb daemon. All are set by here (npu() exports
+            # them; tpu has the top-of-file defaults), so bake unconditionally;
+            # the prefix may be empty (tpu) and '' is the correct explicit value.
+            _envprefix="$_envprefix TPU_JOBS_FILE='$TPU_JOBS_FILE'"
+            _envprefix="$_envprefix TPU_JOBS_LEGACY_FILE='$TPU_JOBS_LEGACY_FILE'"
+            _envprefix="$_envprefix TPU_CHECK_CACHE_FILE='$TPU_CHECK_CACHE_FILE'"
+            _envprefix="$_envprefix TPU_JOB_NAME_PREFIX='$TPU_JOB_NAME_PREFIX'"
             # A restart loop so a worker crash self-heals; each iteration builds
             # at most one job then the binary loops internally.
             tmux new-session -d -s "$wsess" -c "$HOME" \

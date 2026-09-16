@@ -19,7 +19,8 @@ flock -n 9 || { echo "[npu-reroute-loop] another instance holds the lock; exitin
 while true; do
   systemd-run --user --scope -q \
       -p MemoryMax=8G -p MemorySwapMax=0 \
-      "$BIN" --queue_file="$QUEUE" --reroute_loop --nodry_run 2>&1 \
+      "$BIN" --queue_file="$QUEUE" --reroute_loop \
+      --reroute_after_s=999999999 --noinplace_reroute --nodry_run 2>&1 \
       | while IFS= read -r _line; do
           printf '%s %s\n' "$(date -u +%FT%TZ)" "$_line"
         done >> "$LOG"

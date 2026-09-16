@@ -59,5 +59,14 @@ export TPU_ROUTE_ENABLED=1
 # Standalone npu-reroute (tmux) owns reconcile+reroute. In-lane --reroute
 # never ran --reconcile, which is how 59 XM-COMPLETED rows sat SUBMITTED for days.
 export TPU_ROUTE_INLANE_REROUTE=0
+# npu-build-worker (route_check --worker, TPU_JOB_NAME_PREFIX=lyy-) is the SOLE
+# drainer of the npu local queue: it claims -> plans a cell -> builds -> submits.
+# The daemon's in-lane place pass must therefore stay OFF, or a QUEUED job is
+# submitted TWICE (once by the worker as lyy-.../g9, once by the daemon as no-
+# prefix/g5) -- two live XIDs per arm writing the SAME out_dir. The tpu side
+# pins this off automatically (tpu_check_daemon.sh case-branch), but that branch
+# only matches the tpu cache path, so npu falls back to the :=1 default and must
+# set it explicitly here (mirror of the INLANE_REROUTE=0 line above).
+export TPU_ROUTE_INLANE_PLACE=0
 
 exec bash "$PWD/tpu_check_daemon.sh"

@@ -1,4 +1,45 @@
 #!/bin/bash
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+# SINGLETON GUARD — at most ONE daemon per cache file (= per operator).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+# The outer `flock /tmp/tpu-check-daemon.lock` watchdog guards only ITS OWN
+# launch path; a daemon started any other way (a hand-run `bash
+# tpu_check_daemon.sh`, a second `tmux tpu-daemon`) bypasses it, and a SECOND
+# writer then races the same $TPU_CHECK_CACHE_FILE — two daemons publishing one
+# cache, which is how the board went stale/incoherent. Chasing the restarter
+# through the process tree does not work (every candidate is a `bash -c` under
+# the shared tmux server, and a setsid'd child loses the link), so the guard
+# lives HERE, in the script, where EVERY launch path must pass through it.
+#
+# Keyed by the CANONICAL cache path, so the TPU daemon (~/.tpu_check_cache.txt)
+# and the NPU daemon (~/lyy-work/.npu_check_cache.txt) never exclude each other,
+# while two daemons on the SAME cache do. A distinct name from the watchdog's
+# /tmp/tpu-check-daemon.lock on purpose: that fd is inherited down the tree, so
+# reusing it would make this guard refuse the very daemon the watchdog launched.
+#
+# Re-exec UNDER `flock -n -o`: -n makes a duplicate exit at once instead of
+# queueing; -o CLOSES the lock fd before running the daemon, so long-lived
+# children (the blaze server) never inherit it and a dead daemon's lock frees
+# even while a build child lingers (measured: without -o a setsid'd child keeps
+# the lock and blocks the legitimate restart). Escape hatch for a deliberate
+# second instance: TPU_DAEMON_NO_SINGLETON=1.
+if [ "${TPU_DAEMON_NO_SINGLETON:-0}" != "1" ] && [ -z "${_TPU_DAEMON_SINGLETON:-}" ]; then
+  _sg_cache="${TPU_CHECK_CACHE_FILE:-$HOME/.tpu_check_cache.txt}"
+  _sg_canon="$(realpath -m -- "$_sg_cache" 2>/dev/null || printf '%s' "$_sg_cache")"
+  _sg_lock="/tmp/tpu-check-daemon.$(id -u).$(printf '%s' "$_sg_canon" | md5sum | cut -c1-16).lock"
+  _sg_self="$(realpath -- "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]:-$0}")"
+  if command -v flock >/dev/null 2>&1 && [ -r "$_sg_self" ]; then
+    export _TPU_DAEMON_SINGLETON=1
+    # A duplicate loses the flock and `flock -n` exits it silently (rc=1); the
+    # winner runs the daemon with the lock held for its whole life, fd closed.
+    exec flock -n -o "$_sg_lock" bash "$_sg_self" "$@"
+    # Reached ONLY if flock itself could not start -- then run unguarded.
+    unset _TPU_DAEMON_SINGLETON
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [tpu_check_daemon] WARN: flock exec failed; running WITHOUT singleton guard" >&2
+  else
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [tpu_check_daemon] WARN: flock/self-path unavailable; singleton guard SKIPPED" >&2
+  fi
+fi
 # Which operator's board this daemon maintains. Unset = sqa's own files, which
 # is exactly how this behaved before the variables existed. A second operator
 # on the same Unix account (lyy, via the `npu` function in tpu_wrapper.sh)
