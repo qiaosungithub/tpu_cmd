@@ -31,6 +31,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from typing import Callable, Optional, Protocol, Sequence
@@ -54,9 +55,15 @@ class _Provider(Protocol):
 
 class _Submitter(Protocol):
   """What run_tick needs to submit: shells out to `tpu queue` in production, a
-  recorder in tests. `cwd` is the checkout `tpu queue` packages from."""
+  recorder in tests. `cwd` is the checkout `tpu queue` packages from.
 
-  def submit(self, argv: list[str], cwd: str = '') -> tuple[Optional[str], str]:
+  `on_early_xid`, if given, is called with the XID the instant the experiment is
+  created (the early `Experiment id: N` line), BEFORE the build finishes -- the
+  §5.4 early-binding hook. Optional so old callers / fakes need not supply it."""
+
+  def submit(self, argv: list[str], cwd: str = '',
+             on_early_xid: 'Optional[Callable[[str], None]]' = None
+             ) -> tuple[Optional[str], str]:
     ...
 
   def cancel(self, xid: str) -> tuple[bool, str]:
@@ -184,6 +191,20 @@ DEFAULT_GROUP_ORDER = ['5', '3', '9']
 # resume. Strip color first -- xmanager sometimes colorizes the id.
 _XID_RE = re.compile(r'(?:Launched experiment|work unit\(s\) to experiment)\s+(\d+)')
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+# ★EARLY-CREATION line (§5.4 early binding). The XManager client prints
+# `Experiment id: N` the INSTANT create_experiment() returns -- measured to
+# reach a streaming reader at t~0.02s vs the post-build `Launched experiment`
+# line at build-completion time. Capturing THIS closes the minutes-long window
+# where a re-routed/crashed row held no XID at all (the 2026-09-15 incident).
+# `--resume_xid` reuses an existing experiment and prints no create line, so an
+# early miss is expected there and simply falls through to the launch line.
+_EARLY_XID_RE = re.compile(r'Experiment id:\s+(\d+)')
+
+
+def extract_early_xid(text: str) -> Optional[str]:
+  """The XID from an early `Experiment id: N` creation line, ANSI-stripped."""
+  m = _EARLY_XID_RE.search(_ANSI_RE.sub('', text or ''))
+  return m.group(1) if m else None
 
 
 _QUEUE_FILE = flags.DEFINE_string(
@@ -715,7 +736,9 @@ class Submitter:
     self.wrapper_path = wrapper_path
     self.timeout_s = timeout_s
 
-  def submit(self, argv: list[str], cwd: str = '') -> tuple[Optional[str], str]:
+  def submit(self, argv: list[str], cwd: str = '',
+             on_early_xid: 'Optional[Callable[[str], None]]' = None
+             ) -> tuple[Optional[str], str]:
     # argv[0] is 'tpu' (a shell function); build a sourced-shell command.
     # `cwd` is where `tpu queue` runs, hence what its rsync packages -- it MUST
     # be the job's own checkout or the wrong source is shipped. Empty = inherit
@@ -727,45 +750,98 @@ class Submitter:
     run_cwd = cwd or None
     if run_cwd is not None and not os.path.isdir(run_cwd):
       return None, f'[route_check] refusing to submit: workdir does not exist: {run_cwd}'
+    # ★STREAM the output (§5.4 early binding). The build blocks for minutes; the
+    # `Experiment id: N` creation line prints in the first instant. Reading
+    # stdout line-by-line lets us fire `on_early_xid` the moment the experiment
+    # exists -- so the row records its XID BEFORE the build finishes and a crash
+    # in that window can no longer leave a running experiment with no local
+    # trace (the 2026-09-15 incident). Measured: early line reaches this reader
+    # at ~0.02s vs the post-build launch line at build-completion.
     try:
-      proc = subprocess.run(['bash', '-c', script], capture_output=True,
-                            text=True, timeout=self.timeout_s, cwd=run_cwd)
-    except subprocess.TimeoutExpired as e:
-      # ★A TIMEOUT IS NOT EVIDENCE THAT NOTHING WAS SUBMITTED. `tpu queue`
-      # creates the experiment early and then blocks for minutes on the build,
-      # so a timeout most often means "submitted, then we stopped watching".
-      # Returning None here made the worker count a failed attempt and RESUBMIT:
-      # the first XID then ran with no local row (invisible to every self-check
-      # that walks the queue) while a second copy burned the same quota twice --
-      # and the wasted spend pushed OTHER lines' jobs over the budget bar.
-      # Same trap as cancellation: LOCAL FAILURE IS NOT REMOTE ABSENCE.
-      return self._recover_timed_out_xid(e, argv)
-    # ★Mark where stdout ends. `tpu queue` prints a ~400-char deprecation banner
-    # to STDERR on every invocation, so a plain concatenation puts a fixed banner
-    # AFTER the real error and any tail-excerpt returns only the banner. _tail()
-    # splits on this marker and prefers stdout. Keep the marker in the string
-    # (not a separate field) so the Submitter protocol and its fakes are unchanged.
-    out = (proc.stdout or '') + _STDERR_MARK + (proc.stderr or '')
+      proc = subprocess.Popen(['bash', '-c', script], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, cwd=run_cwd)
+    except OSError as e:
+      return None, f'[route_check] could not start submit: {e}'
+    stdout_lines: list[str] = []
+    stderr_chunks: list[str] = []
+    early_done = [False]
+    # Drain stderr on a thread so a full stderr pipe buffer cannot deadlock the
+    # stdout read loop. stderr is kept SEPARATE (not merged) so the _STDERR_MARK
+    # contract below -- stdout, marker, then stderr -- survives, and _tail()
+    # still prefers the real stdout error over the fixed deprecation banner.
+    def _drain_stderr():
+      try:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+          stderr_chunks.append(line)
+      except Exception:  # pylint: disable=broad-except
+        pass
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+    # Popen has no built-in timeout for a streaming read, so a watchdog kills the
+    # process after timeout_s and we fall into the SAME recovery the blocking
+    # path used (a timeout is not proof nothing was submitted).
+    timed_out = [False]
+    def _kill_on_timeout():
+      timed_out[0] = True
+      try:
+        proc.kill()
+      except Exception:  # pylint: disable=broad-except
+        pass
+    timer = threading.Timer(self.timeout_s, _kill_on_timeout)
+    timer.start()
+    try:
+      assert proc.stdout is not None
+      for line in proc.stdout:
+        stdout_lines.append(line)
+        if on_early_xid is not None and not early_done[0]:
+          exid = extract_early_xid(line)
+          if exid:
+            early_done[0] = True
+            try:
+              on_early_xid(exid)
+            except Exception:  # pylint: disable=broad-except
+              # Persisting the early xid must NEVER kill the build -- it is a
+              # best-effort head-start; apply_placement records it definitively
+              # when the launch line lands.
+              pass
+      proc.wait()
+    except Exception:  # pylint: disable=broad-except
+      pass
+    finally:
+      timer.cancel()
+      stderr_thread.join(timeout=5.0)
+      # Close both pipes so a submit every round does not leak file descriptors
+      # over the daemon's (unbounded) lifetime.
+      for _stream in (proc.stdout, proc.stderr):
+        try:
+          if _stream is not None:
+            _stream.close()
+        except Exception:  # pylint: disable=broad-except
+          pass
+    out = ''.join(stdout_lines) + _STDERR_MARK + ''.join(stderr_chunks)
+    if timed_out[0]:
+      return self._recover_timed_out_xid(out, argv)
     return extract_xid(out), out
 
   def _recover_timed_out_xid(
-      self, exc: subprocess.TimeoutExpired,
+      self, partial: str,
       argv: list[str]) -> tuple[Optional[str], str]:
     """After a submit timeout, find out whether the experiment EXISTS anyway.
 
     Two probes, cheapest first:
-      1. the partial output captured before the timeout -- `tpu queue` prints
-         `Experiment id: N` long before it returns, so this usually settles it
-         at zero cost (subprocess.TimeoutExpired carries .stdout/.stderr);
+      1. the partial output already streamed before the kill -- `tpu queue`
+         prints `Experiment id: N` long before it returns, so this usually
+         settles it at zero cost. Accept BOTH the post-build launch line and the
+         early creation line (the early one is the whole point of streaming).
       2. an XM lookup by `--experiment_name`, for the case where the timeout
          landed before the id was flushed.
     Only when BOTH come back empty do we report 'no XID' -- and then in words
     that do not claim the submit failed.
     """
-    partial = _decode_stream(exc.stdout) + _STDERR_MARK + _decode_stream(exc.stderr)
     note = f'[route_check] tpu queue TIMED OUT after {self.timeout_s}s'
 
-    xid = extract_xid(partial)
+    xid = extract_xid(partial) or extract_early_xid(partial)
     if xid:
       return xid, (f'{note}, but the experiment WAS created: xid={xid} '
                    f'recovered from output captured before the timeout. '
@@ -1951,7 +2027,19 @@ def run_tick(
     log.append(f'[route_check] placing {p.job_id}: {p.reason}')
     log.append(f'      cmd: {" ".join(argv)}{cwd_note}')
     t_submit = time.time()
-    xid, out = sub.submit(argv, cwd=workdir)
+    # ★Early binding: persist a CREATING submission the instant the experiment is
+    # created, before the (minutes-long) build finishes, so a crash in that
+    # window cannot leave a running experiment with no local trace. apply_
+    # placement UPGRADES this same record to SUBMITTED when the launch line lands.
+    # run_tick mutates entries IN MEMORY (its caller persists the list); unlike
+    # run_worker_once there is no queue_file to write mid-build, so early binding
+    # here records the CREATING submission on the in-memory entry, which
+    # apply_placement then upgrades. Durable crash-window protection is provided
+    # by run_worker_once (the disk-backed drainer), which update_entry's it.
+    def _bind_early(exid: str, _entry=entry, _p=p):
+      _entry.open_creating(xid=exid, cell=_p.cell, arch=_p.arch, chips=_p.chips,
+                           group=getattr(_entry, 'group', None), now=time.time())
+    xid, out = sub.submit(argv, cwd=workdir, on_early_xid=_bind_early)
     if xid:
       # ★`submitted_at` is "epoch when handed to XM", and `submit` BLOCKS for the
       # whole build -- 890-1692 s measured in the field (host build lock, then
@@ -2157,7 +2245,19 @@ def run_worker_once(
   log.append(f'[worker] building {claimed.job_id}: {placement.reason} '
              f'(cwd={pkg_dir or "router dir"})')
   t_submit = time.time()
-  xid, out = submitter.submit(argv, cwd=pkg_dir)
+  # ★Early binding (§5.4): record a CREATING submission with the XID the instant
+  # the experiment is created -- before this (minutes-long) build returns -- so a
+  # crash/stale-claim in the build window can no longer leave a live experiment
+  # with no local trace (the 2026-09-15 attnfilm incident). apply_placement
+  # UPGRADES this same record to SUBMITTED when the launch line lands.
+  def _bind_early(exid: str) -> None:
+    def _open(e: route_lib.QueueEntry) -> None:
+      e.open_creating(xid=exid, cell=placement.cell, arch=placement.arch,
+                      chips=placement.chips,
+                      group=route_lib.pinned_group(e) or getattr(e, 'group', None),
+                      now=time.time())
+    update_entry(queue_file, claimed.job_id, _open)
+  xid, out = submitter.submit(argv, cwd=pkg_dir, on_early_xid=_bind_early)
 
   if xid:
     # ★See the same fix in run_tick: `submit` blocks for the whole build, so the

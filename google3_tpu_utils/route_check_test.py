@@ -76,9 +76,14 @@ class _FakeSubmitter:
     self.name_lookups = []
     self._name_lookup = name_lookup or (None, 'XM lookup ran and found no exact-name match')
 
-  def submit(self, argv, cwd=''):
+  def submit(self, argv, cwd='', on_early_xid=None):
     self.calls.append(argv)
     self.cwds.append(cwd)
+    # Mirror production: fire the early-binding callback with the XID the instant
+    # the experiment is "created", BEFORE returning the (post-build) result. A
+    # scripted None xid means a dead launch -- no experiment, no early callback.
+    if on_early_xid is not None and self._xid:
+      on_early_xid(self._xid)
     return self._xid, f'Launched experiment {self._xid}' if self._xid else 'no line'
 
   def cancel(self, xid):
@@ -552,7 +557,10 @@ class _BudgetRefusedSubmitter:
     self.calls = []
     self.cwds = []
 
-  def submit(self, argv, cwd=''):
+  def submit(self, argv, cwd='', on_early_xid=None):
+    # A budget refusal never creates an experiment, so there is no early XID to
+    # bind -- the callback is accepted (production always passes it) but not
+    # fired, exactly like a dead launch.
     self.calls.append(argv)
     self.cwds.append(cwd)
     return None, ('[budget check] total projected: 9999 (Limit: 2228)\n'
@@ -1496,13 +1504,6 @@ class RunReconcileTest(unittest.TestCase):
 _PARTIAL_WITH_XID = 'Launched experiment 284946261\nstill building...'
 
 
-class _FakeTimeout(subprocess.TimeoutExpired):
-  def __init__(self, stdout=b'', stderr=b''):
-    super().__init__(cmd='tpu queue', timeout=1800.0)
-    self.stdout = stdout
-    self.stderr = stderr
-
-
 class SubmitTimeoutRecoveryTest(unittest.TestCase):
 
   def _submitter(self, name_lookup=None):
@@ -1514,9 +1515,10 @@ class SubmitTimeoutRecoveryTest(unittest.TestCase):
   def test_xid_recovered_from_partial_output(self):
     """Cheapest probe: the id was already printed before the timeout."""
     s = self._submitter(lambda n, **kw: (None, 'should not be reached'))
+    # Streaming submit hands recovery the partial output as TEXT (it already read
+    # the pipe line-by-line); the timeout path is a plain kill, no exception obj.
     xid, out = s._recover_timed_out_xid(
-        _FakeTimeout(stdout=_PARTIAL_WITH_XID.encode()),
-        ['tpu', 'queue', '--exp_name=job_a'])
+        _PARTIAL_WITH_XID, ['tpu', 'queue', '--exp_name=job_a'])
     self.assertEqual(xid, '284946261')
     self.assertIn('WAS created', out)
 
@@ -1524,7 +1526,7 @@ class SubmitTimeoutRecoveryTest(unittest.TestCase):
     """Timeout landed before the id flushed -> ask XManager by name."""
     s = self._submitter(lambda n, **kw: ('284999999', 'XM lookup matched 1'))
     xid, out = s._recover_timed_out_xid(
-        _FakeTimeout(), ['tpu', 'queue', '--exp_name=job_a'])
+        '', ['tpu', 'queue', '--exp_name=job_a'])
     self.assertEqual(xid, '284999999')
     self.assertIn('Adopting it', out)
 
@@ -1533,14 +1535,14 @@ class SubmitTimeoutRecoveryTest(unittest.TestCase):
     say so -- the fix must not fabricate an XID and strand a QUEUED row."""
     s = self._submitter(lambda n, **kw: (None, 'XM lookup ran and found no exact-name match'))
     xid, out = s._recover_timed_out_xid(
-        _FakeTimeout(), ['tpu', 'queue', '--exp_name=job_a'])
+        '', ['tpu', 'queue', '--exp_name=job_a'])
     self.assertIsNone(xid)
     self.assertIn('Treating as not-submitted', out)
 
   def test_NC_unknown_remote_state_is_named_not_guessed(self):
     """No --exp_name -> we cannot check; say UNKNOWN rather than imply failure."""
     s = self._submitter()
-    xid, out = s._recover_timed_out_xid(_FakeTimeout(), ['tpu', 'queue'])
+    xid, out = s._recover_timed_out_xid('', ['tpu', 'queue'])
     self.assertIsNone(xid)
     self.assertIn('UNKNOWN', out)
 
@@ -1548,7 +1550,7 @@ class SubmitTimeoutRecoveryTest(unittest.TestCase):
     """If the lookup itself failed, that is not evidence the job is absent."""
     s = self._submitter(lambda n, **kw: (None, 'XM lookup itself timed out; remote state UNKNOWN'))
     xid, out = s._recover_timed_out_xid(
-        _FakeTimeout(), ['tpu', 'queue', '--exp_name=job_a'])
+        '', ['tpu', 'queue', '--exp_name=job_a'])
     self.assertIsNone(xid)
     self.assertIn('UNKNOWN', out)
 

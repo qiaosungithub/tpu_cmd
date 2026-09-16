@@ -934,7 +934,16 @@ class QueueEntry:
     the multi-minute build (§5.4 early binding). Persisting this closes the
     window where a crash between create and the post-build launch line left the
     row with no XID at all (the 2026-09-15 incident). apply_placement later
-    UPGRADES this same record to SUBMITTED rather than appending a duplicate."""
+    UPGRADES this same record to SUBMITTED rather than appending a duplicate.
+
+    A new experiment SUPERSEDES any still-open prior attempt: if a build crashed
+    after creating an experiment but before the launch line, that earlier record
+    stays with its xid (never orphaned -- the whole point of §5.2), moved out of
+    the live slot so `xid` now points at the new attempt."""
+    if self.submissions and self.submissions[-1].state in SUBMISSION_LIVE_STATES:
+      self.submissions[-1].state = 'SUPERSEDED'
+      if not self.submissions[-1].ended_reason:
+        self.submissions[-1].ended_reason = 'superseded by re-create'
     sub = Submission(seq=len(self.submissions) + 1,
                      xid=(str(xid) if xid else None), state='CREATING',
                      cell=cell, arch=arch, chips=chips, group=group,
