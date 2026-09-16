@@ -639,22 +639,27 @@ class SubmissionsViewTest(unittest.TestCase):
   things at once -- the v1->v2 migration is correct, AND it is a no-op on data
   (xid/prior_xids stay the source of truth; only serialization gains a key)."""
 
-  def test_migration_from_prior_xids_and_current(self):
-    # A row re-routed once: prior_xids=[old] + current xid. The migration must
-    # yield oldest-first submissions, the old one SUPERSEDED, the current one
-    # carrying the row's live state + cell/arch/chips/group. This is the exact
-    # shape the attnfilm incident needed and did not have.
-    e = _entry(xid='289723858', prior_xids=['289686907'])
-    e.state = R.JobState.RUNNING
-    e.cell, e.arch, e.chips, e.group = 'sj', 'v6e', 32, '9'
-    e.submitted_at = 1789500000.0
+  def test_migration_from_v1_dict_prior_and_current(self):
+    # The v1->v2 migration runs in from_dict on a queue file that predates
+    # `submissions` (scalar xid + prior_xids, no submissions key). A RUNNING row
+    # re-routed once must yield oldest-first submissions: the old id SUPERSEDED,
+    # the current one RUNNING (state taken from the ROW) carrying its
+    # cell/arch/chips. This is the exact shape the attnfilm incident lacked.
+    v1 = {'job_id': 'j', 'power': 'v7-32', 'allowed_archs': ['v7'],
+          'state': 'RUNNING', 'xid': '289723858', 'prior_xids': ['289686907'],
+          'cell': 'sj', 'arch': 'v6e', 'chips': 32,
+          'submitted_at': 1789500000.0}
+    e = R.QueueEntry.from_dict(v1)
     subs = e.submissions
     self.assertEqual([s.seq for s in subs], [1, 2])
     self.assertEqual([s.xid for s in subs], ['289686907', '289723858'])
     self.assertEqual(subs[0].state, 'SUPERSEDED')
     self.assertEqual(subs[1].state, 'RUNNING')
-    self.assertEqual((subs[1].cell, subs[1].arch, subs[1].chips, subs[1].group),
-                     ('sj', 'v6e', 32, '9'))
+    self.assertEqual((subs[1].cell, subs[1].arch, subs[1].chips),
+                     ('sj', 'v6e', 32))
+    # and the derived views still read the way every caller expects
+    self.assertEqual(e.xid, '289723858')
+    self.assertEqual(e.prior_xids, ['289686907'])
 
   def test_derived_helpers(self):
     e = _entry(xid='3', prior_xids=['1', '2'])

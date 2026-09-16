@@ -1848,6 +1848,7 @@ def run_reroute(
       # should not have to prove that invariant from two places at once.
       if not nominal or not xid:
         e.state = route_lib.JobState.RUNNING
+        route_lib.sync_current_submission(e, e.state)
         e.last_reason = f'running in {e.cell} ({e.arch}-{e.chips})'
         why = ('borg vmgroup RUN' if vm_running
                else 'borg unreadable' if vm_running is None
@@ -1876,6 +1877,8 @@ def run_reroute(
                    f'left as-is. {_tail(out)}')
     elif state == STATUS_TERMINAL:
       e.state = route_lib.JobState.FAILED
+      route_lib.sync_current_submission(
+          e, e.state, reason='terminal per XManager (failed/stopped)')
       e.last_reason = 'terminal per XManager (failed/stopped)'
       log.append(f'[reroute] {tag} is TERMINAL -> marked FAILED')
     else:  # STATUS_UNKNOWN

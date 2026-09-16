@@ -659,34 +659,30 @@ def _row_state_to_submission_state(row_state: 'JobState') -> str:
   }.get(row_state, 'SUBMITTED')
 
 
-def derive_submissions(entry: 'QueueEntry') -> list['Submission']:
-  """Build the submissions VIEW for a row from its authoritative xid/prior_xids.
-
-  This IS the v1->v2 migration (§5.6) written as a pure function: every id in
-  `prior_xids` becomes a SUPERSEDED submission (oldest first), and the current
-  `xid`, if any, becomes the newest submission -- its state taken from the row,
-  its cell/arch/chips/group/timestamps copied across (these are smeared onto the
-  single xid today and lost on re-route; here at least the current one keeps
-  them). Pure, deterministic, no I/O -- so QueueEntry.to_dict() stays byte-stable
-  for the baseline-equality check in merge_and_save_touched. Empty/None ids drop.
+def _migrate_v1_submissions(
+    prior_xids: Optional[list], xid: Optional[str], state: 'JobState',
+    cell: Optional[str], arch: Optional[str], chips: Optional[int],
+    ts: Optional[float]) -> list['Submission']:
+  """v1->v2 migration (§5.6): build the authoritative submissions list for a row
+  read from a queue file that predates it (has scalar xid + prior_xids, no
+  `submissions` key). Every id in `prior_xids` becomes a SUPERSEDED submission
+  (oldest first); the current `xid`, if any, becomes the newest, its state taken
+  from the ROW state and its cell/arch/chips/timestamps copied across. Pure and
+  deterministic. Empty/None ids drop. Called only by from_dict for v1 data; a v2
+  file carries its submissions verbatim and never hits this.
   """
   subs: list['Submission'] = []
   seq = 0
-  for x in (getattr(entry, 'prior_xids', None) or []):
+  for x in (prior_xids or []):
     if not x:
       continue
     seq += 1
     subs.append(Submission(seq=seq, xid=str(x), state='SUPERSEDED'))
-  cur = getattr(entry, 'xid', None)
-  if cur:
+  if xid:
     seq += 1
     subs.append(Submission(
-        seq=seq, xid=str(cur),
-        state=_row_state_to_submission_state(entry.state),
-        cell=getattr(entry, 'cell', None), arch=getattr(entry, 'arch', None),
-        chips=getattr(entry, 'chips', None), group=getattr(entry, 'group', None),
-        created_at=getattr(entry, 'submitted_at', None),
-        confirmed_at=getattr(entry, 'submitted_at', None)))
+        seq=seq, xid=str(xid), state=_row_state_to_submission_state(state),
+        cell=cell, arch=arch, chips=chips, created_at=ts, confirmed_at=ts))
   return subs
 
 
@@ -739,7 +735,16 @@ class QueueEntry:
   snapshot_dir: str = ''
   # ---- mutable state ----
   state: JobState = JobState.QUEUED
-  xid: Optional[str] = None         # set once submitted
+  # ★AUTHORITATIVE per-submission history (§5.2): every XManager experiment the
+  # router ever created for this row, oldest first. `xid`/`prior_xids` below are
+  # DERIVED read-views + compat setters over THIS list, so the list is the single
+  # source of truth and no id can be orphaned by a scalar overwrite (the
+  # 2026-09-15 attnfilm root cause). Declared BEFORE xid/prior_xids so __init__
+  # initializes it before their setters run.
+  submissions: list['Submission'] = dataclasses.field(default_factory=list)
+  xid: Optional[str] = None         # DERIVED view of the current live submission
+                                    # (see the xid property); kept as an init
+                                    # param for construction/back-compat.
   cell: Optional[str] = None        # cell it was placed into
   arch: Optional[str] = None        # concrete arch chosen
   chips: Optional[int] = None       # concrete chip count chosen
@@ -848,36 +853,103 @@ class QueueEntry:
   # because the budget is meaningless if it resets whenever the process does.
   auto_resumes: int = 0
 
+  # ---- xid / prior_xids: DERIVED read + COMPAT write over `submissions` ----
+  # These read as VIEWS of the authoritative list and write by mutating it, so
+  # every caller/test that still says `entry.xid`, `e.xid = x`, or
+  # `QueueEntry(xid=..., prior_xids=[...])` keeps working while the list stays
+  # the single source of truth. The `isinstance(v, property)` guard is the
+  # standard dataclass idiom for a field shadowed by a same-named property: a
+  # no-arg construct passes the property object itself as the field "default",
+  # which must be ignored rather than stored.
   @property
-  def submissions(self) -> list['Submission']:
-    """Ordered (oldest-first) view of every experiment this row has ever had.
+  def xid(self) -> Optional[str]:
+    """The row's CURRENT live XID -- the newest submission's id, unless it has
+    been superseded (re-routed / re-built away), in which case the row holds
+    none. A terminal (DONE/FAILED) submission still reports its id."""
+    if self.submissions:
+      last = self.submissions[-1]
+      if last.xid and last.state != 'SUPERSEDED':
+        return last.xid
+    return None
 
-    DERIVED (phase 1) from the authoritative xid/prior_xids via
-    derive_submissions -- not an independently mutable field, so it cannot drift
-    from xid/prior_xids the way a stored copy could. A later phase inverts this.
-    """
-    return derive_submissions(self)
+  @xid.setter
+  def xid(self, value) -> None:
+    if isinstance(value, property):
+      return                       # no-arg construct: ignore the sentinel default
+    if value is None:
+      # "clear the current xid" (mark_reroute's old idiom): supersede the live
+      # submission so its id survives in history rather than vanishing.
+      if self.submissions and self.submissions[-1].state in SUBMISSION_LIVE_STATES:
+        self.submissions[-1].state = 'SUPERSEDED'
+      return
+    value = str(value)
+    if self.submissions and self.submissions[-1].state in SUBMISSION_LIVE_STATES:
+      self.submissions[-1].xid = value    # refine/overwrite the open submission
+    else:
+      self.submissions.append(Submission(
+          seq=len(self.submissions) + 1, xid=value, state='SUBMITTED'))
+
+  @property
+  def prior_xids(self) -> list[str]:
+    """Every XID this row held BEFORE the current one, oldest first -- the
+    history the XM->local audits walk. Derived: all submission ids except the
+    current live one."""
+    subs = self.submissions
+    if subs and subs[-1].xid and subs[-1].state != 'SUPERSEDED':
+      return [s.xid for s in subs[:-1] if s.xid]
+    return [s.xid for s in subs if s.xid]
+
+  @prior_xids.setter
+  def prior_xids(self, value) -> None:
+    if isinstance(value, property):
+      return
+    # Seed SUPERSEDED history BEFORE any current live submission. Used at
+    # construction (build_warm_restart_entry, tests). Preserves an already-open
+    # current submission so `QueueEntry(xid=X, prior_xids=[...])` in either field
+    # order yields [history..., current].
+    cur = None
+    if self.submissions and self.submissions[-1].state in SUBMISSION_LIVE_STATES:
+      cur = self.submissions[-1]
+    seeded = [Submission(seq=i + 1, xid=str(x), state='SUPERSEDED')
+              for i, x in enumerate(value or []) if x]
+    self.submissions = seeded + ([cur] if cur is not None else [])
+    for i, s in enumerate(self.submissions):
+      s.seq = i + 1
 
   @property
   def current_submission(self) -> Optional['Submission']:
-    """The newest submission (the one `xid` points at), or None if never placed."""
-    subs = self.submissions
-    return subs[-1] if subs else None
+    """The newest submission (any state), or None if the row was never placed."""
+    return self.submissions[-1] if self.submissions else None
 
   @property
   def all_xids(self) -> list[str]:
-    """Every XID this row has held, oldest first -- current plus history."""
+    """Every XID this row has ever held, oldest first -- current plus history."""
     return [s.xid for s in self.submissions if s.xid]
 
+  def open_creating(self, xid: Optional[str] = None, *,
+                    cell: Optional[str] = None, arch: Optional[str] = None,
+                    chips: Optional[int] = None, group: Optional[str] = None,
+                    now: Optional[float] = None) -> 'Submission':
+    """Open a CREATING submission the INSTANT an experiment is created -- before
+    the multi-minute build (§5.4 early binding). Persisting this closes the
+    window where a crash between create and the post-build launch line left the
+    row with no XID at all (the 2026-09-15 incident). apply_placement later
+    UPGRADES this same record to SUBMITTED rather than appending a duplicate."""
+    sub = Submission(seq=len(self.submissions) + 1,
+                     xid=(str(xid) if xid else None), state='CREATING',
+                     cell=cell, arch=arch, chips=chips, group=group,
+                     created_at=now)
+    self.submissions.append(sub)
+    return sub
+
   def to_dict(self) -> dict:
+    # `submissions` is the authoritative field; asdict recurses it to a list of
+    # dicts. `xid` and `prior_xids` are property-backed fields, so asdict emits
+    # them too -- as their DERIVED views -- which IS the back-compat projection an
+    # older (v1) binary reads out of the same file. Deterministic, so this does
+    # not perturb merge_and_save_touched's baseline-equality check.
     d = dataclasses.asdict(self)
     d['state'] = self.state.value
-    # ★schema v2: publish the submissions VIEW so external readers (tpu check,
-    # audits) and a newer binary can join job_id<->xid without re-deriving, and
-    # so the file upgrades in place on the next save. Derived + deterministic,
-    # so this does NOT perturb the baseline-equality check in
-    # merge_and_save_touched (same fields in => same submissions out).
-    d['submissions'] = [s.to_dict() for s in self.submissions]
     return d
 
   @classmethod
@@ -885,8 +957,22 @@ class QueueEntry:
     d = dict(d)
     if 'state' in d and not isinstance(d['state'], JobState):
       d['state'] = JobState(d['state'])
+    # Pull the identity keys out so the plain constructor never sees them: a v2
+    # file's `submissions` is authoritative and set directly; a v1 file's
+    # scalar xid/prior_xids are migrated. (xid/prior_xids are property-backed
+    # fields -- letting them through to the ctor would re-run their setters.)
+    subs_raw = d.pop('submissions', None)
+    xid_raw = d.pop('xid', None)
+    prior_raw = d.pop('prior_xids', None)
     known = {f.name for f in dataclasses.fields(cls)}
-    return cls(**{k: v for k, v in d.items() if k in known})
+    entry = cls(**{k: v for k, v in d.items() if k in known})
+    if subs_raw is not None:
+      entry.submissions = [Submission.from_dict(s) for s in subs_raw]
+    else:
+      entry.submissions = _migrate_v1_submissions(
+          prior_raw, xid_raw, entry.state, entry.cell, entry.arch, entry.chips,
+          entry.submitted_at)
+    return entry
 
 
 def pinned_group(entry: 'QueueEntry') -> Optional[str]:
@@ -1968,12 +2054,31 @@ def apply_placement(entry: QueueEntry, placement: Placement, xid: str,
   that is resubmitted (build retry, re-route) would otherwise erase the only
   local trace of an experiment that may still be running and billing."""
   entry.state = JobState.SUBMITTED
-  if entry.xid and entry.xid != xid:
-    if not entry.prior_xids:
-      entry.prior_xids = []
-    if entry.xid not in entry.prior_xids:
-      entry.prior_xids.append(entry.xid)
-  entry.xid = xid
+  xid = str(xid)
+  cur = entry.submissions[-1] if entry.submissions else None
+  if cur is not None and cur.state in SUBMISSION_LIVE_STATES and cur.xid in (None, xid):
+    # UPGRADE the open (early-bound) submission in place. The create->build->
+    # submit sequence must record ONE experiment, not two: open_creating opened
+    # this record at 'Experiment id:', we now confirm it at the launch line.
+    cur.xid = xid
+    cur.state = 'SUBMITTED'
+    cur.cell = placement.cell
+    cur.arch = placement.arch
+    cur.chips = placement.chips
+    cur.group = getattr(entry, 'group', None)
+    cur.confirmed_at = now
+    if cur.created_at is None:
+      cur.created_at = now
+  else:
+    # A DIFFERENT live xid means a genuine re-submit: supersede the old record
+    # (its id survives in history -- NEVER orphaned, the whole point of §5.2)
+    # and append the new one.
+    if cur is not None and cur.state in SUBMISSION_LIVE_STATES:
+      cur.state = 'SUPERSEDED'
+    entry.submissions.append(Submission(
+        seq=len(entry.submissions) + 1, xid=xid, state='SUBMITTED',
+        cell=placement.cell, arch=placement.arch, chips=placement.chips,
+        group=getattr(entry, 'group', None), created_at=now, confirmed_at=now))
   entry.cell = placement.cell
   entry.arch = placement.arch
   entry.chips = placement.chips
@@ -2257,15 +2362,13 @@ def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry
   # every audit that enumerates known XIDs (xid_recon/recon.py reads
   # prior_xids explicitly) -- i.e. a ghost car. record_submit already does
   # this on the re-submit path; the reroute path was missing it.
-  if entry.xid:
-    if not entry.prior_xids:
-      entry.prior_xids = []
-    if entry.xid not in entry.prior_xids:
-      entry.prior_xids.append(entry.xid)
+  if entry.submissions and entry.submissions[-1].state in SUBMISSION_LIVE_STATES:
+    entry.submissions[-1].state = 'SUPERSEDED'
+    if not entry.submissions[-1].ended_reason:
+      entry.submissions[-1].ended_reason = 'rerouted'
   entry.state = JobState.QUEUED
   entry.last_reason = (f"re-routed after pending in {entry.cell} "
                        f">{int((now - (entry.submitted_at or now)))}s")
-  entry.xid = None
   entry.cell = None
   entry.arch = None
   entry.chips = None
@@ -2562,6 +2665,38 @@ def decide_reconcile(local_state: 'JobState', xm_status: str,
   return None
 
 
+def sync_current_submission(entry: 'QueueEntry', row_state: 'JobState',
+                            reason: str = '') -> None:
+  """Mirror a row lifecycle transition onto its CURRENT submission's state.
+
+  With `submissions` authoritative (§5.2), the row state and the newest
+  submission's state are two separate facts: the row can be promoted to RUNNING
+  or retired to DONE/FAILED, and the submission RECORD must independently learn
+  it so audits and the computed HELD reason (§5.5) read a coherent history.
+  Call this right after setting `entry.state` at a RUNNING/DONE/FAILED
+  transition. QUEUED/BUILDING/... are row-only phases and never touch the
+  submission (a re-routed row already SUPERSEDED its submission in mark_reroute).
+
+  Only a LIVE submission that already carries an xid is advanced -- never
+  resurrect a SUPERSEDED record, never label an id-less open CREATING one.
+  """
+  if not entry.submissions:
+    return
+  cur = entry.submissions[-1]
+  if not cur.xid or cur.state not in SUBMISSION_LIVE_STATES:
+    return
+  sub_state = {
+      JobState.RUNNING: 'RUNNING',
+      JobState.DONE: 'DONE',
+      JobState.FAILED: 'FAILED',
+  }.get(row_state)
+  if sub_state is None:
+    return
+  cur.state = sub_state
+  if reason and not cur.ended_reason and sub_state in SUBMISSION_TERMINAL_STATES:
+    cur.ended_reason = reason
+
+
 def reconcile_entry(entry: QueueEntry, xm_status: str, reason: str = '',
                     age_s: Optional[float] = None) -> bool:
   """Apply decide_reconcile to one entry in place. Returns True if the entry's
@@ -2577,6 +2712,8 @@ def reconcile_entry(entry: QueueEntry, xm_status: str, reason: str = '',
     return False
   old = entry.state
   entry.state = new_state
+  # Keep the authoritative submission record in step with the row transition.
+  sync_current_submission(entry, new_state, reason=reason)
   if new_state == JobState.DONE:
     entry.last_reason = reason or f'reconciled: XM reports COMPLETED (was local {old.value}); finished normally'
   elif new_state == JobState.FAILED:
