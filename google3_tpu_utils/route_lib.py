@@ -1780,7 +1780,7 @@ def build_warm_restart_entry(dead: 'QueueEntry', checkpoint: str,
   prior = list(getattr(dead, 'prior_xids', None) or [])
   if dead.xid:
     prior.append(str(dead.xid))
-  return QueueEntry(
+  entry = QueueEntry(
       job_id=new_job_id,
       # Carry the human label forward: a warm restart IS the same run, so it
       # keeps its readable name. Only the opaque job_id is freshly minted (a new
@@ -1807,11 +1807,17 @@ def build_warm_restart_entry(dead: 'QueueEntry', checkpoint: str,
       # window to protect.
       state=JobState.QUEUED,
       auto_resumes=new_attempt,
-      prior_xids=prior,
       last_reason=(f'auto warm-restart from {checkpoint} after '
                    f'pruned/preempted death of {dead.job_id} '
                    f'(xid {dead.xid})'),
   )
+  # prior_xids is a DERIVED, property-backed field (Phase 2a), not a real
+  # __init__ parameter -- seed it through the setter AFTER construction (it
+  # records the carried-forward history as SUPERSEDED submissions). Passing it
+  # as a constructor kwarg tripped pyrefly with unexpected-keyword; the runtime
+  # dataclass tolerated it, so the offline suite never caught it.
+  entry.prior_xids = prior
+  return entry
 
 
 def _metro_has_group_storage(metro: str) -> bool:

@@ -61,8 +61,8 @@ class _Submitter(Protocol):
   §5.4 early-binding hook. Optional so old callers / fakes need not supply it."""
 
   def submit(self, argv: list[str], cwd: str = '',
-             on_early_xid: 'Optional[Callable[[str], None]]' = None
-             ) -> tuple[Optional[str], str]:
+             on_early_xid: 'Optional[Callable[[str], None]]' = None,
+             job_id: str = '') -> tuple[Optional[str], str]:
     ...
 
   def cancel(self, xid: str) -> tuple[bool, str]:
@@ -134,7 +134,7 @@ class _JobIdProbe(Protocol):
   NONE / AMBIGUOUS / UNKNOWN, and only NONE clears a row to build."""
 
   def find_xid_by_jobid(
-      self, job_id: str
+      self, job_id: str, known_xids: 'Optional[Sequence[str]]' = None,
   ) -> 'tuple[Optional[str], Optional[tuple[str, str, int]], str]':
     ...
 
@@ -2263,10 +2263,15 @@ def run_worker_once(
     r_xid, r_place, r_status = jobid_probe.find_xid_by_jobid(
         claimed.job_id, known_xids=claimed.all_xids)
     if r_status == 'FOUND':
+      # FOUND guarantees a concrete xid; assert narrows Optional[str] -> str for
+      # the type checker, and the closure captures it via a default arg (flow
+      # narrowing does not cross into a nested function, so a bare reference
+      # would re-widen to str | None).
+      assert r_xid is not None
       r_cell, r_arch, r_chips = (r_place if r_place else (None, None, None))
-      def _recover(e: route_lib.QueueEntry) -> None:
+      def _recover(e: route_lib.QueueEntry, _xid: str = r_xid) -> None:
         route_lib.adopt_recovered_submission(
-            e, r_xid, cell=r_cell, arch=r_arch, chips=r_chips, now=time.time())
+            e, _xid, cell=r_cell, arch=r_arch, chips=r_chips, now=time.time())
       update_entry(queue_file, claimed.job_id, _recover)
       log.append(f'[worker] {claimed.job_id} -> RECOVERED xid={r_xid} by jobid '
                  f'tag (escaped build from a create/persist crash); adopted, '
