@@ -112,6 +112,23 @@ class _FakePlacementProbe:
     return self._by_xid.get(xid)
 
 
+class _FakeJobIdProbe:
+  """Scripted find_xid_by_jobid(): returns a (xid, placement, status) triple.
+
+  Stands in for XManagerJobIdProbe so the worker's pre-build escape check can be
+  exercised without an XManager RPC. `result` is the triple to return; `calls`
+  records (job_id, known_xids) so a test can assert the row's known ids were
+  passed through (the re-routed-job de-dup)."""
+
+  def __init__(self, result=(None, None, 'NONE')):
+    self._result = result
+    self.calls = []
+
+  def find_xid_by_jobid(self, job_id, known_xids=None):
+    self.calls.append((job_id, list(known_xids or [])))
+    return self._result
+
+
 # (AdoptEscapedBuildTest removed 2026-09-16 with the adopt_check_name /
 # adopt_escaped_builds machinery it exercised. The stale-BUILDING resolution it
 # used to cover now lives in route_lib.reclaim_stale_building -- reading each
@@ -1141,6 +1158,233 @@ class SerialWorkerTest(unittest.TestCase):
         self.path, self._prov(), sub, now=100.0, worker_id='w')
     self.assertEqual(outcome, 'requeued')
     self.assertEqual(self._byid('rf').attempts, 1)  # real failure counts
+
+
+class WorkerJobIdRecoveryTest(unittest.TestCase):
+  """§5.4 pre-build escape check: before rebuilding a reclaimed row, ask
+  XManager (by the row's jobid tag) whether the build already escaped. This is
+  the last resort for the ONE window early binding cannot close -- router died
+  between create and persist -- and it is fail-closed."""
+
+  def setUp(self):
+    self.path = tempfile.mkstemp(suffix='.json')[1]
+    self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+    lock = self.path + '.lock'
+    self.addCleanup(lambda: os.path.exists(lock) and os.remove(lock))
+
+  def _seed(self, entries):
+    RC.save_queue(self.path, entries)
+
+  def _byid(self, jid):
+    return {e.job_id: e for e in RC.load_queue(self.path)}[jid]
+
+  def _prov(self, cell='yutulpz', arch='v7', free=320):
+    return _FakeProvider({f'{cell}|{arch}': _avail(cell, arch, free)},
+                         arch_price={arch: 20.0}, arch_pool={arch: free})
+
+  def _reclaimed(self, jid='r', attempts=1):
+    # A row reclaim_stale_building left as 'crashed before create': QUEUED, one
+    # attempt burned, no live submission.
+    e = _entry(jid, power='v7-32', archs=('v7',))
+    e.attempts = attempts
+    return e
+
+  def test_found_escaped_build_is_adopted_not_rebuilt(self):
+    self._seed([self._reclaimed('r')])
+    sub = _FakeSubmitter(xid='999')
+    probe = _FakeJobIdProbe(('285706173', ('sj', 'v6p', 32), 'FOUND'))
+    outcome, log, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=5000.0, worker_id='w',
+        jobid_probe=probe)
+    self.assertEqual(outcome, 'recovered')
+    self.assertEqual(sub.calls, [])                    # NEVER rebuilt
+    e = self._byid('r')
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertEqual(e.xid, '285706173')
+    self.assertEqual((e.cell, e.arch, e.chips), ('sj', 'v6p', 32))
+
+  def test_none_means_nothing_escaped_so_build_proceeds(self):
+    self._seed([self._reclaimed('r')])
+    sub = _FakeSubmitter(xid='999')
+    probe = _FakeJobIdProbe((None, None, 'NONE'))
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=5000.0, worker_id='w',
+        jobid_probe=probe)
+    self.assertEqual(outcome, 'submitted')             # built normally
+    self.assertEqual(self._byid('r').xid, '999')
+
+  def test_ambiguous_holds_for_a_human_never_guesses(self):
+    self._seed([self._reclaimed('r')])
+    sub = _FakeSubmitter(xid='999')
+    probe = _FakeJobIdProbe((None, None, 'AMBIGUOUS'))
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=5000.0, worker_id='w',
+        jobid_probe=probe)
+    self.assertEqual(outcome, 'held')
+    self.assertEqual(sub.calls, [])                    # never rebuilt
+    self.assertEqual(self._byid('r').state, R.JobState.HELD)
+
+  def test_unknown_defers_build_never_rebuilds_on_unreadable_lookup(self):
+    self._seed([self._reclaimed('r')])
+    sub = _FakeSubmitter(xid='999')
+    probe = _FakeJobIdProbe((None, None, 'UNKNOWN'))
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=5000.0, worker_id='w',
+        jobid_probe=probe)
+    self.assertEqual(outcome, 'deferred')
+    self.assertEqual(sub.calls, [])                    # never rebuilt
+    e = self._byid('r')
+    self.assertEqual(e.state, R.JobState.QUEUED)       # slot released
+    self.assertEqual(e.attempts, 1)                    # attempts untouched
+
+  def test_fresh_row_skips_the_lookup_entirely(self):
+    # attempts == 0: the create/persist-crash state is impossible, so the happy
+    # path must pay NO RPC. The probe must not even be called.
+    self._seed([self._reclaimed('r', attempts=0)])
+    sub = _FakeSubmitter(xid='999')
+    probe = _FakeJobIdProbe((None, None, 'NONE'))
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=5000.0, worker_id='w',
+        jobid_probe=probe)
+    self.assertEqual(outcome, 'submitted')
+    self.assertEqual(probe.calls, [])                  # lookup skipped
+
+  def test_row_with_live_xid_skips_the_lookup(self):
+    # A row that already holds a live early-bound xid is not in the escape
+    # window; the check must be skipped even though attempts > 0.
+    e = self._reclaimed('r')
+    e.open_creating(xid='111', cell='sj', arch='v7', chips=32, now=4000.0)
+    self._seed([e])
+    sub = _FakeSubmitter(xid='999')
+    probe = _FakeJobIdProbe((None, None, 'NONE'))
+    RC.run_worker_once(self.path, self._prov(), sub, now=5000.0,
+                       worker_id='w', jobid_probe=probe)
+    self.assertEqual(probe.calls, [])                  # lookup skipped
+
+  def test_no_probe_supplied_is_backward_compatible(self):
+    # jobid_probe=None (the default) -> the check is inert and the row builds
+    # exactly as before this feature.
+    self._seed([self._reclaimed('r')])
+    sub = _FakeSubmitter(xid='999')
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=5000.0, worker_id='w')
+    self.assertEqual(outcome, 'submitted')
+
+  def test_known_xids_are_passed_so_rerouted_history_is_excluded(self):
+    # A re-routed row accumulates tagged experiments it already knows about; the
+    # worker must hand them to the probe so they are not re-flagged as escaped.
+    e = self._reclaimed('r')
+    e.open_creating(xid='100', now=3000.0)
+    e.submissions[-1].state = 'SUPERSEDED'             # a past, known attempt
+    self._seed([e])
+    sub = _FakeSubmitter(xid='999')
+    probe = _FakeJobIdProbe((None, None, 'NONE'))
+    RC.run_worker_once(self.path, self._prov(), sub, now=5000.0,
+                       worker_id='w', jobid_probe=probe)
+    self.assertEqual(len(probe.calls), 1)
+    _jid, known = probe.calls[0]
+    self.assertIn('100', known)                        # known id forwarded
+
+
+class _FakeExp:
+  """Minimal stand-in for an xmanager Experiment: an id and launch_args."""
+
+  def __init__(self, experiment_id, launch_args=()):
+    self.experiment_id = experiment_id
+    self.launch_args = list(launch_args)
+
+
+class _FakeXmClient:
+  """Stand-in for XManagerApi: list_experiments(tags=...) returns scripted exps
+  keyed by the tag, or raises to exercise the UNKNOWN path."""
+
+  def __init__(self, by_tag=None, raises=False):
+    self._by_tag = by_tag or {}
+    self._raises = raises
+    self.calls = []
+
+  def list_experiments(self, tags=None):
+    self.calls.append(list(tags or []))
+    if self._raises:
+      raise RuntimeError('XM unreachable')
+    out = []
+    for t in (tags or []):
+      out.extend(self._by_tag.get(t, []))
+    return out
+
+
+class XManagerJobIdProbeTest(unittest.TestCase):
+  """The jobid-tag query primitive (§5.4). Injects a fake client so the
+  triple-returning, fail-closed, known-id-excluding logic is tested offline."""
+
+  def _probe(self, client):
+    p = RC.XManagerJobIdProbe()
+    p._client = client            # inject; _get_client returns it as-is
+    return p
+
+  def test_found_unique_returns_xid_and_placement(self):
+    exp = _FakeExp(285706173,
+                   ['--cell=sj', '--tpu_type=v6p-32', '--foo=bar'])
+    client = _FakeXmClient({'jobid:j1': [exp]})
+    xid, place, status = self._probe(client).find_xid_by_jobid('j1')
+    self.assertEqual(status, 'FOUND')
+    self.assertEqual(xid, '285706173')
+    self.assertEqual(place, ('sj', 'v6p', 32))
+    self.assertEqual(client.calls, [['jobid:j1']])   # queried by the tag
+
+  def test_none_when_no_experiment_carries_the_tag(self):
+    client = _FakeXmClient({})
+    xid, place, status = self._probe(client).find_xid_by_jobid('j1')
+    self.assertEqual((xid, place, status), (None, None, 'NONE'))
+
+  def test_known_xids_are_excluded_so_rerouted_history_is_not_reflagged(self):
+    # Two tagged experiments: one the row already knows (a past attempt), one it
+    # does not. Only the unknown one is 'escaped'.
+    known = _FakeExp(100, ['--cell=sj', '--tpu_type=v6p-32'])
+    escaped = _FakeExp(285706173, ['--cell=mtv', '--tpu_type=v7-16'])
+    client = _FakeXmClient({'jobid:j1': [known, escaped]})
+    xid, _, status = self._probe(client).find_xid_by_jobid(
+        'j1', known_xids=['100'])
+    self.assertEqual(status, 'FOUND')
+    self.assertEqual(xid, '285706173')
+
+  def test_all_matches_known_is_none_not_ambiguous(self):
+    # A re-routed row whose every tagged experiment is already recorded: nothing
+    # escaped, so NONE (build proceeds) -- must NOT read as AMBIGUOUS.
+    a = _FakeExp(100)
+    b = _FakeExp(200)
+    client = _FakeXmClient({'jobid:j1': [a, b]})
+    _, _, status = self._probe(client).find_xid_by_jobid(
+        'j1', known_xids=['100', '200'])
+    self.assertEqual(status, 'NONE')
+
+  def test_two_unknown_matches_is_ambiguous(self):
+    a = _FakeExp(100)
+    b = _FakeExp(200)
+    client = _FakeXmClient({'jobid:j1': [a, b]})
+    xid, _, status = self._probe(client).find_xid_by_jobid('j1')
+    self.assertEqual(status, 'AMBIGUOUS')
+    self.assertIsNone(xid)
+
+  def test_client_exception_is_unknown_not_none(self):
+    # 'Could not see it' must be distinguishable from 'not there'.
+    client = _FakeXmClient(raises=True)
+    self.assertEqual(self._probe(client).find_xid_by_jobid('j1'),
+                     (None, None, 'UNKNOWN'))
+
+  def test_empty_job_id_short_circuits_to_none(self):
+    client = _FakeXmClient({})
+    self.assertEqual(self._probe(client).find_xid_by_jobid(''),
+                     (None, None, 'NONE'))
+    self.assertEqual(client.calls, [])               # no query made
+
+  def test_found_but_unparseable_launch_args_still_binds_with_no_placement(self):
+    exp = _FakeExp(285706173, ['--nonsense'])         # no cell/tpu_type
+    client = _FakeXmClient({'jobid:j1': [exp]})
+    xid, place, status = self._probe(client).find_xid_by_jobid('j1')
+    self.assertEqual(status, 'FOUND')
+    self.assertEqual(xid, '285706173')
+    self.assertIsNone(place)
 
 
 class IsBudgetDeferralTest(unittest.TestCase):

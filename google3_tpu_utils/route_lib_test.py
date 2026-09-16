@@ -1108,6 +1108,64 @@ class ReclaimEarlyBoundTest(unittest.TestCase):
     self.assertNotIn('adopt_check_name', names)
 
 
+class AdoptRecoveredSubmissionTest(unittest.TestCase):
+  """§5.4 last resort: adopt an experiment recovered by its jobid tag onto a
+  row whose router died between create and persist. The row had no XID; adoption
+  records it and moves the row to SUBMITTED so a rebuild never double-writes."""
+
+  def _reclaimed_row(self, job_id='j'):
+    # The state reclaim_stale_building leaves for a 'crashed before create' row:
+    # QUEUED, no live submission, one build attempt burned.
+    e = _entry(job_id)
+    e.state = R.JobState.QUEUED
+    e.attempts = 1
+    return e
+
+  def test_adopts_xid_and_moves_to_submitted(self):
+    e = self._reclaimed_row()
+    R.adopt_recovered_submission(e, '285706173', cell='sj', arch='v6p',
+                                 chips=32, now=5000.0)
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertEqual(e.xid, '285706173')
+    self.assertEqual(e.current_submission.state, 'CREATING')
+    self.assertIsNone(e.build_started_at)
+    self.assertIsNone(e.worker_id)
+
+  def test_backfills_placement_onto_row(self):
+    e = self._reclaimed_row()
+    self.assertIsNone(e.cell)
+    R.adopt_recovered_submission(e, '285706173', cell='sj', arch='v6p',
+                                 chips=32, now=5000.0)
+    self.assertEqual((e.cell, e.arch, e.chips), ('sj', 'v6p', 32))
+
+  def test_does_not_bump_attempts(self):
+    # §5.5: recovering a lost binding is not a build failure.
+    e = self._reclaimed_row()
+    e.attempts = 2
+    R.adopt_recovered_submission(e, '285706173', now=5000.0)
+    self.assertEqual(e.attempts, 2)
+
+  def test_adopt_with_no_placement_leaves_row_fields_but_still_binds(self):
+    # A recovered experiment whose launch_args could not be parsed: xid is still
+    # adopted (that is what prevents the double-write), placement stays None for
+    # the reroute-side backfill to fill later. Never guess a cell.
+    e = self._reclaimed_row()
+    R.adopt_recovered_submission(e, '285706173', now=5000.0)
+    self.assertEqual(e.xid, '285706173')
+    self.assertIsNone(e.cell)
+
+  def test_recovered_submission_is_in_all_xids(self):
+    e = self._reclaimed_row()
+    R.adopt_recovered_submission(e, '285706173', now=5000.0)
+    self.assertIn('285706173', e.all_xids)
+
+  def test_reason_names_the_recovery(self):
+    e = self._reclaimed_row()
+    R.adopt_recovered_submission(e, '285706173', now=5000.0)
+    self.assertIn('recovered by jobid tag', e.last_reason)
+    self.assertIn('285706173', e.last_reason)
+
+
 class BuildRequestedBackpressureTest(unittest.TestCase):
   """Step1: BUILD_REQUESTED handoff token + backpressure counting."""
 

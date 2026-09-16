@@ -2594,6 +2594,48 @@ def reclaim_stale_building(entries: list['QueueEntry'], now: float,
   return touched
 
 
+def adopt_recovered_submission(entry: 'QueueEntry', xid: str,
+                               *, cell: Optional[str] = None,
+                               arch: Optional[str] = None,
+                               chips: Optional[int] = None,
+                               now: Optional[float] = None) -> None:
+  """Adopt an experiment recovered by its `jobid:` tag onto `entry` (§5.4).
+
+  The last-resort recovery for the ONE window early binding cannot close by
+  itself: the router process died AFTER `create_experiment` succeeded on
+  XManager but BEFORE on_early_xid persisted the CREATING submission. The row
+  then carries no XID, so reclaim_stale_building reads it as 'crashed before
+  create' and would rebuild -- a second writer on the running experiment's
+  output path. A pre-build lookup by the unique jobid tag finds the escaped
+  experiment; this records it so the row is verified, never rebuilt.
+
+  Opens a CREATING submission carrying the recovered xid (open_creating
+  supersedes any stale live record), then moves the ROW to SUBMITTED and
+  backfills cell/arch/chips onto the row from what the lookup resolved (the
+  liveness probes need e.cell; a None there is the xid 288485310 16h-wedge).
+  attempts is NOT touched -- recovering a lost binding is not a build failure
+  (§5.5). reconcile then promotes it to RUNNING against XManager truth.
+  """
+  entry.open_creating(xid=str(xid), cell=cell, arch=arch, chips=chips,
+                      group=pinned_group(entry) or getattr(entry, 'group', None),
+                      now=now)
+  entry.state = JobState.SUBMITTED
+  entry.build_started_at = None
+  entry.worker_id = None
+  entry.submitted_at = entry.submitted_at or now
+  if entry.cell is None and cell is not None:
+    entry.cell = cell
+  if entry.arch is None and arch is not None:
+    entry.arch = arch
+  if entry.chips is None and chips is not None:
+    entry.chips = chips
+  entry.last_reason = (
+      f'recovered by jobid tag: experiment xid={xid} was already created on '
+      f'XManager under this row\'s job_id before the router persisted it; '
+      f'adopted instead of rebuilding (a rebuild would double-write its output '
+      f'path). Handed to reconcile to verify.')
+
+
 def next_queued(entries: list['QueueEntry']) -> Optional['QueueEntry']:
   """The next QUEUED entry to build, highest priority first then FIFO-ish by
   list order. Returns None if nothing is queued. Does NOT consider whether a

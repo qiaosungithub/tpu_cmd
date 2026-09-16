@@ -128,6 +128,17 @@ class _PlacementProbe(Protocol):
     ...
 
 
+class _JobIdProbe(Protocol):
+  """Recovers an escaped experiment by its unique `jobid:<id>` tag (§5.4). See
+  XManagerJobIdProbe: returns (xid, placement, status) where status is FOUND /
+  NONE / AMBIGUOUS / UNKNOWN, and only NONE clears a row to build."""
+
+  def find_xid_by_jobid(
+      self, job_id: str
+  ) -> 'tuple[Optional[str], Optional[tuple[str, str, int]], str]':
+    ...
+
+
 class _RestartProbe(Protocol):
   """How many times a job has been restarted IN PLACE since it last made durable
   progress (a new checkpoint), or None if that cannot be measured. Backed by a
@@ -1076,6 +1087,70 @@ class XManagerPlacementProbe:
       return parse_placement_from_launch_args(exp.launch_args)
     except Exception:  # pylint: disable=broad-except
       return None
+
+
+class XManagerJobIdProbe:
+  """Recover an escaped experiment by its `jobid:<id>` tag (§5.4, last resort).
+
+  The tag is stamped by xm_launcher right after create_experiment and is a
+  first-class server-side-queryable, Spanner-indexed, EXACT-match field
+  (XMANAGER_query_surface.md), so `list_experiments(tags=['jobid:<id>'])`
+  returns exactly the experiment(s) carrying that id -- no client-side paging.
+  Returns a (xid, placement, status) triple, fail-closed. `known_xids` are the
+  ids the ROW already knows it owned (entry.all_xids); they are excluded from
+  the match, because a re-routed job accumulates one tagged experiment PER
+  attempt (each create stamps the tag; reroute cancels the old one but the tag
+  stays), and every one of those is already recorded on the row. What we are
+  hunting is an experiment the row does NOT know about -- the one that escaped
+  when the router died between create and persist. After excluding the known
+  ids:
+    * ('N', placement_or_None, 'FOUND')  -- exactly one UNKNOWN experiment.
+                                            Adopt it.
+    * (None, None, 'NONE')               -- the lookup RAN and every match is
+                                            already known (or none): nothing
+                                            escaped, safe to build.
+    * (None, None, 'AMBIGUOUS')          -- >1 UNKNOWN experiment carries this
+                                            id (should be impossible). Do NOT
+                                            pick one -- park for a human.
+    * (None, None, 'UNKNOWN')            -- the lookup could not run (import/RPC
+                                            failed). 'could not see it' must not
+                                            read as 'not there': do not build.
+  """
+
+  def __init__(self):
+    self._client = None
+
+  def _get_client(self):
+    if self._client is None:
+      from google3.learning.deepmind.xmanager2.client import xmanager_api
+      self._client = xmanager_api.XManagerApi()
+    return self._client
+
+  def find_xid_by_jobid(
+      self, job_id: str, known_xids: 'Optional[Sequence[str]]' = None,
+  ) -> tuple['Optional[str]', 'Optional[tuple[str, str, int]]', str]:
+    if not job_id:
+      return None, None, 'NONE'
+    try:
+      client = self._get_client()
+      exps = list(client.list_experiments(tags=[f'jobid:{job_id}']))
+    except Exception:  # pylint: disable=broad-except
+      return None, None, 'UNKNOWN'
+    known = {str(x) for x in (known_xids or [])}
+    # Keep only experiments the row has never recorded -- the escaped one(s).
+    unknown = [e for e in exps if str(e.experiment_id) not in known]
+    if not unknown:
+      return None, None, 'NONE'
+    if len(unknown) > 1:
+      return None, None, 'AMBIGUOUS'
+    exp = unknown[0]
+    xid = str(exp.experiment_id)
+    placement = None
+    try:
+      placement = parse_placement_from_launch_args(exp.launch_args)
+    except Exception:  # pylint: disable=broad-except
+      placement = None
+    return xid, placement, 'FOUND'
 
 
 def _parse_fileutil_mtime(fields: list[str]) -> Optional[float]:
@@ -2111,6 +2186,7 @@ def run_worker_once(
     last_fail_count: Optional[int] = None,
     max_build_attempts: int = 3,
     claim_pick: 'Optional[Callable[[list[route_lib.QueueEntry]], Optional[route_lib.QueueEntry]]]' = None,
+    jobid_probe: 'Optional[_JobIdProbe]' = None,
 ) -> tuple[str, list[str], Optional[int]]:
   """One worker step. Returns (outcome, log_lines, new_fail_count).
 
@@ -2166,6 +2242,63 @@ def run_worker_once(
     update_entry(queue_file, claimed.job_id, _hold_bad_workdir)
     log.append(f'[worker] {claimed.job_id} -> HELD ({reason}); slot released, not churned.')
     return 'held', log, new_fail_count
+
+  # PRE-BUILD ESCAPE CHECK (§5.4, last resort). Early binding closes the crash
+  # window in all but one case: the router died AFTER create_experiment
+  # succeeded on XManager but BEFORE on_early_xid persisted the CREATING
+  # submission. The row then carries no live xid, so reclaim read it as
+  # 'crashed before create' and requeued it -- and rebuilding now would put a
+  # SECOND writer on the escaped experiment's output path. Before building, ask
+  # XManager whether an experiment already carries this row's jobid tag.
+  #
+  # Gated so the happy path pays NOTHING: only a row that has already burned a
+  # build attempt (attempts > 0) and holds no live xid can be in this state; a
+  # fresh row skips the RPC entirely. Fail-closed -- only a lookup that RAN and
+  # found nothing (NONE) proceeds to build; FOUND adopts, AMBIGUOUS parks for a
+  # human, UNKNOWN releases the slot to retry (never builds on 'could not see').
+  cur_sub = claimed.current_submission
+  has_live_xid = (cur_sub is not None and cur_sub.xid
+                  and cur_sub.state in route_lib.SUBMISSION_LIVE_STATES)
+  if jobid_probe is not None and claimed.attempts > 0 and not has_live_xid:
+    r_xid, r_place, r_status = jobid_probe.find_xid_by_jobid(
+        claimed.job_id, known_xids=claimed.all_xids)
+    if r_status == 'FOUND':
+      r_cell, r_arch, r_chips = (r_place if r_place else (None, None, None))
+      def _recover(e: route_lib.QueueEntry) -> None:
+        route_lib.adopt_recovered_submission(
+            e, r_xid, cell=r_cell, arch=r_arch, chips=r_chips, now=time.time())
+      update_entry(queue_file, claimed.job_id, _recover)
+      log.append(f'[worker] {claimed.job_id} -> RECOVERED xid={r_xid} by jobid '
+                 f'tag (escaped build from a create/persist crash); adopted, '
+                 f'NOT rebuilt. Slot released for reconcile to verify.')
+      return 'recovered', log, new_fail_count
+    if r_status == 'AMBIGUOUS':
+      reason = (f'jobid-tag recovery found MORE THAN ONE unrecorded experiment '
+                f'for job_id={claimed.job_id}; refusing to guess which to adopt '
+                f'(rebuilding could double-write). A human must resolve: '
+                f'tpu requeue {claimed.job_id} after cancelling the stray(s).')
+      def _held_ambiguous(e: route_lib.QueueEntry) -> None:
+        route_lib.hold_entry(e, reason)
+      update_entry(queue_file, claimed.job_id, _held_ambiguous)
+      log.append(f'[worker] {claimed.job_id} -> HELD ({reason}); slot released.')
+      return 'held', log, new_fail_count
+    if r_status == 'UNKNOWN':
+      # The lookup could not run. 'Could not see it' must not read as 'not
+      # there', so do NOT build: release the slot back to QUEUED (attempts
+      # untouched) and retry the check next round.
+      def _defer(e: route_lib.QueueEntry) -> None:
+        e.state = route_lib.JobState.QUEUED
+        e.build_started_at = None
+        e.worker_id = None
+        e.last_reason = ('jobid-tag escape check could not reach XManager; '
+                         'holding the build back until it can (never rebuild on '
+                         'an unreadable lookup -- an escaped experiment may be '
+                         'live and unseen).')
+      update_entry(queue_file, claimed.job_id, _defer)
+      log.append(f'[worker] {claimed.job_id}: jobid-tag check UNKNOWN (XM '
+                 f'unreachable); slot released, will retry -- not rebuilding.')
+      return 'deferred', log, new_fail_count
+    # r_status == 'NONE': nothing escaped -- fall through and build normally.
 
   # PLAN a cell for it (live availability).
   placement = plan_one_entry(claimed, provider, now)
@@ -2506,7 +2639,7 @@ def run_worker_loop(
         queue_file, provider, submitter, now=time.time(), worker_id=worker_id,
         build_stale_s=build_stale_s, group=group, stage_probe=stage_probe,
         srcfs_fail_brake=srcfs_fail_brake, last_fail_count=last_fail,
-        max_build_attempts=max_build_attempts)
+        max_build_attempts=max_build_attempts, jobid_probe=XManagerJobIdProbe())
     for line in log:
       print(line, flush=True)
     # After a successful build, immediately try the next (drain fast); otherwise
@@ -2563,7 +2696,8 @@ def run_dispatch_worker_loop(
         build_stale_s=build_stale_s, group=group, stage_probe=stage_probe,
         srcfs_fail_brake=srcfs_fail_brake, last_fail_count=last_fail,
         max_build_attempts=max_build_attempts,
-        claim_pick=route_lib.next_build_requested)
+        claim_pick=route_lib.next_build_requested,
+        jobid_probe=XManagerJobIdProbe())
     for line in wlog:
       print(line, flush=True)
     # Drain fast after a successful build; otherwise sleep so an idle/busy/braked
