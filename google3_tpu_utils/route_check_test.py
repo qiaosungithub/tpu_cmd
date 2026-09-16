@@ -68,6 +68,7 @@ class _FakeSubmitter:
   def __init__(self, xid='555001', name_lookup=None):
     self.calls = []
     self.cwds = []
+    self.job_ids = []
     self.cancels = []
     self._xid = xid
     # What find_xid_by_name should answer. Default: the lookup RAN and saw
@@ -76,9 +77,10 @@ class _FakeSubmitter:
     self.name_lookups = []
     self._name_lookup = name_lookup or (None, 'XM lookup ran and found no exact-name match')
 
-  def submit(self, argv, cwd='', on_early_xid=None):
+  def submit(self, argv, cwd='', on_early_xid=None, job_id=''):
     self.calls.append(argv)
     self.cwds.append(cwd)
+    self.job_ids.append(job_id)
     # Mirror production: fire the early-binding callback with the XID the instant
     # the experiment is "created", BEFORE returning the (post-build) result. A
     # scripted None xid means a dead launch -- no experiment, no early callback.
@@ -557,7 +559,7 @@ class _BudgetRefusedSubmitter:
     self.calls = []
     self.cwds = []
 
-  def submit(self, argv, cwd='', on_early_xid=None):
+  def submit(self, argv, cwd='', on_early_xid=None, job_id=''):
     # A budget refusal never creates an experiment, so there is no early XID to
     # bind -- the callback is accepted (production always passes it) but not
     # fired, exactly like a dead launch.

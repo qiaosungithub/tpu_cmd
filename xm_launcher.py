@@ -1357,7 +1357,30 @@ def main(argv) -> None:
 
     experiment_context = xm_abc.get_experiment(experiment_id=_RESUME_XID.value) if _RESUME_XID.value else xm_abc.create_experiment(experiment_title=exp_name)
     with experiment_context as experiment:
-        
+
+        # ★Stamp the router's local job_id as a `jobid:<id>` XManager TAG, right
+        # after the experiment exists (smart-router design §5.3). Tags are
+        # server-side filterable and Spanner-indexed, so
+        # `client.list_experiments(tags=['jobid:<id>'])` recovers the
+        # XID<->job_id binding EXACTLY if the local queue row is ever lost --
+        # the queryable channel that inverts the 2026-09-15 root cause (adopting
+        # the newest same-NAME experiment). The id arrives via the
+        # TPU_LOCAL_JOB_ID env the router sets on the submit subprocess; unset
+        # (a hand-run `tpu queue`) simply skips the tag. Fail-SOFT: a tag error
+        # must never abort a launch -- the tag is a redundant recovery channel,
+        # not the primary binding (that is the early-captured `Experiment id:`).
+        _local_job_id = os.environ.get('TPU_LOCAL_JOB_ID', '').strip()
+        if _local_job_id:
+            try:
+                experiment.context.annotations.add_tags(f'jobid:{_local_job_id}')
+                print(f'[launcher] stamped tag jobid:{_local_job_id} on '
+                      f'experiment {experiment.experiment_id}', flush=True)
+            except Exception as _tag_err:  # pylint: disable=broad-except
+                print(f'[launcher] WARN: could not stamp jobid tag '
+                      f'({_tag_err!r}); continuing -- early-xid binding is the '
+                      f'primary channel, the tag is only for recovery.',
+                      flush=True)
+
         # --- Codebase Specifics via config.sh ---
         project_name = "unified_project"
         package_mode = "python" # 'python' or 'bazel'

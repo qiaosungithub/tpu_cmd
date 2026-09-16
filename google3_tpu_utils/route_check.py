@@ -737,8 +737,8 @@ class Submitter:
     self.timeout_s = timeout_s
 
   def submit(self, argv: list[str], cwd: str = '',
-             on_early_xid: 'Optional[Callable[[str], None]]' = None
-             ) -> tuple[Optional[str], str]:
+             on_early_xid: 'Optional[Callable[[str], None]]' = None,
+             job_id: str = '') -> tuple[Optional[str], str]:
     # argv[0] is 'tpu' (a shell function); build a sourced-shell command.
     # `cwd` is where `tpu queue` runs, hence what its rsync packages -- it MUST
     # be the job's own checkout or the wrong source is shipped. Empty = inherit
@@ -750,6 +750,18 @@ class Submitter:
     run_cwd = cwd or None
     if run_cwd is not None and not os.path.isdir(run_cwd):
       return None, f'[route_check] refusing to submit: workdir does not exist: {run_cwd}'
+    # ★Pass the local job_id to the launcher via env (§5.3 tag stamp). The
+    # launcher stamps `jobid:<id>` as an XManager tag right after
+    # create_experiment, giving a server-queryable, exact, Spanner-indexed
+    # channel to recover the XID<->job_id binding if the local row is ever lost.
+    # Env (not a --flag) so the churn-prone tpu_wrapper.sh arg parser is
+    # untouched: xm_launcher already reads several TPU_* vars the same way, and
+    # the launch path does not scrub the environment. Empty job_id => unset =>
+    # the launcher simply skips the tag (a no-op, exactly today's behavior).
+    sub_env = None
+    if job_id:
+      sub_env = dict(os.environ)
+      sub_env['TPU_LOCAL_JOB_ID'] = job_id
     # ★STREAM the output (§5.4 early binding). The build blocks for minutes; the
     # `Experiment id: N` creation line prints in the first instant. Reading
     # stdout line-by-line lets us fire `on_early_xid` the moment the experiment
@@ -759,7 +771,8 @@ class Submitter:
     # at ~0.02s vs the post-build launch line at build-completion.
     try:
       proc = subprocess.Popen(['bash', '-c', script], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, cwd=run_cwd)
+                              stderr=subprocess.PIPE, text=True, cwd=run_cwd,
+                              env=sub_env)
     except OSError as e:
       return None, f'[route_check] could not start submit: {e}'
     stdout_lines: list[str] = []
@@ -2054,7 +2067,8 @@ def run_tick(
     def _bind_early(exid: str, _entry=entry, _p=p):
       _entry.open_creating(xid=exid, cell=_p.cell, arch=_p.arch, chips=_p.chips,
                            group=getattr(_entry, 'group', None), now=time.time())
-    xid, out = sub.submit(argv, cwd=workdir, on_early_xid=_bind_early)
+    xid, out = sub.submit(argv, cwd=workdir, on_early_xid=_bind_early,
+                          job_id=p.job_id)
     if xid:
       # ★`submitted_at` is "epoch when handed to XM", and `submit` BLOCKS for the
       # whole build -- 890-1692 s measured in the field (host build lock, then
@@ -2272,7 +2286,8 @@ def run_worker_once(
                       group=route_lib.pinned_group(e) or getattr(e, 'group', None),
                       now=time.time())
     update_entry(queue_file, claimed.job_id, _open)
-  xid, out = submitter.submit(argv, cwd=pkg_dir, on_early_xid=_bind_early)
+  xid, out = submitter.submit(argv, cwd=pkg_dir, on_early_xid=_bind_early,
+                              job_id=claimed.job_id)
 
   if xid:
     # ★See the same fix in run_tick: `submit` blocks for the whole build, so the
