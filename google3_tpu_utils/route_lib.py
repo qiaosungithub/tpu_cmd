@@ -2505,12 +2505,40 @@ def can_claim_build(entries: list['QueueEntry'], now: float,
 # empty-workdir-that-fails case, caught without guessing whether the config is
 # flag-resolvable). HELD is recoverable, not terminal.
 
+def describe_submissions(entry: 'QueueEntry') -> str:
+  """A short, TRUE summary of a row's submission history for a HELD reason (§5.5).
+
+  Computed from the authoritative submissions list, so it can never again claim
+  a row "never produced an XID" when it produced four (the 2026-09-15 attnfilm
+  incident: the hardcoded reason lied about a row that had a live experiment).
+  Examples:
+    'no experiment was ever created'
+    'submissions: 288.. FAILED; live: none'
+    'submissions: 285.. SUPERSEDED, 289.. RUNNING; live: 289..'
+  """
+  subs = entry.submissions
+  if not subs:
+    return 'no experiment was ever created'
+  parts = []
+  for s in subs:
+    tag = (s.xid or '(no-xid)')
+    parts.append(f'{tag} {s.state}')
+  live = [s.xid for s in subs if s.xid and s.state in SUBMISSION_LIVE_STATES]
+  live_str = ', '.join(live) if live else 'none'
+  return f'submissions: {"; ".join(parts)}; live: {live_str}'
+
+
 def hold_entry(entry: QueueEntry, reason: str) -> QueueEntry:
-  """Park an entry in HELD with a human-readable reason. Frees the build slot."""
+  """Park an entry in HELD with a human-readable reason. Frees the build slot.
+
+  The submission history is APPENDED to the caller's reason (§5.5), so the parked
+  row always states what actually happened to its experiments -- a caller can no
+  longer stamp a reason that contradicts the row's own submissions."""
   entry.state = JobState.HELD
   entry.build_started_at = None
   entry.worker_id = None
-  entry.last_reason = f'HELD: {reason}'
+  hist = describe_submissions(entry)
+  entry.last_reason = f'HELD: {reason} [{hist}]'
   return entry
 
 

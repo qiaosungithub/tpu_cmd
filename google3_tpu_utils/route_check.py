@@ -862,7 +862,16 @@ class Submitter:
 
   def find_xid_by_name(self, exp_name: str,
                        timeout_s: float = 120.0) -> tuple[Optional[str], str]:
-    """Newest XID whose experiment name matches EXACTLY, or (None, why).
+    """Last-resort name lookup: the SOLE XID matching EXACTLY, or (None, why).
+
+    ★DEMOTED to fail-closed (§5.4). This used to `return max(rows, key=int)` --
+    pick the NEWEST experiment sharing a name -- which is ROOT CAUSE 2 of the
+    2026-09-15 incident: with four same-named experiments it adopted a fresh
+    build and orphaned the one that was actually running. Identity now binds
+    early by the unique local id, so this name probe is only a residual recovery
+    aid for the narrow window where the id was never captured. When the name is
+    AMBIGUOUS it must therefore NEVER guess: it returns None and parks the
+    decision for a human. A unique match is still adopted (that is unambiguous).
 
     `--experiment_name` matches a SUBSTRING, so the exact-match filter below is
     load-bearing: `foo_v3` must not adopt `foo_v30`.
@@ -883,7 +892,13 @@ class Submitter:
         rows.append(f[0])
     if not rows:
       return None, 'XM lookup ran and found no exact-name match'
-    return max(rows, key=int), f'XM lookup matched {len(rows)} experiment(s)'
+    if len(rows) > 1:
+      # FAIL CLOSED: never pick the newest of an ambiguous set (root cause 2).
+      return None, (f'XM lookup found {len(rows)} experiments named {exp_name} '
+                    f'({", ".join(sorted(rows, key=int))}); AMBIGUOUS, refusing '
+                    f'to guess -- a human must say which. (identity binds early '
+                    f'by local id now; this name probe never adopts a collision.)')
+    return rows[0], 'XM lookup matched exactly 1 experiment'
 
   def cancel(self, xid: str) -> tuple[bool, str]:
     script = (f'source {_shquote(self.wrapper_path)} >/dev/null 2>&1; '

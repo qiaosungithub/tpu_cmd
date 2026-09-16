@@ -717,6 +717,65 @@ class SubmissionsViewTest(unittest.TestCase):
     self.assertEqual(e3.all_xids, ['1', '2'])           # and re-derive the view
 
 
+class FourSameNameNoOrphanTest(unittest.TestCase):
+  """Regression for the 2026-09-15 attnfilm incident (design §6 asks for this).
+
+  ROOT CAUSE: a row was re-routed repeatedly, each attempt creating an XManager
+  experiment with the SAME exp_name; the scalar `xid` was overwritten and the
+  recovery-by-name helper adopted `max(rows)` -- the NEWEST same-name id --
+  while an EARLIER experiment was still RUNNING. The running experiment had no
+  local row pointing at it, so it billed invisibly and the row's HELD reason
+  claimed it had 'never produced an XID'.
+
+  With submissions authoritative, EVERY id a re-route leaves behind is retained
+  (SUPERSEDED, never dropped), so none can be orphaned; and the HELD reason is
+  computed from that history, so it can never again lie."""
+
+  def test_four_reroutes_same_name_orphan_none_and_reason_is_true(self):
+    e = _entry(job_id='attnfilm-4n-film-2e4')
+    e.launch_kwargs = {'exp_name': 'attnfilm-4n-film-2e4'}   # the single shared name
+    e.state = R.JobState.SUBMITTED
+    e.submitted_at = 0.0
+    created = []
+    # Four placements of the SAME job, each a distinct XID, re-routed between.
+    for i, x in enumerate(['288001', '288002', '288003', '288004']):
+      p = R.Placement(job_id=e.job_id, cell=f'cell{i}', arch='v6e', chips=16,
+                      price=8.0, reason='placed', geometry=None)
+      R.apply_placement(e, p, xid=x, now=100.0 + i)
+      created.append(x)
+      if i < 3:
+        R.mark_reroute(e, now=150.0 + i, cooldown_s=1800.0)
+
+    # 1) NO XID IS ORPHANED: every experiment ever created is still tracked.
+    self.assertEqual(e.all_xids, created)
+    self.assertEqual(set(R.entry_xids(e)), set(created))
+
+    # 2) exactly one live submission -- the last placement -- and it is `xid`.
+    live = [s for s in e.submissions if s.state in R.SUBMISSION_LIVE_STATES]
+    self.assertEqual([s.xid for s in live], ['288004'])
+    self.assertEqual(e.xid, '288004')
+    self.assertEqual(e.prior_xids, ['288001', '288002', '288003'])
+
+    # 3) the earlier ids are retained as SUPERSEDED, never dropped.
+    superseded = [s.xid for s in e.submissions if s.state == 'SUPERSEDED']
+    self.assertEqual(superseded, ['288001', '288002', '288003'])
+
+    # 4) the HELD reason tells the TRUTH -- it can no longer say "never produced
+    # an XID" for a row that produced four.
+    R.hold_entry(e, 'build failed 3 times')
+    self.assertNotIn('never produced', e.last_reason.lower())
+    for x in created:
+      self.assertIn(x, e.last_reason)         # every real id is named
+
+  def test_held_row_that_truly_never_created_says_so(self):
+    # The honest negative: a row that genuinely never created an experiment must
+    # still read as such -- the fix must not paper over the real no-XID case.
+    e = _entry(job_id='never-built')
+    e.state = R.JobState.BUILDING
+    R.hold_entry(e, 'build failed 3 times')
+    self.assertIn('no experiment was ever created', e.last_reason)
+
+
 
 class TopologyLockTest(unittest.TestCase):
 
