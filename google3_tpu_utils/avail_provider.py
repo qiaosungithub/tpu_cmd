@@ -22,8 +22,11 @@ imports in a bare interpreter for those tests.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import re
+import sys
 from typing import Any, Callable, Optional
 
 from google3.experimental.users.qiaos.tpu_utils import metro_util
@@ -49,8 +52,11 @@ ARCH_PLATFORM: dict[str, str] = {
     'h200': 'GPU_NVIDIA_H200',        # 86
     'b200': 'GPU_NVIDIA_B200',        # 87
     'b300': 'GPU_NVIDIA_B300',        # 112
-    'gb200': 'GPU_NVIDIA_GB200',      # 89
-    'gb300': 'GPU_NVIDIA_GB300',      # 100
+    # gb200 (89) / gb300 (100) are NOT resolvable: the operator's directive forbids this
+    # group from using them, so the router must not be able to name a GB slice at all.
+    # ★Removing them here makes an unknown-arch lookup fail; it does NOT relax a cap.
+    # Contrast tpu_wrapper.sh's `gb200) echo "20"`, which is a limit-PRICE and whose
+    # deletion would leave the family UNCAPPED -- that one stays.
 }
 
 # arch -> card codes in market.json price keys (first present wins for price).
@@ -61,7 +67,7 @@ ARCH_CARDS: dict[str, list[int]] = {
     'v6p': [92],
     'v7': [101],
     'a100': [46], 'a100_80gib': [66], 'h100': [70], 'h200': [86],
-    'b200': [87], 'b300': [112], 'gb200': [89], 'gb300': [100],
+    'b200': [87], 'b300': [112],   # gb200/gb300 withdrawn: see above
 }
 
 # The alloc/group the router submits under (same as slice_probe --group=9).
@@ -140,6 +146,52 @@ def load_prices(market_json_path: str = DEFAULT_MARKET_JSON,
   return out
 
 
+def load_cell_prices(market_json_path: str = DEFAULT_MARKET_JSON,
+                     pool: str = DEFAULT_PRICE_POOL) -> dict[str, dict[str, float]]:
+  """arch -> {cell -> credits/chip-hr}, the PER-CELL prices in the same layer.
+
+  ★THE PRICES WERE ALWAYS THERE; the router just never read them. Each market
+  layer holds `global` PLUS one entry per cell, and inside one arch they differ
+  by up to 3.2x -- v6e measured 15.999 (x102 cells) and 51.923 (x13 cells) in
+  the same snapshot, v6p 14.404/28.261, v5p 15.475/33.692. `load_prices` takes
+  only `global`, so every cell of an arch reached the router with an identical
+  price and the cell-level sort had nothing to rank on.
+
+  Invalid entries are DROPPED, not defaulted:
+    * `None`   -- GQM quotes no price for that cell (v7's yuphxrp). A cell with
+                  no price is one we cannot cost, and guessing the global value
+                  for it is how a cell you cannot actually get ends up looking
+                  like the cheapest option.
+    * non-numeric -- same reasoning.
+  A price of 0.0 is KEPT: a free pool is a real state (v4/v6e whole layers sit
+  at 0.0), not missing data.
+
+  Returns {} if the cache is missing; callers fall back to the global price,
+  i.e. exactly today's behaviour.
+  """
+  try:
+    with open(market_json_path) as f:
+      market = json.load(f)
+  except (OSError, ValueError):
+    return {}
+  prices = market.get('prices', {})
+  out: dict[str, dict[str, float]] = {}
+  for arch, cards in ARCH_CARDS.items():
+    for card in cards:
+      layer = prices.get(f'{pool}|{card}|PROD')
+      if not isinstance(layer, dict) or 'global' not in layer:
+        continue
+      per_cell: dict[str, float] = {}
+      for cell, val in layer.items():
+        if cell == 'global' or not isinstance(val, (int, float)):
+          continue          # drops None and any non-numeric quote
+        per_cell[cell] = float(val)
+      if per_cell:
+        out[arch] = per_cell
+      break
+  return out
+
+
 def parse_cell_availability(resp: Any, platform_int: int) -> dict[str, tuple[int, bool]]:
   """cell -> (free_chips, oversold) for ONE platform, from a GetCellAvailability
   response. Pure: `resp` is the proto (or a duck-typed fake for tests).
@@ -167,6 +219,7 @@ def parse_cell_availability(resp: Any, platform_int: int) -> dict[str, tuple[int
 def build_availability(
     per_arch: dict[str, dict[str, tuple[int, bool]]],
     arch_price: dict[str, float],
+    cell_price: Optional[dict[str, dict[str, float]]] = None,
 ) -> tuple[dict[str, route_lib.CellAvail], dict[str, float], dict[str, float]]:
   """Assemble the router's three inputs from parsed per-arch cell data. Pure.
 
@@ -179,19 +232,157 @@ def build_availability(
   and the router would never see it. route_lib scans .values() filtered by arch
   and matches placements by content, so the key shape is opaque to it.
   arch_pool[arch] = sum of free chips across that arch's cells (live magnitude).
+
+  `cell_price[arch][cell]` (from `load_cell_prices`) gives each CellAvail its
+  OWN price. A cell missing from that map falls back to the arch's global price
+  -- which is the pre-2026-08-31 behaviour for every cell, so an absent or
+  stale market cache degrades to exactly what the router did before.
   """
   avail_by_cell: dict[str, route_lib.CellAvail] = {}
   arch_pool: dict[str, float] = {}
+  cell_price = cell_price or {}
   for arch, cells in per_arch.items():
     pool = 0
     price = arch_price.get(arch)
+    by_cell = cell_price.get(arch, {})
     for cell, (free_chips, oversold) in cells.items():
       pool += max(0, free_chips)
       avail_by_cell[f'{cell}|{arch}'] = route_lib.CellAvail(
           cell=cell, arch=arch, free_chips=free_chips, oversold=oversold,
-          price=price, metro=metro_str(cell))
+          price=by_cell.get(cell, price), metro=metro_str(cell))
     arch_pool[arch] = float(pool)
   return avail_by_cell, arch_price, arch_pool
+
+
+# --- half-initialised module recovery ---------------------------------------
+# ★A transient gRPC failure inside a LAZY import pins a long-lived worker
+# FOREVER, and it disguises itself as "waiting for capacity": the router logs
+# `availability fetch failed`, keeps the job QUEUED, never increments attempts,
+# never bills, and the fleet stalls with nothing marked broken.
+#
+# MECHANISM, measured against the live RPC (not inferred):
+# A generated `*_pb_stubby.py` sets, at MODULE level,
+#     try:  _client_stub_base_class = proto_python_api_2_stub.Stub
+#     except ImportError: _client_stub_base_class = object
+# When the RPC stack is half-imported, that line raises AttributeError, which
+# the `except ImportError` does NOT catch -- so the stubby module itself dies
+# mid-body and every later call raises
+#     NameError: name '_client_stub_base_class' is not defined
+# Python never re-runs an import that is already in sys.modules, so the process
+# is poisoned for good.
+#
+# ★THE FIX IS RELOAD-IN-PLACE, NOT EVICTION. Dropping the modules from
+# sys.modules and re-importing MEASURABLY DOES NOT WORK: the cached
+# `*_pb2.GoodputService` class holds `__globals__` pointing at the OLD module
+# dict, so a fresh import builds a second dict nobody references and the stale
+# class keeps raising. `importlib.reload()` re-executes the body in the SAME
+# dict, which is the one the cached class reads. Verified end to end against
+# blade:xborg-prod-routing-layer: poison 711 attrs -> evict+reimport still
+# NameError -> reload-in-place recovers 206 cells.
+#
+# ★THE DISCRIMINATOR: AttributeError or NameError => the module EXISTS but is
+#   INCOMPLETE, i.e. a poisoned PROCESS, not a version mismatch -- do NOT go
+#   chasing library versions. An ImportError means the dependency is genuinely
+#   absent and a reload cannot help; let it propagate.
+# Corroborating signal: the first failure differs from every later one, and a
+# FRESH process succeeds.
+_HALF_INIT_MODULE_HINTS = (
+    'stubby',
+    'grpc',
+    'rpc',
+    'net.rpc',
+)
+
+
+_HALF_INIT_RE = re.compile(r"module '([A-Za-z0-9_.]+)' has no attribute")
+# The stubby module's own body died partway, so a module-level name it was
+# supposed to bind is missing. This is the shape actually observed live.
+_HALF_INIT_NAME_RE = re.compile(r"name '([A-Za-z0-9_]+)' is not defined")
+
+
+def _looks_half_initialised(exc: BaseException) -> bool:
+  """True iff `exc` is the 'module exists but is incomplete' shape.
+
+  ONLY AttributeError (attribute never populated) and NameError (module body
+  died before binding a module-level name) qualify. An ImportError means the
+  module is genuinely absent -- reloading and retrying would just burn a second
+  RPC deadline and hide the real error.
+  """
+  if isinstance(exc, ImportError):  # ModuleNotFoundError included
+    return False
+  if isinstance(exc, NameError):
+    return _HALF_INIT_NAME_RE.search(str(exc)) is not None
+  if not isinstance(exc, AttributeError):
+    return False
+  return _poisoned_module_name(exc) is not None
+
+
+def _poisoned_module_name(exc: BaseException) -> Optional[str]:
+  """The module named by an AttributeError, e.g. `...base_stubby_api`, or None."""
+  m = _HALF_INIT_RE.search(str(exc))
+  return m.group(1) if m else None
+
+
+def _is_generated_proto(name: str) -> bool:
+  """Generated `_pb2` protos are NEVER reloaded: re-executing one duplicates
+  descriptor-pool entries and raises, turning a recoverable stall into a hard
+  crash. Their `_pb_stubby` siblings are safe and ARE reloaded -- that is where
+  the poison actually sits."""
+  return '_pb2' in name.lower()
+
+
+def _reload_candidates(seed: Optional[str]) -> list[str]:
+  """Live RPC-stack modules to re-execute in place.
+
+  Wider than just the module named in the message, because a module that DID
+  finish importing still holds a reference to the broken one:
+    1. the seed module named by the error, plus its submodules;
+    2. every RPC-stack module (`_HALF_INIT_MODULE_HINTS`);
+  both excluding generated protos and `None` tombstones (a tombstone has no
+  module object to reload; it is dropped separately).
+  """
+  victims: set[str] = set()
+  for name, mod in list(sys.modules.items()):
+    if mod is None or _is_generated_proto(name):
+      continue
+    if seed and (name == seed or name.startswith(seed + '.')):
+      victims.add(name)
+      continue
+    lowered = name.lower()
+    if any(h in lowered for h in _HALF_INIT_MODULE_HINTS):
+      victims.add(name)
+  return sorted(victims)
+
+
+def _tombstone_names() -> list[str]:
+  """`None` entries left in sys.modules by a failed import; safe to drop."""
+  return sorted(n for n, m in list(sys.modules.items()) if m is None)
+
+
+def _heal_half_initialised_modules(seed: Optional[str] = None) -> list[str]:
+  """Re-execute poisoned RPC modules IN PLACE. Returns the names healed.
+
+  In place (`importlib.reload`) rather than pop+reimport: the cached generated
+  service class reads the ORIGINAL module dict via `__globals__`, so a fresh
+  module object would leave it reading the stale one. Scoped to the RPC stack
+  on purpose -- reloading the world under a live worker is not recoverable.
+  """
+  healed: list[str] = []
+  for name in _tombstone_names():
+    sys.modules.pop(name, None)
+    healed.append(name)
+  for name in _reload_candidates(seed):
+    mod = sys.modules.get(name)
+    if mod is None:
+      continue
+    try:
+      importlib.reload(mod)
+      healed.append(name)
+    except Exception:  # pylint: disable=broad-except
+      # A module that refuses to reload is not fatal: the others may still
+      # restore the stack, and the retry will show whether it worked.
+      pass
+  return healed
 
 
 class AvailabilityProvider:
@@ -249,7 +440,27 @@ class AvailabilityProvider:
 
   # -- the live fetch -------------------------------------------------------
   def fetch(self) -> tuple[dict[str, route_lib.CellAvail], dict[str, float], dict[str, float]]:
-    """One RPC per arch -> the router's (avail_by_cell, arch_price, arch_pool)."""
+    """One RPC per arch -> the router's (avail_by_cell, arch_price, arch_pool).
+
+    Retries ONCE after re-executing half-initialised modules in place (see
+    `_looks_half_initialised`): a transient gRPC failure during a lazy import
+    otherwise pins a long-lived worker forever.
+    """
+    try:
+      return self._fetch_once()
+    except Exception as e:  # pylint: disable=broad-except
+      if not _looks_half_initialised(e):
+        raise
+      healed = _heal_half_initialised_modules(_poisoned_module_name(e))
+      print(f'[avail_provider] half-initialised module detected '
+            f'({type(e).__name__}: {e}); reloaded {len(healed)} module(s) in '
+            f'place and retrying once: {healed[:8]}', flush=True)
+      if not healed:
+        raise
+      return self._fetch_once()
+
+  def _fetch_once(self) -> tuple[dict[str, route_lib.CellAvail], dict[str, float], dict[str, float]]:
+    """The unguarded fetch. One RPC per arch."""
     stub = (self._stub_factory or self._default_stub)()
     resolve = self._alloc_resolver or self._resolve_alloc
     platform_of = self._platform_enum or self._platform_int
@@ -271,5 +482,9 @@ class AvailabilityProvider:
       per_arch[arch] = parse_cell_availability(resp, platform_int)
 
     arch_price = load_prices(self.market_json_path)
-    return build_availability(per_arch, arch_price)
+    # Two reads of the same file, deliberately: the ARCH score wants one price
+    # per arch, the CELL score wants each cell's own. Conflating them is what
+    # made the cell-level sort price-blind.
+    cell_price = load_cell_prices(self.market_json_path)
+    return build_availability(per_arch, arch_price, cell_price)
 
