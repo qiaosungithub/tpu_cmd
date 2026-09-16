@@ -1045,6 +1045,23 @@ class SerialWorkerTest(unittest.TestCase):
     self.assertEqual(e.xid, '900')
     self.assertIsNone(e.build_started_at)         # slot released
 
+  def test_records_last_build_duration_on_submit(self):
+    # The build-speed viz in `tpu check` reads last_build_duration; it must be
+    # written the instant before build_started_at is cleared. claim_for_build
+    # stamps build_started_at = now (here 100.0); the fake submit returns
+    # instantly, so submitted_now ~= 100.0 and the recorded duration ~= 0.
+    # The point of the assertion is that the field is POPULATED (not None) and
+    # non-negative -- with a real blocking build it is the true wall-clock time.
+    self._seed([_entry('a', power='v7-32', archs=('v7',))])
+    sub = _FakeSubmitter(xid='900')
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=100.0, worker_id='w1')
+    self.assertEqual(outcome, 'submitted')
+    e = self._byid('a')
+    self.assertIsNone(e.build_started_at)              # slot released
+    self.assertIsNotNone(e.last_build_duration)        # duration recorded
+    self.assertGreaterEqual(e.last_build_duration, 0.0)
+
   def test_single_build_invariant_blocks_second_claim(self):
     # one already BUILDING (live) + one QUEUED -> worker must NOT start a 2nd
     e_bld = _entry('bld', power='v7-32', archs=('v7',))

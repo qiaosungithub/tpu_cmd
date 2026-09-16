@@ -645,6 +645,14 @@ class QueueEntry:
   chips: Optional[int] = None       # concrete chip count chosen
   submitted_at: Optional[float] = None   # epoch when handed to XM
   build_started_at: Optional[float] = None  # epoch a worker claimed it (BUILDING)
+  # ★Wall-clock seconds the LAST successful build took (build_started_at ->
+  # SUBMITTED), recorded the instant the worker submits and BEFORE it clears
+  # build_started_at. Diagnostic only -- nothing routes on it -- but persisted so
+  # `tpu check` can show "how long did this job's build take" after the fact,
+  # since build_started_at is reset to None on SUBMITTED and the duration would
+  # otherwise be unrecoverable. None = never built yet, or a row from before this
+  # field existed (from_dict drops the key, default restores None: no regression).
+  last_build_duration: Optional[float] = None
   worker_id: Optional[str] = None   # which worker claimed it (BUILDING); for debug
   attempts: int = 0                 # BUILD failures so far -- the 3-strikes
                                     # brake reads THIS. Never bump it for a

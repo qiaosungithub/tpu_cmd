@@ -619,6 +619,19 @@ class SerdeTest(unittest.TestCase):
     self.assertEqual(e2.cooldown_cells, {'c': 5.0})
     self.assertEqual(e2.cooldown_metros, {'sin': {'until': 9.0, 'strikes': 2}})
 
+  def test_last_build_duration_roundtrips_and_defaults_none(self):
+    # New diagnostic field: defaults None (a row built by an older binary), and
+    # survives the JSON round-trip when set. A missing key must restore None
+    # (from_dict drops unknown keys), so an old queue file loads without error.
+    e = _entry()
+    self.assertIsNone(e.last_build_duration)          # default
+    e.last_build_duration = 73.5
+    e2 = R.QueueEntry.from_dict(e.to_dict())
+    self.assertEqual(e2.last_build_duration, 73.5)     # round-trips
+    d = e.to_dict()
+    del d['last_build_duration']                       # simulate old row
+    self.assertIsNone(R.QueueEntry.from_dict(d).last_build_duration)
+
 
 
 class TopologyLockTest(unittest.TestCase):

@@ -2163,11 +2163,20 @@ def run_worker_once(
     submitted_now = now + max(0.0, time.time() - t_submit)
 
     def _submitted(e: route_lib.QueueEntry) -> None:
+      # ★Record how long the build took BEFORE clearing build_started_at, so
+      # `tpu check` can show it after the fact. build_started_at was set by
+      # claim_for_build at BUILDING; submitted_now is `now` advanced by the
+      # blocking submit, so this is the true wall-clock build duration.
+      if e.build_started_at is not None:
+        e.last_build_duration = max(0.0, submitted_now - e.build_started_at)
       route_lib.apply_placement(e, placement, xid=xid, now=submitted_now)
       e.build_started_at = None
       e.worker_id = None
     update_entry(queue_file, claimed.job_id, _submitted)
-    log.append(f'[worker] {claimed.job_id} -> SUBMITTED xid={xid} cell={placement.cell}')
+    dur = ''
+    if claimed.build_started_at is not None:
+      dur = f' build={max(0.0, submitted_now - claimed.build_started_at):.0f}s'
+    log.append(f'[worker] {claimed.job_id} -> SUBMITTED xid={xid} cell={placement.cell}{dur}')
     return 'submitted', log, new_fail_count
 
   # R2 FIX: BUDGET-DEFERRAL is NOT a build failure. Before the MODE-1 GUARD
