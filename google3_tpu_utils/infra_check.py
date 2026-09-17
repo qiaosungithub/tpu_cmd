@@ -19,6 +19,10 @@ from rich.align import Align
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('user', 'qiaos', 'User LDAP')
+flags.DEFINE_bool(
+    'tail_cache_daemon', False,
+    'Run as the long-lived log-tail sidecar (keeps Colossus channels hot and '
+    'refreshes the tail cache file) instead of rendering the board once.')
 
 
 # Scope by the same env vars every other consumer reads (tpu_wrapper.sh, the
@@ -499,6 +503,30 @@ _STAT_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 # inside the 300s staleness alarm.
 _LOG_TAIL_BUDGET_SEC = 45.0
 
+# --- Sidecar tail cache -----------------------------------------------------
+# The board process is spawned FRESH each round, so it opens cold Colossus
+# channels every time; on this non-prod host opening a far cell's channel (si-d,
+# Singapore) measured ~20s, which dominated the tail phase and starved far-cell
+# jobs of their tail. A long-lived `--tail_cache_daemon` process opens each
+# channel ONCE and reuses it for its whole life (warm reads are ~3.5s), writing
+# the results here; the per-round board reads fresh entries from this file
+# instead of reading CNS itself.
+#
+# STRICTLY ADDITIVE by construction: only 'ok'/'nolog' results are ever written
+# (never 'error'), and the board trusts an entry only while it is fresh, so a
+# dead daemon / stale / missing / corrupt file makes every bucket fall back to a
+# direct read -- byte-for-byte the pre-sidecar behaviour. Scoped by the same env
+# var family as the registry so the guest/npu operator gets a separate file.
+_TAIL_SIDECAR_FILE = os.path.expanduser(
+    os.environ.get('TPU_TAIL_CACHE_FILE') or '~/.tpu_tail_cache.json')
+# An entry is trusted by the board only this fresh. Well above the daemon's
+# refresh period below (a healthy daemon's entries never look stale) yet well
+# under the 300s staleness alarm (a DEAD daemon's entries expire and the board
+# reverts to direct reads within a couple of rounds).
+_TAIL_SIDECAR_MAX_AGE_SEC = 180.0
+# The daemon's target period between refresh passes.
+_TAIL_SIDECAR_POLL_SEC = 20.0
+
 # Experiment fetch is now ONE batched list_experiments RPC (see main). Work
 # units are still fetched per experiment, so those RPCs are fanned out across
 # this pool: issued only from the main thread -- never from inside another
@@ -589,35 +617,41 @@ def _read_log_tail(bucket: str, nbytes: int = 16384) -> tuple[str, str]:
     with entries[best[1]].open('rb') as handle:
       try:
         handle.seek(-nbytes, os.SEEK_END)
-      except OSError:
-        pass  # file shorter than the window; read it whole
+      except Exception:  # noqa: BLE001 - see below; must catch more than OSError
+        # A file SHORTER than the window: seek-from-end runs off the front. On a
+        # local POSIX file that is OSError, but CNS/epath raises its own
+        # SeekError('bad offset: -N') which is NOT an OSError -- so an `except
+        # OSError` let it escape to the outer handler and every small log (the
+        # torch ports write 5-10 KB) was misreported as an unreadable 'error'.
+        # Whatever the backend, the recovery is identical: read the whole file.
+        try:
+          handle.seek(0)
+        except Exception:  # noqa: BLE001 - already at start on most backends
+          pass
       return ('ok', handle.read().decode('utf-8', errors='replace'))
   except Exception:  # noqa: BLE001 - the tail is a nicety, never a hard failure
     return ('error', '')
 
 
-def _fetch_log_tails(buckets: list[str]) -> dict[str, str]:
-  """Read every bucket's tail concurrently; return {bucket: text}.
+def _read_tails_direct(buckets: list[str]) -> dict[str, tuple[str, str]]:
+  """Concurrently read every bucket's tail RIGHT NOW; {bucket: (kind, text)}.
 
-  A bucket maps to its tail text when the read succeeded, to '' when the job has
-  genuinely not written a log yet ('nolog'), and is ABSENT when the read failed
-  even after a retry. `_log_tail` renders those three as the tail lines, "no log
-  file yet", and silence respectively.
+  The COLD path: it opens whatever Colossus channels it needs and pays the cost
+  in-line. `_fetch_log_tails` calls this only for the buckets the warm sidecar
+  did not already cover, and the sidecar daemon calls it for all buckets.
 
-  Concurrency plus one shared deadline keeps `tpu check` interactive: the phase
-  costs the slowest single read, not the sum, and a wedged cell cannot hang the
-  board. The deadline is shared, not per-future -- the old per-future timeout
-  walked the futures in submission order and handed the FIRST job the whole
-  window and each later job only the leftover, so whether a job got its tail
-  turned on its POSITION in the list rather than its own read speed.
+  Concurrency plus one shared deadline keeps the phase cheap: it costs the
+  slowest single read, not the sum, and a wedged cell cannot hang the caller.
+  The deadline is shared, not per-future -- a per-future timeout walked the
+  futures in submission order and handed the FIRST bucket the whole window and
+  each later one only the leftover, so whether a bucket was read turned on its
+  POSITION in the list rather than its own read speed.
 
-  The retry is load-bearing. The daemon starts a FRESH process each round, so
-  every round opens cold Colossus channels and the first read to each cell fails
-  while its channel initialises. The old per-future serial timeout hid this by
-  accidentally warming the channels before it reached the last few jobs (which
-  is why only the oldest handful ever showed a tail). With the reads now fired
-  together the cold failures land together -- so retry exactly the failures
-  once, by which time the channels opened in the first pass are warm.
+  The retry is load-bearing for the cold board process: it opens cold channels
+  and the first read to each cell fails while the channel initialises, so retry
+  exactly the failures once, by which time the first pass has warmed them. (The
+  long-lived sidecar daemon is already warm after its first pass, so its retries
+  are rare.)
   """
   wanted = [b for b in dict.fromkeys(buckets) if b]
   if not wanted:
@@ -639,6 +673,130 @@ def _fetch_log_tails(buckets: list[str]) -> dict[str, str]:
   retry = [b for b in wanted if results.get(b, ('error', ''))[0] == 'error']
   if retry:
     _run(retry)
+  return results
+
+
+def _load_tail_sidecar() -> dict[str, tuple[str, str]]:
+  """Fresh {bucket: (kind, text)} from the sidecar file, or {} if unusable.
+
+  Only entries younger than _TAIL_SIDECAR_MAX_AGE_SEC and of kind ok/nolog are
+  returned, so a dead daemon's file (entries age out), a missing file, or a
+  corrupt file all yield {} -- and the board then falls back to direct reads.
+  Never raises.
+  """
+  try:
+    with open(_TAIL_SIDECAR_FILE) as f:
+      blob = json.load(f)
+  except (OSError, ValueError):
+    return {}
+  if not isinstance(blob, dict) or blob.get('version') != 1:
+    return {}
+  now = time.time()
+  out: dict[str, tuple[str, str]] = {}
+  for bucket, ent in (blob.get('tails') or {}).items():
+    try:
+      if now - float(ent['ts']) > _TAIL_SIDECAR_MAX_AGE_SEC:
+        continue
+      kind = ent['kind']
+      if kind in ('ok', 'nolog'):
+        out[bucket] = (kind, ent.get('text', ''))
+    except (KeyError, TypeError, ValueError):
+      continue
+  return out
+
+
+def _write_tail_sidecar(results: dict[str, tuple[str, str]]) -> None:
+  """Atomically persist ok/nolog tails (tmp + os.replace).
+
+  'error' results are NEVER written: a stale sidecar can then only ever OMIT a
+  bucket (-> the board direct-reads it), never misreport one as absent/no-log.
+  """
+  now = time.time()
+  tails = {
+      bucket: {'kind': kind, 'text': text, 'ts': now}
+      for bucket, (kind, text) in results.items()
+      if kind in ('ok', 'nolog')
+  }
+  blob = {'version': 1, 'updated': now, 'tails': tails}
+  tmp = '%s.tmp.%d' % (_TAIL_SIDECAR_FILE, os.getpid())
+  with open(tmp, 'w') as f:
+    json.dump(blob, f)
+  os.replace(tmp, _TAIL_SIDECAR_FILE)
+
+
+def _run_tail_cache_daemon() -> None:
+  """Long-lived tail refresher that keeps Colossus channels hot across rounds.
+
+  The per-round board process is cold and pays ~20s to open a far cell's channel
+  every round; that cost dominated the tail phase and starved far-cell (si-d)
+  jobs. This process opens each channel ONCE and reuses it for its whole life,
+  so every refresh after the first is warm. It reads the live job registry each
+  pass (new jobs are picked up without a restart), reads all their tails via
+  `_read_tails_direct`, and writes the sidecar file.
+
+  Single-writer: holds an flock for its whole life, so a second copy exits
+  immediately rather than both racing on the file. Never exits on a read error;
+  only a lost lock or a fatal signal stops it.
+  """
+  import fcntl
+  lock_path = _TAIL_SIDECAR_FILE + '.lock'
+  lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+  try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except OSError:
+    print('[tail-daemon] another instance holds %s; exiting' % lock_path,
+          file=sys.stderr, flush=True)
+    return
+  print('[tail-daemon] started; refreshing %s every ~%.0fs'
+        % (_TAIL_SIDECAR_FILE, _TAIL_SIDECAR_POLL_SEC),
+        file=sys.stderr, flush=True)
+  while True:
+    t0 = time.monotonic()
+    try:
+      jobs = _load_json(_JOBS_FILE)
+      buckets = [
+          (v.get('bucket_cp_path', '') if isinstance(v, dict) else '')
+          for v in jobs.values()
+      ]
+      buckets = [b for b in dict.fromkeys(buckets) if b]
+      results = _read_tails_direct(buckets) if buckets else {}
+      _write_tail_sidecar(results)
+      n_ok = sum(1 for k, _ in results.values() if k == 'ok')
+      n_nolog = sum(1 for k, _ in results.values() if k == 'nolog')
+      print('[tail-daemon] %d buckets -> %d ok, %d nolog in %.1fs'
+            % (len(results), n_ok, n_nolog, time.monotonic() - t0),
+            file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001 - a daemon must never die on one pass
+      print('[tail-daemon] pass failed: %r' % e, file=sys.stderr, flush=True)
+    time.sleep(max(1.0, _TAIL_SIDECAR_POLL_SEC - (time.monotonic() - t0)))
+
+
+def _fetch_log_tails(buckets: list[str]) -> dict[str, str]:
+  """Return {bucket: tail_text} for the board, sidecar-first.
+
+  A bucket maps to its tail text ('ok'), to '' when the job genuinely has no log
+  yet ('nolog'), and is ABSENT when the read failed ('error') -- `_log_tail`
+  renders those three as the tail lines, "no log file yet", and silence.
+
+  Fresh entries from the warm sidecar are used as-is; buckets the sidecar has
+  not covered are read directly. The result is therefore a superset of the
+  pre-sidecar behaviour: with no daemon (stale/missing/corrupt file) EVERY
+  bucket falls back to a direct read and the board behaves exactly as before.
+  """
+  wanted = [b for b in dict.fromkeys(buckets) if b]
+  if not wanted:
+    return {}
+  sidecar = _load_tail_sidecar()
+  results: dict[str, tuple[str, str]] = {}
+  missing: list[str] = []
+  for b in wanted:
+    hit = sidecar.get(b)
+    if hit is not None:
+      results[b] = hit
+    else:
+      missing.append(b)
+  if missing:
+    results.update(_read_tails_direct(missing))
 
   out: dict[str, str] = {}
   for bucket, (kind, text) in results.items():
@@ -646,7 +804,7 @@ def _fetch_log_tails(buckets: list[str]) -> dict[str, str]:
       out[bucket] = text
     elif kind == 'nolog':
       out[bucket] = ''  # present-but-empty -> rendered as "no log file yet"
-    # 'error' (even after retry) -> omit -> _log_tail stays silent
+    # 'error' -> omit -> _log_tail stays silent
   return out
 
 
@@ -1249,6 +1407,10 @@ def main(argv):
     if len(argv) > 1 and argv[1] == 'clear':
         _clear_jobs(argv[2:], mapping_dir)
         sys.exit(0)
+
+    if FLAGS.tail_cache_daemon:
+        _run_tail_cache_daemon()
+        return
 
     args_user = FLAGS.user
 
