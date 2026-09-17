@@ -465,13 +465,16 @@ _LOG_TAIL_SKIP = (
 
 # CNS round-trips dominate the tail, so they are issued concurrently. One pool
 # for the process: the client releases the GIL, and rebuilding a pool per call
-# would cost more than the reads. Sized for (jobs x ranks) in flight at once.
-_CNS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+# would cost more than the reads. Sized to comfortably EXCEED the number of
+# running jobs so none waits for a free worker -- with fewer workers than jobs,
+# the overflow cannot even START its read until an earlier one frees a slot, and
+# on this cross-metro host that overflow reliably missed the budget.
+_CNS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=32)
 
 # The per-rank stat() fan-out inside _read_log_tail MUST NOT share _CNS_POOL.
 # _read_log_tail itself runs ON a _CNS_POOL worker, so submitting its own work
 # back to that pool is a classic nested-executor deadlock: with more tracked
-# jobs than workers (16), every worker is occupied by an OUTER task waiting for
+# jobs than pool workers, every worker is occupied by an OUTER task waiting for
 # INNER tasks that can never be scheduled. The main thread escapes via
 # _LOG_TAIL_BUDGET_SEC and the table still renders, so the symptom is not a
 # slow table -- it is a process that prints everything and then never exits,
@@ -479,10 +482,22 @@ _CNS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 # `tpu_check_daemon.sh` on its `wait`, froze the money/quota caches, and made
 # `tpu money` report stale data every time. Two pools never deadlock: an inner
 # task only ever waits on a worker from a strictly different pool.
-_STAT_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+_STAT_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
-# How long the whole tail-fetching phase may take before we render without it.
-_LOG_TAIL_BUDGET_SEC = 8.0
+# How long the whole tail-fetching phase -- ALL jobs' reads together, not each
+# one -- may take before the table renders with whatever has arrived. Shared as
+# a SINGLE deadline in _fetch_log_tails so a job's tail depends on its own read
+# speed, not on its position in the list.
+#
+# Sized for the SLOWEST SINGLE read, not the sum: the reads run concurrently, so
+# a healthy round returns the moment the last bucket finishes, well under this
+# ceiling. It only bites when a read is genuinely slow. On this non-prod host
+# every CNS cell is treated as different-metro, and one bucket's list+stat+read
+# measured 8-15s even warm -- so the old 8-12s ceiling cut off nearly every job
+# and the board went tail-less. 45s clears 3x the worst measured single read;
+# with the 60s work-unit ceiling after it, a full round still finishes far
+# inside the 300s staleness alarm.
+_LOG_TAIL_BUDGET_SEC = 45.0
 
 # Experiment fetch is now ONE batched list_experiments RPC (see main). Work
 # units are still fetched per experiment, so those RPCs are fanned out across
@@ -510,44 +525,54 @@ def _fetch_work_units(exp):
   return list(exp.get_work_units())
 
 
-def _read_log_tail(bucket: str, nbytes: int = 16384) -> str:
-  """Raw tail bytes of the most active rank log under `bucket`, or ''.
+def _read_log_tail(bucket: str, nbytes: int = 16384) -> tuple[str, str]:
+  """Classify and read the most active rank log under `bucket`.
+
+  Returns `(kind, text)`:
+    * ('ok', <tail bytes>) -- found a non-empty rank log and read its tail.
+    * ('nolog', '')        -- a rank-log directory was LISTED successfully and
+                              held no rank_* file yet (a just-started job), or
+                              every rank file is still 0 bytes.
+    * ('error', '')        -- listing/stat/read FAILED (e.g. a cold Colossus
+                              channel at process start). The caller MUST NOT
+                              report this as absence: it is retried, and if it
+                              survives retry it stays silent, never rendered as
+                              "no log file yet".
+
+  The kind split exists because a bare '' conflated two opposite facts -- "this
+  job has not written a log" and "I could not read the log" -- and reporting the
+  second as the first put a confident "no log file yet" under jobs that were
+  15k+ steps in, every time the fresh per-round process hit its cold-channel
+  window.
 
   Rank 0 is not always the talkative one -- under pmap the process that owns the
   progress bar can be any rank -- so pick whichever rank log is LARGEST, which
-  needs one stat() per rank.
+  needs one stat() per rank (through `_STAT_POOL`, never `_CNS_POOL` -- see its
+  comment). The read SEEKS to the tail rather than downloading the whole file,
+  which is unbounded at 100k steps.
 
-  Two things here are deliberate, both measured against a live 1 MB job log:
-
-  * the per-rank stat() calls go through `_STAT_POOL` instead of running inside
-    a `sorted(key=...)`. That key function made them strictly serial, and with
-    4 ranks it was the single biggest cost in the tail (1271 ms -> 656 ms for
-    two jobs once parallelised). The pool is deliberately NOT `_CNS_POOL` --
-    see the comment on `_STAT_POOL`.
-  * the read SEEKS to the tail rather than doing `read_bytes()[-16384:]`, which
-    downloaded the entire file and then threw away all but the last 16 KB. At
-    1 MB that is only ~1.4x -- small reads are dominated by the RPC round trip,
-    not by bytes -- but the old form grew without bound as the run went on,
-    which is exactly the regime a 100k-step job ends up in.
-
-  Never raises: a status table that dies because a log was unreadable is worse
-  than one with no tail.
+  Never raises.
   """
   try:
     from etils import epath
     # Rank logs usually live in `<bucket>/logs/rank_*`, but HF-Trainer ports
     # mirror them directly under `<bucket>/rank_*`. Try both, deepest first.
     base = epath.Path(bucket)
+    listed = False
     entries = []
     for d in (base / 'logs', base):
       try:
-        entries = [p for p in d.iterdir() if p.name.startswith('rank_')]
-      except Exception:  # noqa: BLE001 - a missing dir is not fatal
-        entries = []
-      if entries:
+        found = [p for p in d.iterdir() if p.name.startswith('rank_')]
+      except Exception:  # noqa: BLE001 - this dir unreadable; try the next one
+        continue
+      listed = True  # the channel answered: a real listing, not a cold miss
+      if found:
+        entries = found
         break
+    if not listed:
+      return ('error', '')  # no dir could be listed -> failure, NOT absence
     if not entries:
-      return ''
+      return ('nolog', '')  # listed cleanly, genuinely no rank_* file yet
 
     def _size(path):
       try:
@@ -557,38 +582,71 @@ def _read_log_tail(bucket: str, nbytes: int = 16384) -> str:
 
     sizes = list(_STAT_POOL.map(_size, entries))
     best = max(zip(sizes, range(len(entries))), key=lambda t: t[0])
-    if best[0] <= 0:
-      return ''
+    if best[0] < 0:
+      return ('error', '')  # every stat() failed -> cold channel, not absence
+    if best[0] == 0:
+      return ('nolog', '')  # files exist but empty -> nothing to show yet
     with entries[best[1]].open('rb') as handle:
       try:
         handle.seek(-nbytes, os.SEEK_END)
       except OSError:
         pass  # file shorter than the window; read it whole
-      return handle.read().decode('utf-8', errors='replace')
+      return ('ok', handle.read().decode('utf-8', errors='replace'))
   except Exception:  # noqa: BLE001 - the tail is a nicety, never a hard failure
-    return ''
+    return ('error', '')
 
 
 def _fetch_log_tails(buckets: list[str]) -> dict[str, str]:
-  """Tail every bucket at once. Missing/slow entries simply come back absent.
+  """Read every bucket's tail concurrently; return {bucket: text}.
 
-  Fetching the whole table's tails concurrently is what keeps `tpu check`
-  interactive: the cost becomes that of the slowest single job rather than the
-  sum over jobs. The budget is a hard ceiling -- a wedged CNS cell must not be
-  able to hang the status table, so whatever has not arrived is dropped.
+  A bucket maps to its tail text when the read succeeded, to '' when the job has
+  genuinely not written a log yet ('nolog'), and is ABSENT when the read failed
+  even after a retry. `_log_tail` renders those three as the tail lines, "no log
+  file yet", and silence respectively.
+
+  Concurrency plus one shared deadline keeps `tpu check` interactive: the phase
+  costs the slowest single read, not the sum, and a wedged cell cannot hang the
+  board. The deadline is shared, not per-future -- the old per-future timeout
+  walked the futures in submission order and handed the FIRST job the whole
+  window and each later job only the leftover, so whether a job got its tail
+  turned on its POSITION in the list rather than its own read speed.
+
+  The retry is load-bearing. The daemon starts a FRESH process each round, so
+  every round opens cold Colossus channels and the first read to each cell fails
+  while its channel initialises. The old per-future serial timeout hid this by
+  accidentally warming the channels before it reached the last few jobs (which
+  is why only the oldest handful ever showed a tail). With the reads now fired
+  together the cold failures land together -- so retry exactly the failures
+  once, by which time the channels opened in the first pass are warm.
   """
   wanted = [b for b in dict.fromkeys(buckets) if b]
   if not wanted:
     return {}
-  futures = {b: _CNS_POOL.submit(_read_log_tail, b) for b in wanted}
+  results: dict[str, tuple[str, str]] = {}
+
+  def _run(targets):
+    futures = {b: _CNS_POOL.submit(_read_log_tail, b) for b in targets}
+    deadline = time.monotonic() + _LOG_TAIL_BUDGET_SEC
+    for bucket, fut in futures.items():
+      try:
+        results[bucket] = fut.result(
+            timeout=max(0.0, deadline - time.monotonic()))
+      except Exception:  # noqa: BLE001 - a timeout counts as a failed read
+        fut.cancel()
+        results[bucket] = ('error', '')
+
+  _run(wanted)
+  retry = [b for b in wanted if results.get(b, ('error', ''))[0] == 'error']
+  if retry:
+    _run(retry)
+
   out: dict[str, str] = {}
-  for bucket, fut in futures.items():
-    try:
-      raw = fut.result(timeout=_LOG_TAIL_BUDGET_SEC)
-    except Exception:  # noqa: BLE001 - timeout or read error: render without it
-      continue
-    if raw:
-      out[bucket] = raw
+  for bucket, (kind, text) in results.items():
+    if kind == 'ok':
+      out[bucket] = text
+    elif kind == 'nolog':
+      out[bucket] = ''  # present-but-empty -> rendered as "no log file yet"
+    # 'error' (even after retry) -> omit -> _log_tail stays silent
   return out
 
 
@@ -603,9 +661,17 @@ def _log_tail(job_info, lines: int = _LOG_TAIL_LINES, cache=None) -> list[str]:
   bucket = (job_info.get('bucket_cp_path') or '').strip()
   if not bucket:
     return []
-  raw = cache.get(bucket) if cache is not None else _read_log_tail(bucket)
+  if cache is not None:
+    # ABSENT means the read did not finish within the shared budget -- stay
+    # silent rather than mislabel a slow read as missing. PRESENT-but-empty
+    # means the read succeeded and the job has not mirrored a log line yet.
+    if bucket not in cache:
+      return []
+    raw = cache[bucket]
+  else:
+    raw = _read_log_tail(bucket)[1]
   if not raw:
-    return []
+    return ['no log file yet']
 
   out: list[str] = []
   # tqdm uses \r to repaint in place, so split on it too or the whole bar is
@@ -757,7 +823,7 @@ def _cell_from_log(tpu_info):
     if not bucket:
         return ''
     try:
-        raw = _read_log_tail(bucket, nbytes=200000) or ''
+        raw = _read_log_tail(bucket, nbytes=200000)[1] or ''
     except Exception:  # noqa: BLE001
         return ''
     # `Compute cluster: yuskedq, metro: ske` -- printed by orbax and by far the
