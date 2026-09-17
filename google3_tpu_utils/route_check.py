@@ -1717,6 +1717,91 @@ def run_reconcile(
   return entries, log
 
 
+def _archive_rerouted_xid(xid: Optional[str], log: list[str]) -> None:
+  """Move a just-cancelled reroute XID off the live board into the legacy archive.
+
+  ★WHY. A reroute cancels the old XID (Submitter.cancel -> `tpu cancel`, which
+  writes registry[xid].status=CANCELLED) and re-queues the SAME local job_id on a
+  new cell. The dead XID then piles up on the `tpu check` board as a CANCELLED
+  shell that a human had to `tpu clear`. Archiving it here, the instant it is
+  superseded, keeps the board clean with no manual step and no separate janitor.
+
+  SAFE BY CONSTRUCTION:
+    * It only ever touches the REGISTRY board file (~/.tpu_jobs.json), never the
+      queue. The queue row is the router's live handle on the job (same job_id,
+      old xid pushed to prior_xids) and is being re-queued right now -- archiving
+      it would strand the work, exactly what `tpu clear`/`tpu dequeue` refuse.
+    * It archives ONE named XID -- the one we just cancelled and superseded --
+      not a scan, so it can never sweep a live job.
+    * MOVE, not delete: the row goes to ~/.tpu_jobs_legacy.json (the only map
+      from an XID back to its checkpoint bucket / stagedir / launch log),
+      recoverable exactly like `tpu clear`.
+    * Idempotent: a missing/absent row is a no-op.
+    * FAIL-SAFE: the whole body is wrapped so a guard/telemetry step can NEVER
+      raise into the reroute loop (engineering.md). On any error it logs and
+      returns.
+    * KILL-SWITCH: `TPU_REROUTE_NO_ARCHIVE` (read at call time) disables it with
+      no rebuild -- set it in the loop env and restart the loop to roll back.
+
+  Files resolve from the same env as infra_check / the wrapper
+  (`TPU_JOBS_FILE` / `TPU_JOBS_LEGACY_FILE`), so a tpu-scoped loop archives into
+  the tpu registry and an npu-scoped one into npu's, automatically.
+  """
+  if os.environ.get('TPU_REROUTE_NO_ARCHIVE'):
+    return
+  if not xid:
+    return
+  xid = str(xid)
+  try:
+    jobs_file = os.path.expanduser(
+        os.environ.get('TPU_JOBS_FILE') or '~/.tpu_jobs.json')
+    legacy_file = os.path.expanduser(
+        os.environ.get('TPU_JOBS_LEGACY_FILE') or '~/.tpu_jobs_legacy.json')
+    if not os.path.exists(jobs_file):
+      return
+    # One exclusive lock over the read-modify-write, the same lock discipline the
+    # check daemon uses on this file, so a concurrent registry writer never
+    # interleaves with us.
+    with open(jobs_file, 'r+') as f:
+      fcntl.flock(f, fcntl.LOCK_EX)
+      try:
+        try:
+          live = json.load(f)
+        except ValueError:
+          return  # a half-written registry: leave it for the daemon, do no harm
+        entry = live.pop(xid, None)
+        if entry is None:
+          return  # already archived / never on the board -> idempotent no-op
+        entry['archived_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        entry['archived_by'] = 'reroute'
+        # Merge into legacy first (best-effort; never lose the provenance), then
+        # rewrite the live file in place under the held lock.
+        try:
+          if os.path.exists(legacy_file):
+            with open(legacy_file) as lf:
+              legacy = json.load(lf)
+          else:
+            legacy = {}
+        except ValueError:
+          legacy = {}
+        legacy[xid] = entry
+        tmp = f'{legacy_file}.tmp.{os.getpid()}'
+        with open(tmp, 'w') as lf:
+          json.dump(legacy, lf, indent=2, sort_keys=True)
+        os.replace(tmp, legacy_file)
+        f.seek(0)
+        f.truncate()
+        json.dump(live, f, indent=2, sort_keys=True)
+      finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+    log.append(f'[reroute] archived superseded xid {xid} off the board '
+               f'-> {legacy_file}')
+  except Exception as exc:  # pylint: disable=broad-except
+    # Guards must never kill the loop: a failed archive just leaves the CANCELLED
+    # shell on the board (the pre-change behaviour), never interrupts reroute.
+    log.append(f'[reroute] archive of xid {xid} FAILED (non-fatal): {exc!r}')
+
+
 # --- the re-route sweep ---------------------------------------------------
 def run_reroute(
     entries: list[route_lib.QueueEntry],
@@ -1843,6 +1928,7 @@ def run_reroute(
         _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
         route_lib.mark_reroute(e, now, cooldown_s)
         log.append(f'[reroute] cancelled + re-queued {tag}; cell cooled {int(cooldown_s)}s')
+        _archive_rerouted_xid(xid, log)
       else:
         log.append(f'[reroute] cancel FAILED for {tag}, left SUBMITTED. {_tail(out)}')
     elif state == STATUS_RUNNING:
@@ -1917,6 +2003,7 @@ def run_reroute(
             route_lib.mark_reroute(e, now, cooldown_s)
             log.append(f'[reroute] cancelled + re-queued {tag}: {why}; cell '
                        f'cooled {int(cooldown_s)}s, eviction strike recorded')
+            _archive_rerouted_xid(xid, log)
           else:
             log.append(f'[reroute] cancel FAILED for thrashing {tag}, left '
                        f'as-is. {_tail(out)}')
@@ -1973,6 +2060,7 @@ def run_reroute(
         route_lib.mark_reroute(e, now, cooldown_s)
         log.append(f'[reroute] cancelled + re-queued {tag}: nominally RUNNING '
                    f'({stuck_why}); cell cooled {int(cooldown_s)}s')
+        _archive_rerouted_xid(xid, log)
       else:
         log.append(f'[reroute] cancel FAILED for nominally-RUNNING {tag}, '
                    f'left as-is. {_tail(out)}')

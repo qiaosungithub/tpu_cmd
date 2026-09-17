@@ -2045,5 +2045,130 @@ class ArchiveFinishedQueueRowsTest(unittest.TestCase):
     self.assertEqual([e.job_id for e in RC.load_queue(path)], ['j1'])
 
 
+class ArchiveReroutedXidTest(unittest.TestCase):
+  """_archive_rerouted_xid: move a just-cancelled reroute XID off the registry
+  board into the legacy archive. Negative controls come first -- it must NEVER
+  raise into the loop, and must touch ONLY the named XID's registry row."""
+
+  def setUp(self):
+    super().setUp()
+    # Redirect BOTH registry files to temps via env, exactly the vars the helper
+    # reads (same as infra_check / the wrapper). Restored in tearDown so no test
+    # can leak into ~/.tpu_jobs.json.
+    self._saved = {k: os.environ.get(k) for k in
+                   ('TPU_JOBS_FILE', 'TPU_JOBS_LEGACY_FILE',
+                    'TPU_REROUTE_NO_ARCHIVE')}
+    self.jobs = tempfile.mkstemp(suffix='.jobs.json')[1]
+    self.legacy = tempfile.mkstemp(suffix='.legacy.json')[1]
+    os.environ['TPU_JOBS_FILE'] = self.jobs
+    os.environ['TPU_JOBS_LEGACY_FILE'] = self.legacy
+    os.environ.pop('TPU_REROUTE_NO_ARCHIVE', None)
+
+  def tearDown(self):
+    for k, v in self._saved.items():
+      if v is None:
+        os.environ.pop(k, None)
+      else:
+        os.environ[k] = v
+    for p in (self.jobs, self.legacy):
+      if os.path.exists(p):
+        os.unlink(p)
+    super().tearDown()
+
+  def _write_jobs(self, d):
+    with open(self.jobs, 'w') as f:
+      json.dump(d, f)
+
+  def _read_jobs(self):
+    with open(self.jobs) as f:
+      return json.load(f)
+
+  def _read_legacy(self):
+    if not os.path.exists(self.legacy):
+      return {}
+    with open(self.legacy) as f:
+      body = f.read().strip()
+    return json.loads(body) if body else {}   # mkstemp leaves a 0-byte file
+
+  def test_archives_named_xid_off_the_board_into_legacy(self):
+    self._write_jobs({'111': {'exp_name': 'foo', 'bucket_cp_path': '/cns/x'},
+                      '222': {'exp_name': 'bar'}})
+    log = []
+    RC._archive_rerouted_xid('111', log)
+    self.assertNotIn('111', self._read_jobs())            # gone from the board
+    self.assertIn('222', self._read_jobs())               # sibling untouched
+    leg = self._read_legacy()
+    self.assertIn('111', leg)                             # moved, not deleted
+    self.assertEqual(leg['111']['bucket_cp_path'], '/cns/x')  # provenance kept
+    self.assertEqual(leg['111']['archived_by'], 'reroute')
+    self.assertIn('archived_at', leg['111'])
+    self.assertTrue(any('archived superseded xid 111' in l for l in log))
+
+  def test_kill_switch_env_disables_archiving(self):
+    os.environ['TPU_REROUTE_NO_ARCHIVE'] = '1'
+    self._write_jobs({'111': {'exp_name': 'foo'}})
+    log = []
+    RC._archive_rerouted_xid('111', log)
+    self.assertIn('111', self._read_jobs())               # still on the board
+    self.assertEqual(self._read_legacy(), {})
+
+  def test_absent_xid_is_idempotent_noop(self):
+    self._write_jobs({'222': {'exp_name': 'bar'}})
+    log = []
+    RC._archive_rerouted_xid('111', log)                  # 111 never on board
+    self.assertEqual(self._read_jobs(), {'222': {'exp_name': 'bar'}})
+    self.assertEqual(self._read_legacy(), {})
+
+  def test_double_archive_is_idempotent(self):
+    self._write_jobs({'111': {'exp_name': 'foo'}})
+    RC._archive_rerouted_xid('111', [])
+    RC._archive_rerouted_xid('111', [])                   # second call: no-op, no raise
+    self.assertNotIn('111', self._read_jobs())
+    self.assertIn('111', self._read_legacy())
+
+  def test_missing_registry_file_is_failsafe(self):
+    os.unlink(self.jobs)                                  # no registry at all
+    log = []
+    RC._archive_rerouted_xid('111', log)                 # must not raise
+    self.assertFalse(os.path.exists(self.jobs))
+
+  def test_empty_xid_is_a_noop(self):
+    self._write_jobs({'111': {'exp_name': 'foo'}})
+    RC._archive_rerouted_xid('', [])
+    RC._archive_rerouted_xid(None, [])
+    self.assertIn('111', self._read_jobs())
+
+  def test_corrupt_registry_is_failsafe(self):
+    with open(self.jobs, 'w') as f:
+      f.write('{ this is not valid json')
+    log = []
+    RC._archive_rerouted_xid('111', log)                 # must not raise
+    # a half-written registry is left for the daemon, never partially rewritten
+
+  def test_reroute_end_to_end_leaves_no_board_shell(self):
+    # The whole point: a real reroute cancel archives the dead xid off the board.
+    self._write_jobs({'111': {'exp_name': 'j1', 'status': 'SUBMITTED'}})
+    e = _submitted('j1', '111', 'yulpptr', submitted_at=0.0)
+    probe = _FakeProbe({'111': RC.STATUS_PENDING})
+    sub = _FakeSubmitter()
+    RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
+                   reroute_after_s=600.0, cooldown_s=1800.0, dry_run=False,
+                   sleep_fn=lambda _: None)
+    self.assertEqual(sub.cancels, ['111'])               # it did cancel
+    self.assertEqual(e.state, R.JobState.QUEUED)         # and re-queue
+    self.assertNotIn('111', self._read_jobs())           # AND archive the shell
+    self.assertIn('111', self._read_legacy())
+
+  def test_dry_run_reroute_archives_nothing(self):
+    self._write_jobs({'111': {'exp_name': 'j1', 'status': 'SUBMITTED'}})
+    e = _submitted('j1', '111', 'yulpptr', submitted_at=0.0)
+    probe = _FakeProbe({'111': RC.STATUS_PENDING})
+    sub = _FakeSubmitter()
+    RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
+                   reroute_after_s=600.0, dry_run=True, sleep_fn=lambda _: None)
+    self.assertEqual(sub.cancels, [])                     # no cancel in dry-run
+    self.assertIn('111', self._read_jobs())              # so no archive either
+
+
 if __name__ == '__main__':
   unittest.main()
