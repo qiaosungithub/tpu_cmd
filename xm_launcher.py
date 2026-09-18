@@ -1223,20 +1223,33 @@ def _load_default_wandb() -> dict:
     yields {}, exactly as before.
     """
     import importlib.util  # local: only needed on this fallback path
-    for rel in _DEFAULT_CONFIG_PATHS:
-        path = os.path.join(os.getcwd(), rel)
-        if not os.path.exists(path):
-            continue
-        try:
-            spec = importlib.util.spec_from_file_location('_wandb_default', path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            cfg = module.get_config()
-        except Exception:  # noqa: BLE001 - best effort; {} is a safe answer
-            continue
-        identity = _wandb_identity_from_cfg(cfg)
-        if identity:
-            return identity
+    # Search $TPU_STAGEDIR FIRST, then cwd. The wrapper's getcwd guard chdir's
+    # to $STAGE_WS_ROOT (the workspace root, which has no configs/default.py)
+    # right before launch, so a cwd-relative search finds nothing and records
+    # wandb={}, leaving the offline daemon with no identity to upload under.
+    # $TPU_STAGEDIR is exported by the wrapper on every staging path and holds
+    # the staged config -- the same CWD-guard fix already applied to config.sh
+    # resolution below.
+    _bases = []
+    _stagedir = os.environ.get('TPU_STAGEDIR', '')
+    if _stagedir:
+        _bases.append(_stagedir)
+    _bases.append(os.getcwd())
+    for base in _bases:
+        for rel in _DEFAULT_CONFIG_PATHS:
+            path = os.path.join(base, rel)
+            if not os.path.exists(path):
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location('_wandb_default', path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                cfg = module.get_config()
+            except Exception:  # noqa: BLE001 - best effort; {} is a safe answer
+                continue
+            identity = _wandb_identity_from_cfg(cfg)
+            if identity:
+                return identity
     return {}
 
 
