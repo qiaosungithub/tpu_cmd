@@ -38,6 +38,8 @@ SOURCE = os.path.join(HERE, 'cell_locality.py')
 TARGET_GLOBS = (
     os.path.expanduser('~/work/*/xm_launcher.py'),
     os.path.expanduser('~/work/tpu_cmd/xm_launcher.py'),
+    os.path.expanduser('~/.tpu_enqueue_snapshots/*/xm_launcher.py'),
+    '/google/src/cloud/qiaos/run_amply_workspace/google3/experimental/qiaos/eqr_jax_final_stages/eqr_run_ca_*/xm_launcher.py',
 )
 # Checkouts that are NOT ours to edit.
 EXCLUDE = re.compile(r'/(lyy-work|mesh_diffusion|migrate_arms|src_snapshot|'

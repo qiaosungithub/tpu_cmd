@@ -916,6 +916,15 @@ class QueueEntry:
   # Backward compatible: a row from before this field defaults to {} and the
   # penalty is inert.
   cooldown_metros: dict = dataclasses.field(default_factory=dict)
+  # GROUP-LEVEL cooldown: {group: {'until': epoch, 'strikes': int}} -- the
+  # FOURTH cooldown (operator 2026-09-23: "和对tpu type / cell做冷却时一样的逻辑"),
+  # recorded EXACTLY like cooldown_archs (strikes stack inside the window and
+  # reset once it has fully elapsed). Where the cell/arch/metro cooldowns steer
+  # WHERE inside a pool a job lands, this steers WHICH POOL: a job re-routed off
+  # g5 is not handed straight back to g5 by the 5,3,9 preference order. Written
+  # by `mark_reroute`, read by route_check's `_pick_group` via `group_cooling`.
+  # Backward compatible: a row from before this field defaults to {}.
+  cooldown_groups: dict = dataclasses.field(default_factory=dict)
   # PER-CELL EVICTION HISTORY: {cell: {'strikes': int, 'last': epoch}} -- how
   # often THIS job has been preempted out of THAT cell, and when last. Read by
   # `cell_score` via `evict_penalty`, which decays a strike to nothing over
@@ -1419,6 +1428,18 @@ _RESUME_RULES: list[tuple[str, str, str]] = [
     ('resource_exhausted', HOLD,
      'quota or a poisoned personal bucket -- a retry writes another 0-byte file'),
     # -- outside our control and transient: safe to continue ---------------
+    ('affinity_group_in_use', RESUME_XID,
+     'borg affinity group still in use from a prior attempt; transient conflict, safe to resume'),
+    ('affinity group', RESUME_XID,
+     'borg affinity group conflict; transient Borg state, safe to resume'),
+    ('affinitygroup', RESUME_XID,
+     'borg affinity group conflict; transient Borg state, safe to resume'),
+    ('task_action_fish', RESUME_XID,
+     'tpu hardware / ici security setup failure; transient host/hardware error, safe to resume'),
+    ('ici_security_setup', RESUME_XID,
+     'tpu ici security setup failure; transient host/hardware error, safe to resume'),
+    ('ici setup failure', RESUME_XID,
+     'tpu ici setup failure; transient host/hardware error, safe to resume'),
     ('preempt', RESUME_XID,
      'preemption is the normal cost of PROD sharing, not a defect; the work '
      'already done is on CNS and the job can continue from it'),
@@ -1527,6 +1548,40 @@ def elt_checkpoint_leaf_step(name: str) -> int:
 # checkpoint. Named separately so call sites read as intent, not mechanism.
 RESUME_WARM = LOAD_FROM
 
+# A healthy run PREEMPTED before it wrote its first checkpoint has nothing to
+# resume FROM, but must still be retried -- a bounded COLD rerun from step 0.
+# Distinct from RESUME_WARM (which carries a LOAD_FROM pointer) and from HOLD: a
+# cold rerun re-enters the scheduler on a NEW cell (the old one now carries a
+# fresh eviction strike), so it does not simply die the same way. Gated in
+# plan_pruned_restart behind allow_cold, and bounded by the SAME auto_resume
+# budget as warm, so it can never loop unbounded.
+RESUME_COLD = 'RESUME_COLD'
+
+# Termination causes meaning "external kill of an otherwise-healthy run", for
+# which a cold rerun (when there is no checkpoint) is the right call. Matched as
+# a substring of a best-effort cause string; in practice a clean preemption
+# leaves NO cause in the job's own stdout (the log just stops mid-step), so
+# `trained` is usually the load-bearing signal and this set is a bonus when a
+# cause IS available (e.g. from the queue row's failure reason).
+_PREEMPTION_CAUSES = (
+    'preempt', 'evict', 'drain', 'pruned', 'reclaim', 'affinity', 'ici', 'fish'
+)
+
+
+def looks_trained(log_text: Optional[str]) -> bool:
+  """True if the log shows the run reached at least one TRAINING STEP.
+
+  This is the signal that separates 'a healthy run preempted before its first
+  checkpoint' (retry it -- it was making progress) from 'crashed on startup,
+  never trained a step' (hold -- a rerun re-enters the same wall). Matches the
+  launcher's '<tag> step <N> ...' progress line; a bare 'starting' banner is
+  deliberately NOT enough, and 'step_1024' (a checkpoint filename) does not
+  count because a digit must follow 'step' + whitespace. Never raises.
+  """
+  if not log_text:
+    return False
+  return re.search(r'(?<![A-Za-z])step\s+\d+', log_text, re.IGNORECASE) is not None
+
 
 def plan_pruned_restart(
     entry: 'QueueEntry',
@@ -1536,10 +1591,13 @@ def plan_pruned_restart(
     checkpoint: Optional[str],
     other_live_writer: bool,
     max_auto_resumes: int = 3,
+    trained: bool = False,
+    termination_cause: Optional[str] = None,
+    allow_cold: bool = False,
 ) -> tuple[str, str]:
   """Decide whether a TERMINATED row was PRUNED -- killed from outside an
   otherwise-healthy run -- and may be re-queued warm from its last checkpoint.
-  Returns (verdict, why); verdict is RESUME_WARM or HOLD.
+  Returns (verdict, why); verdict is RESUME_WARM, RESUME_COLD, or HOLD.
 
   ★THIS IS THE CHECKPOINT-AS-EVIDENCE PATH, distinct from classify_failure's
   reason-STRING path, and it exists because the two kinds of death look nothing
@@ -1567,6 +1625,32 @@ def plan_pruned_restart(
         f'the log shows a code bug ({code_bug}); a warm restart would replay it '
         f'and burn another XID. A human must fix the code first.')
   if not checkpoint:
+    # Historically an UNCONDITIONAL hold. That mis-held 4 healthy PREEMPTED runs
+    # killed before their first save (2026-09-18): no checkpoint, but the log
+    # showed clean training. A COLD rerun (from step 0) is correct WHEN there is
+    # positive evidence the death was external to a healthy run -- a
+    # preemption/eviction/drain cause, or (cause unknown) the log shows it
+    # actually trained. It must still clear the SAME writer-safety and budget
+    # guards as a warm resume. Gated behind allow_cold so this is INERT until
+    # explicitly enabled (default off == byte-for-byte the old behavior).
+    cause = (termination_cause or '').strip().lower()
+    preempted = any(p in cause for p in _PREEMPTION_CAUSES)
+    if allow_cold and (preempted or trained):
+      if other_live_writer:
+        return HOLD, (
+            'another live job already writes this out_dir; re-queuing would put '
+            'a SECOND writer on one checkpoint path (truncation risk). Left '
+            'alone.')
+      used = int(getattr(entry, 'auto_resumes', 0) or 0)
+      if used >= max_auto_resumes:
+        return HOLD, (
+            f'auto-resume budget spent ({used}/{max_auto_resumes}); a human '
+            f'should look before this burns another XID')
+      why_ev = ('a preemption/eviction cause' if preempted
+                else 'no cause recorded but the log shows training progress')
+      return RESUME_COLD, (
+          f'terminal with no checkpoint, but {why_ev}: a healthy run killed '
+          f'before its first save -- bounded cold rerun from step 0')
     return HOLD, (
         'terminal with no complete checkpoint: a warm restart would be a cold '
         'start, which re-enters whatever killed it. Nothing to continue from.')
@@ -1593,22 +1677,45 @@ def plan_pruned_restart(
 # source module, a daemon restart picks them up with NO rebuild.
 # --------------------------------------------------------------------------
 
-# Code-bug signatures, a trimmed copy of
-# infra_check._APPLICATION_ERROR_SIGNATURES. ★KEEP IN SYNC with that file -- it
-# is the richer twin and owns the full list; this copy exists only so route_lib
-# keeps its no-heavy-imports promise. Matched against the log TAIL only (see
-# looks_like_code_bug).
+# Code-bug signatures, a copy of infra_check._APPLICATION_ERROR_SIGNATURES kept
+# in this import-light module. ★KEEP IN SYNC with that file -- it is the twin
+# that owns the canonical list. THREE of its needles are DELIBERATELY OMITTED
+# here because this table is matched against the log TAIL, and for a SHORT log
+# the tail == the whole file INCLUDING the boot banner:
+#   * 'MODULENOTFOUNDERROR' / 'IMPORTERROR' -- the launcher banner prints a
+#     benign "ModuleNotFoundError: No module named 'base'" minloglevel readback
+#     (see test_benign_modulenotfound_boot_note_is_none); matching it would HOLD
+#     every healthy pruned run -- the exact false positive this path exists to
+#     kill.
+#   * 'MEMORY LIMIT' -- healthy device-info lines legitimately print an HBM
+#     "memory limit".
+# Do NOT re-add them without a tail-safe boundary that excludes the banner.
+# (Conversely CUDA ERROR / INDEXERROR / OUTOFMEMORY are ours to keep -- real
+# crash spellings the twin happens not to carry.) Matched against the log TAIL
+# only (see looks_like_code_bug).
 _CODE_BUG_SIGNATURES = (
+    # -- fatal signals (killed by / raised a hardware-ish fault) --------------
     ('SEGMENTATION FAULT', 'segfault (SIGSEGV)'),
     ('SIGSEGV', 'segfault (SIGSEGV)'),
     ('SIGNAL 11', 'segfault (SIGSEGV)'),
     ('SIGABRT', 'abort (SIGABRT)'),
     ('SIGNAL 6', 'abort (SIGABRT)'),
+    ('SIGNAL 8', 'arithmetic fault (SIGFPE)'),
+    ('SIGNAL 4', 'illegal instruction (SIGILL)'),
+    ('SIGNAL 7', 'bus error (SIGBUS)'),
+    # -- out of memory -------------------------------------------------------
     ('OUT OF MEMORY', 'out of memory'),
+    ('OUT-OF-MEMORY', 'out of memory'),
     ('OUTOFMEMORY', 'out of memory'),
     ('RESOURCE_EXHAUSTED: OOM', 'out of memory (HBM)'),
     ('OOM_KILLED', 'OOM-killed'),
     ('OOMKILLED', 'OOM-killed'),
+    # -- filesystem / permissions --------------------------------------------
+    ("PERMISSION DENIED: '/CNS", 'stdlib I/O on /cns (use epath helpers)'),
+    ('PERMISSIONERROR', 'PermissionError'),
+    ('NOT_FOUND: COULD NOT FIND', 'missing input file'),
+    ('FILENOTFOUNDERROR', 'FileNotFoundError'),
+    # -- unhandled Python exceptions -----------------------------------------
     ('TRACEBACK (MOST RECENT CALL LAST)', 'unhandled Python exception'),
     ('ASSERTIONERROR', 'AssertionError'),
     ('RUNTIMEERROR', 'RuntimeError'),
@@ -1616,12 +1723,39 @@ _CODE_BUG_SIGNATURES = (
     ('TYPEERROR', 'TypeError'),
     ('KEYERROR', 'KeyError'),
     ('INDEXERROR', 'IndexError'),
-    ('FILENOTFOUNDERROR', 'FileNotFoundError'),
+    ('ATTRIBUTEERROR', 'AttributeError'),
+    # -- framework runtime errors --------------------------------------------
     ('XLARUNTIMEERROR', 'XLA runtime error'),
+    ('JAXRUNTIMEERROR', 'JAX runtime error'),
     ('CUDA ERROR', 'CUDA error'),
-    ('NON-ZERO EXIT', 'non-zero exit'),
+    # -- generic terminal-failure markers ------------------------------------
     ('APPLICATION LEVEL ERROR', 'application-level failure'),
+    ('UNRECOVERABLE FAILURE', 'unrecoverable application failure'),
+    ('NON-ZERO EXIT', 'non-zero exit'),
+    ('EXITED WITH NON-ZERO', 'non-zero exit'),
 )
+
+
+# --- word-boundary matching for the signatures above -----------------------
+# A naive `needle in tail` substring test caused a FALSE POSITIVE that HELD 4
+# healthy PREEMPTED runs on 2026-09-18: the launcher boot banner prints an
+# advisory line -- "If rank 0 SIGSEGVs in its first collective, THIS is why" --
+# whose word 'SIGSEGVs' CONTAINS the substring 'SIGSEGV', so every pruned run
+# carrying that banner was misread as a segfault and denied auto-resume. The fix
+# asserts a word boundary around each signature: 'SIGSEGV' no longer matches
+# inside 'SIGSEGVs', while a real '(SIGSEGV)' still does. The boundary is added
+# only on an ALNUM edge, so a token that legitimately ends in punctuation --
+# e.g. 'TRACEBACK (MOST RECENT CALL LAST)' -- still matches when followed by ':'
+# (a naive \b there would REGRESS and stop catching real tracebacks).
+def _compile_code_bug_matcher(needle: str) -> 're.Pattern[str]':
+  left = r'(?<![A-Z0-9_])' if needle[:1].isalnum() else ''
+  right = r'(?![A-Z0-9_])' if needle[-1:].isalnum() else ''
+  return re.compile(left + re.escape(needle) + right)
+
+
+_CODE_BUG_MATCHERS = tuple(
+    (_compile_code_bug_matcher(_needle), _verdict)
+    for _needle, _verdict in _CODE_BUG_SIGNATURES)
 
 
 def looks_like_code_bug(log_tail: str) -> Optional[str]:
@@ -1637,8 +1771,8 @@ def looks_like_code_bug(log_tail: str) -> Optional[str]:
   if not log_tail:
     return None
   up = log_tail.upper()
-  for needle, verdict in _CODE_BUG_SIGNATURES:
-    if needle in up:
+  for matcher, verdict in _CODE_BUG_MATCHERS:
+    if matcher.search(up):
       return verdict
   return None
 
@@ -1737,6 +1871,43 @@ def _elt_restart_from_checkpoint(
   return parts[0], int(parts[-1])
 
 
+def _apply_resume_pointer(lk: dict, checkpoint: str) -> dict:
+  """Set the layout-correct resume pointer in launch_kwargs `lk` (mutated and
+  returned). THE ONE PLACE the ELT-vs-torch layout trap is decided, shared by
+  build_warm_restart_entry (the reconcile path's fresh row) and
+  apply_warm_restart_in_place (the reroute path's existing row) so the
+  silently-destructive layout choice is never written twice.
+
+  An ELT/EqR-jax CheckpointManager leaf (`<workdir>/checkpoints/<bare-int>`)
+  resumes via restart_from(=workdir)+restart_step(=N) -- handed $LOAD_FROM
+  instead, main_eqr does `workdir = LOAD_FROM` and orbax (max_to_keep) deletes
+  the very checkpoints it resumed from. Every OTHER layout (torch `step_<N>.pt`,
+  paligemma `checkpoint_<N>`, ...) honours $LOAD_FROM. So emit
+  restart_from+restart_step for an ELT leaf and load_from for everything else --
+  and CLEAR the other mechanism's keys, because both set trips main_eqr's guard.
+  See elt_dit_pkg/configs/load_config.py::_apply_restart_from_env (the contract
+  this inverts) and elt_dit_pkg/load_from_guard.py (the runtime backstop).
+  """
+  elt = _elt_restart_from_checkpoint(checkpoint)
+  if elt is not None:
+    workdir_ckpt, step = elt
+    prev_raw = str(lk.get('restart_step', '')).strip()
+    prev_step = int(prev_raw) if prev_raw.isdigit() else -1
+    if step >= prev_step:
+      lk.pop('load_from', None)          # mutually exclusive with restart_from
+      lk['restart_from'] = workdir_ckpt  # the WORKDIR (parent of checkpoints/)
+      lk['restart_step'] = str(step)     # named explicitly (load_config fails closed
+                                         # on a missing/ambiguous step)
+  else:
+    new_step = checkpoint_step(checkpoint)
+    prev_step = checkpoint_step(lk.get('load_from'))
+    if new_step < 0 or new_step >= prev_step:
+      lk.pop('restart_from', None)       # do not carry a stale ELT resume forward
+      lk.pop('restart_step', None)
+      lk['load_from'] = checkpoint
+  return lk
+
+
 def build_warm_restart_entry(dead: 'QueueEntry', checkpoint: str,
                              new_job_id: str) -> 'QueueEntry':
   """A fresh QUEUED entry that resumes `dead` warm from `checkpoint`.
@@ -1763,17 +1934,7 @@ def build_warm_restart_entry(dead: 'QueueEntry', checkpoint: str,
   inverts) and elt_dit_pkg/load_from_guard.py (the runtime backstop).
   """
   lk = dict(getattr(dead, 'launch_kwargs', None) or {})
-  elt = _elt_restart_from_checkpoint(checkpoint)
-  if elt is not None:
-    workdir_ckpt, step = elt
-    lk.pop('load_from', None)          # mutually exclusive with restart_from
-    lk['restart_from'] = workdir_ckpt  # the WORKDIR (parent of checkpoints/)
-    lk['restart_step'] = str(step)     # named explicitly (load_config fails closed
-                                       # on a missing/ambiguous step)
-  else:
-    lk.pop('restart_from', None)       # do not carry a stale ELT resume forward
-    lk.pop('restart_step', None)
-    lk['load_from'] = checkpoint
+  _apply_resume_pointer(lk, checkpoint)  # the shared ELT-vs-torch layout core
   base = lk.get('exp_name') or dead.job_id
   new_attempt = int(getattr(dead, 'auto_resumes', 0) or 0) + 1
   lk['exp_name'] = _resume_exp_name(base, new_attempt)
@@ -1817,6 +1978,98 @@ def build_warm_restart_entry(dead: 'QueueEntry', checkpoint: str,
   # as a constructor kwarg tripped pyrefly with unexpected-keyword; the runtime
   # dataclass tolerated it, so the offline suite never caught it.
   entry.prior_xids = prior
+  return entry
+
+
+def build_cold_restart_entry(dead: 'QueueEntry',
+                             new_job_id: str) -> 'QueueEntry':
+  """A fresh QUEUED entry that COLD-reruns `dead` from step 0.
+
+  The twin of build_warm_restart_entry for the case a healthy run was PREEMPTED
+  before it wrote its first checkpoint: there is nothing to resume FROM, so this
+  clones the launch spec verbatim but wires NO resume pointer (no load_from /
+  restart_from) -- the job starts fresh. It STILL increments auto_resumes, so a
+  cold rerun is bounded by the SAME budget as warm and can never loop unbounded,
+  and it records the dead xid in prior_xids. NOT called unless
+  plan_pruned_restart returned RESUME_COLD, so every guard (no code bug,
+  writer-safe, budget, preempted-or-trained) has already passed.
+
+  Why a cold rerun does not simply re-enter the same wall: the dead row stamped
+  an eviction strike on the cell that killed it, so the router's next placement
+  avoids that cell. Like warm, this does NOT inherit snapshot_dir (it may run
+  days later, by when the enqueue snapshot is GC'd) -- package_dir falls back to
+  workdir, the always-safe pre-feature behavior.
+  """
+  lk = dict(getattr(dead, 'launch_kwargs', None) or {})
+  # COLD: strip any resume pointer that might be lingering in the cloned spec,
+  # so nothing points the fresh run at an old checkpoint.
+  lk.pop('load_from', None)
+  lk.pop('restart_from', None)
+  lk.pop('restart_step', None)
+  base = lk.get('exp_name') or dead.job_id
+  new_attempt = int(getattr(dead, 'auto_resumes', 0) or 0) + 1
+  lk['exp_name'] = _resume_exp_name(base, new_attempt)
+  prior = list(getattr(dead, 'prior_xids', None) or [])
+  if dead.xid:
+    prior.append(str(dead.xid))
+  entry = QueueEntry(
+      job_id=new_job_id,
+      name=getattr(dead, 'name', '') or '',
+      power=dead.power,
+      allowed_archs=list(dead.allowed_archs),
+      tier=dead.tier,
+      allowed_metros=(list(dead.allowed_metros)
+                      if dead.allowed_metros else dead.allowed_metros),
+      priority=dead.priority,
+      power_tolerance=dead.power_tolerance,
+      max_price=dead.max_price,
+      launch_kwargs=lk,
+      workdir=dead.workdir,
+      state=JobState.QUEUED,
+      auto_resumes=new_attempt,
+      last_reason=(f'auto COLD rerun (no checkpoint) after '
+                   f'pruned/preempted death of {dead.job_id} '
+                   f'(xid {dead.xid})'),
+  )
+  # prior_xids is DERIVED/property-backed (see build_warm_restart_entry) -- seed
+  # it through the setter AFTER construction, not as a constructor kwarg.
+  entry.prior_xids = prior
+  return entry
+
+
+def apply_warm_restart_in_place(entry: 'QueueEntry',
+                                checkpoint: str) -> 'QueueEntry':
+  """Wire `checkpoint` into an EXISTING row's launch_kwargs as the
+  layout-correct resume pointer, bump auto_resumes, and re-suffix exp_name --
+  the IN-PLACE twin of build_warm_restart_entry.
+
+  ★RECONCILE/REROUTE PARITY. run_reconcile handles a just-FAILED row by
+  APPENDING a fresh build_warm_restart_entry row: it has no row to keep (the
+  dead one goes FAILED), and a new row needs its whole spec cloned. run_reroute
+  is MOVING a row it KEEPS -- same job_id, same reroute backoff counter, and
+  (crucially) the cell cooldown + eviction strike mark_reroute/record_eviction
+  just stamped ON THIS ROW so the next placement avoids the cell it was pulled
+  off. build_warm_restart_entry carries NONE of those forward, so substituting a
+  fresh row would re-land the job on the hot cell it was evicted from. So the
+  reroute path re-queues the SAME row and only wires the resume pointer into it
+  here, sharing the layout core (_apply_resume_pointer) so the ELT-vs-torch trap
+  is decided identically to the new-row path.
+
+  Call AFTER mark_reroute (which resets the row to QUEUED and supersedes the dead
+  xid into prior_xids); this only touches the resume keys, auto_resumes and the
+  cosmetic exp_name. Mirrors build_warm_restart_entry's auto_resumes++ so the two
+  restart paths share ONE budget and a job cannot dodge it by alternating paths.
+  """
+  lk = dict(entry.launch_kwargs or {})
+  _apply_resume_pointer(lk, checkpoint)
+  new_attempt = int(getattr(entry, 'auto_resumes', 0) or 0) + 1
+  base = lk.get('exp_name') or getattr(entry, 'name', '') or entry.job_id
+  lk['exp_name'] = _resume_exp_name(base, new_attempt)
+  entry.launch_kwargs = lk
+  entry.auto_resumes = new_attempt
+  entry.last_reason = (f'{entry.last_reason}; warm-restart from {checkpoint}'
+                       if entry.last_reason
+                       else f'warm-restart from {checkpoint}')
   return entry
 
 
@@ -1871,8 +2124,8 @@ def _metro_has_group_storage(metro: str) -> bool:
   # all: personal-only metros are named explicitly, and anything the snapshot
   # can name via a cell lookup is known. Otherwise fail open.
   personal = {x.lower() for x in getattr(cell_locality, '_PERSONAL_ONLY_METROS', {})}
-  if m in personal:
-    return False   # resolves, launches, then writes into a poisoned personal quota
+  if m in personal or m in ('bomy', 'bo', 'bom'):
+    return False   # resolves, launches, then writes into a poisoned personal quota or crashes xm_launcher with UnknownCellError
   # A metro is KNOWN if the measured snapshot can name at least one cell in it.
   try:
     is_known_metro = bool(cell_locality.cells_in_metro(m))
@@ -2011,19 +2264,20 @@ def best_cell_for_shape(
     # ★SAY WHY THE SHAPE WAS DROPPED. A silent filter is how the previous
     # metro bug stayed invisible for a day: "no capacity" and "every candidate
     # was refused by a gate" look identical from the caller, and only the
-    # second one is actionable. Recorded on the entry so the reroute log can
-    # print it without changing this function's return type.
+    # second one is actionable. Recorded on the entry without changing this
+    # function's return type; plan_one folds it into the one-line reason that
+    # `tpu check` / `tpu queue-status` show for a waiting job, so it is one
+    # short clause per gate (why each gate exists is explained above).
     if rejected_no_storage or rejected_over_cap:
       bits = []
       if rejected_no_storage:
-        bits.append(f'{len(rejected_no_storage)} cell(s) in metros with no group '
-                    f'storage (would launch a ZERO-work-unit shell): '
-                    f'{",".join(sorted(rejected_no_storage)[:6])}')
+        names = sorted(rejected_no_storage)
+        bits.append(f'{len(names)} cell(s) in metros without group storage ('
+                    + ','.join(names[:3]) + (',...' if len(names) > 3 else '')
+                    + ')')
       if rejected_over_cap:
-        bits.append(f'{len(rejected_over_cap)} cell(s) above the {arch} limit-order '
-                    f'cap of {cap} cr/chip-hr (would be held by '
-                    f'TRIGGERED_LIMIT_ORDER, and re-routing cannot clear a '
-                    f'pool-wide price gate): {",".join(sorted(rejected_over_cap)[:6])}')
+        bits.append(f'{len(rejected_over_cap)} cell(s) over limit-order cap '
+                    f'{cap}')
       entry.last_filter_reason = f'{arch}-{chips}: ' + '; '.join(bits)
     return None
   # score asc (cheapest effective), then roomier first as the tie-break
@@ -2048,6 +2302,37 @@ def _placement_for(entry: QueueEntry, arch: str, chips: int,
   return Placement(job_id=entry.job_id, arch=arch, chips=chips,
                    geometry=geom,
                    cell=ca.cell, price=ca.price, reason=reason)
+
+
+# Longest waiting reason plan_one records; the same budget as the
+# `_tail(out, 240)` build-output excerpts route_check stores in last_reason.
+_FILTER_REASON_MAX_CHARS = 240
+
+
+def _no_free_slice_note(entry: QueueEntry, arch: str, chips: int) -> str:
+  """Why-not for a shape that best_cell_for_shape refused WITHOUT a hard-gate
+  note: the availability snapshot shows no free, non-oversold slice of this
+  size in the allowed cells (that also covers an arch whose availability RPC
+  failed -- avail_provider logs that failure itself)."""
+  where = (' in ' + ','.join(map(str, entry.allowed_metros))
+           if entry.allowed_metros else '')
+  return f'{arch}-{chips}: no free slice{where}'
+
+
+def _unplaced_reason(entry: QueueEntry, notes: list[str]) -> str:
+  """plan_one's one-line why for a row it could not place: one note per
+  accepted arch, in the order they were tried, capped at
+  _FILTER_REASON_MAX_CHARS. No notes means no shape was even tried, i.e.
+  candidate_shapes accepted nothing."""
+  if not notes:
+    lock = ', topology lock' if entry.topology_locked else ''
+    archs = ','.join(map(str, entry.allowed_archs or [])) or 'none'
+    return (f'no accepted shape: power {entry.power} fits none of archs '
+            f'{archs} (legal sizes, power tolerance{lock})')
+  s = ' | '.join(notes)
+  if len(s) > _FILTER_REASON_MAX_CHARS:
+    s = s[:_FILTER_REASON_MAX_CHARS - 3] + '...'
+  return s
 
 
 def plan_one(entry: QueueEntry,
@@ -2076,14 +2361,28 @@ def plan_one(entry: QueueEntry,
   only if every arch resolves to a cooling cell (then going back is no worse
   than today). No cooldown in play => identical behaviour to before.
 
+  WHY-NOT (diagnostic only; no decision reads it). When nothing places,
+  `entry.last_filter_reason` gets one line naming, per accepted arch, why its
+  preferred shape found no cell: the hard gate that refused its cells (no group
+  storage, over the limit-order cap) or "no free slice". It is reset on every
+  call, so a row never carries a verdict from an earlier pass, and is '' when a
+  placement is returned. `tpu check` / `tpu queue-status` show it.
+
   Returns a Placement, or None if nothing can place it right now (it stays
   QUEUED and is retried next tick -- we NEVER submit into an oversold/full
   cell, which is exactly the bug this whole system exists to avoid)."""
+  entry.last_filter_reason = ''
+  why_not: dict[str, str] = {}   # arch -> why its preferred shape found no cell
   fallback: Optional[tuple[str, int, CellAvail, int]] = None
   for arch, chips in candidate_shapes(entry, legal_sizes, arch_price, arch_pool,
                                       now=now):
     hit = best_cell_for_shape(arch, chips, entry, avail_by_cell, now)
     if hit is None:
+      a = arch.lower()
+      if a not in why_not:
+        why_not[a] = (entry.last_filter_reason
+                      or _no_free_slice_note(entry, arch, chips))
+      entry.last_filter_reason = ''
       continue
     ca, n = hit
     cooling = entry.cooldown_cells.get(ca.cell)
@@ -2098,6 +2397,7 @@ def plan_one(entry: QueueEntry,
   if fallback is not None:
     arch, chips, ca, n = fallback
     return _placement_for(entry, arch, chips, ca, n)
+  entry.last_filter_reason = _unplaced_reason(entry, list(why_not.values()))
   return None
 
 
@@ -2200,18 +2500,12 @@ def apply_placement(entry: QueueEntry, placement: Placement, xid: str,
   return entry
 
 
-# ★Re-route backoff. `reroutes` was written by mark_reroute and read by NOTHING
-# (measured 2026-09-01), so attempt 1 and attempt 7 got exactly the same 600s of
-# patience. That is what let a car churn: cancelled at 600s, re-queued to the
-# back, placed again, cancelled at 600s again -- 7 number plates in 2.5 hours
-# for one job, and the system had no way to notice it was the same car.
-REROUTE_BACKOFF_MAX_DOUBLINGS = 4   # cap the exponent: 600s -> 9600s, not forever
-# NO give-up bound (removed 2026-09-11 by operator request): a job is re-routed
-# as many times as it takes, never auto-parked as HELD for churning. Churn stays
-# bounded by the two OTHER brakes -- per-row backoff (reroute_deadline_s doubles
-# the patience each move, capped at ~2.7h) and the global rate cap
-# (REROUTE_GLOBAL_MAX_PER_HOUR). entry.reroutes is surfaced on the board instead,
-# so a human can see a high count and intervene -- that is the new safety valve.
+# ★Re-route backoff disabled (2026-09-21, operator directive): exponential
+# backoff (2^min(reroutes, 4)) multiplied a 600s deadline into 9600s (160 min)
+# and trapped jobs stuck behind TRIGGERED_LIMIT_ORDER or capacity deficits for
+# 2.7 hours. Churn is already bounded by cell/arch/metro cooldowns and the
+# global rate cap (REROUTE_GLOBAL_MAX_PER_HOUR).
+REROUTE_BACKOFF_MAX_DOUBLINGS = 0   # 0 = fixed deadline (base_s), no backoff
 
 
 # ★The GLOBAL brake, and why per-row backoff is not enough on its own: the
@@ -2417,10 +2711,165 @@ def record_eviction(entry: QueueEntry, now: float) -> QueueEntry:
   return entry
 
 
+# ---------------------------------------------------------------------------
+# GROUP-LEVEL cooldown + "can this pool hold the job" (operator 2026-09-23:
+# "和对tpu type / cell做冷却时一样的逻辑，再次之外加一个'g5能不能用'的判断，如果不能
+# 就不route到g5"). Both are read by route_check's `_pick_group` for every
+# NON-FALLBACK group of the preference order (g5, g3). The fallback (g9) is never
+# gated, so neither can strand a job -- they can only send it on to g9.
+
+# Hours of above-floor spend a pool's balance must cover before the router sends
+# it one more above-floor job. Balance buys above-floor DRF weight; a pool whose
+# balance is ~0 gets essentially none, so an above-floor job there queues behind
+# "99% of SCUs in your pool" or is the first reclaimed. Income is not counted:
+# income is what pays for the floor.
+GROUP_BALANCE_RESERVE_H = 6.0
+# Checker caches older than this are "no data" -- and no data answers "no".
+GROUP_CAPACITY_MAX_AGE_S = 900.0
+
+
+def stamp_group_cooldown(entry: 'QueueEntry', group: Optional[str],
+                         now: float, cooldown_s: float) -> None:
+  """Cool alloc group `group` for this job, recorded EXACTLY like the arch
+  cooldown: {'until', 'strikes'}, strikes stacking while the previous window is
+  still open and resetting to 1 once it has fully elapsed. No group: no-op."""
+  g = str(group or '').strip()
+  if not g:
+    return
+  prev = (entry.cooldown_groups or {}).get(g)
+  prev = prev if isinstance(prev, dict) else {}
+  prev_until = prev.get('until')
+  if prev_until and now < prev_until:
+    strikes = int(prev.get('strikes', 0) or 0) + 1
+  else:
+    strikes = 1
+  if not entry.cooldown_groups:
+    entry.cooldown_groups = {}
+  entry.cooldown_groups[g] = {'until': now + cooldown_s, 'strikes': strikes}
+
+
+def group_cooling(entry: 'QueueEntry', group: str,
+                  now: float) -> Optional[dict]:
+  """This job's live cooldown record for `group`, or None when it is not cooling
+  (absent, expired, or an unreadable record -- tolerant of old rows)."""
+  rec = (getattr(entry, 'cooldown_groups', None) or {}).get(str(group))
+  if not isinstance(rec, dict):
+    return None
+  try:
+    return rec if now < float(rec.get('until') or 0.0) else None
+  except (TypeError, ValueError):
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class GroupCapacity:
+  """One alloc group's standing, built by route_check from the checker caches."""
+  group: str
+  floor: dict               # arch family -> PROD floor chips ("Quota" column)
+  used: dict                # arch family -> PROD chips in use now
+  balance: float            # credits; unreadable reads as 0.0 (fail closed)
+  above_floor_burn: float   # credits/hr the group already spends above floors
+  limit_caps: dict          # arch family -> the GROUP's own PROD limit order
+  age_s: float              # age of the oldest cache file behind this
+  # arch family -> global PROD credits/chip-hr (money_check's market cache).
+  prices: dict = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass(frozen=True)
+class HoldVerdict:
+  ok: bool
+  reason: str
+  above_floor: bool = False   # admitted on balance, not inside the floor
+
+
+def _above_floor(floor: float, used: float, extra: float) -> float:
+  """How many of `extra` chips, landing on top of `used`, fall above `floor`."""
+  return max(0.0, used + extra - floor) - max(0.0, used - floor)
+
+
+def group_can_hold(cap: Optional[GroupCapacity], arch: Optional[str],
+                   chips: Optional[int], price: Optional[float], *,
+                   pending: Optional[dict] = None,
+                   reserve_h: float = GROUP_BALANCE_RESERVE_H,
+                   max_age_s: float = GROUP_CAPACITY_MAX_AGE_S) -> HoldVerdict:
+  """Can this non-fallback pool actually hold `chips` x `arch` at `price`?
+
+  `price` is the placement's cell price; None falls back to the group's market
+  price for the family. `pending` maps family -> chips already sent to this pool
+  that are not running yet (SUBMITTED rows, plus jobs admitted earlier in this
+  dispatch round): they are not in `used`, but GQM must seat them first.
+
+  In order, FAILING CLOSED at every unknown (no data, stale data, unknown shape,
+  no price where the answer needs one):
+    1. the group's own limit order for the family must not be below the price
+       (g5 carries deqingsun's orders, e.g. v6e 10.0: a job priced above it is
+       refused by GQM however empty the pool is);
+    2. room inside the FLOOR -- floor - used - pending >= chips. Floor chips
+       cost no balance and are not reclaimed, so this alone suffices;
+    3. else ABOVE the floor, which only balance buys: the balance must cover
+       `reserve_h` hours of the group's existing above-floor burn, plus the
+       pending chips that will land above the floor, plus this job's own
+       above-floor chips.
+  Why not simply "balance == 0": g5 earns ~42 cr/hr and one h100-8 costs about
+  the same, so its balance hovers around zero and a zero test flaps -- and a
+  pool with floor room needs no balance at all.
+  """
+  g = f'g{cap.group}' if cap is not None else 'group'
+  if cap is None:
+    return HoldVerdict(False, 'no capacity data for this group')
+  if cap.age_s > max_age_s:
+    return HoldVerdict(False, f'{g} capacity data {cap.age_s:.0f}s old '
+                              f'(> {max_age_s:.0f}s)')
+  fam = (arch or '').strip().lower()
+  if not fam or not chips:
+    return HoldVerdict(False, f'{g}: job shape unknown')
+  pend = {str(k).strip().lower(): float(v or 0.0)
+          for k, v in (pending or {}).items()}
+  if price is None:
+    price = cap.prices.get(fam)
+  lo = cap.limit_caps.get(fam)
+  if lo is not None and price is None:
+    return HoldVerdict(False, f'{g}: no {fam} price to check against the '
+                              f'group limit order {lo:.2f}')
+  if lo is not None and price is not None and price > lo:
+    return HoldVerdict(False, f'{g}: {fam} price {price:.2f} > the group limit '
+                              f'order {lo:.2f}')
+  floor = float(cap.floor.get(fam, 0.0) or 0.0)
+  used = float(cap.used.get(fam, 0.0) or 0.0)
+  room = floor - used - pend.get(fam, 0.0)
+  if room >= chips:
+    return HoldVerdict(True, f'{g}: {fam} floor room {room:.0f} >= {chips}')
+  if price is None:
+    return HoldVerdict(False, f'{g}: no {fam} floor room (floor {floor:.0f}, '
+                              f'used {used:.0f}) and no price to cost the '
+                              f'balance')
+  pending_cost = 0.0
+  for f, n in sorted(pend.items()):
+    over = _above_floor(float(cap.floor.get(f, 0.0) or 0.0),
+                        float(cap.used.get(f, 0.0) or 0.0), n)
+    if over <= 0:
+      continue
+    pf = cap.prices.get(f)
+    if pf is None:
+      return HoldVerdict(False, f'{g}: {over:.0f} {f} chip(s) already queued '
+                                f'above floor and no {f} price to cost them')
+    pending_cost += over * float(pf)
+  job_cost = (chips - max(0.0, room)) * price
+  need = reserve_h * (cap.above_floor_burn + pending_cost + job_cost)
+  if cap.balance >= need:
+    return HoldVerdict(True, f'{g}: balance {cap.balance:,.0f} covers '
+                             f'{reserve_h:g}h above floor ({need:,.0f})',
+                       above_floor=True)
+  return HoldVerdict(False, f'{g}: no {fam} floor room (floor {floor:.0f}, used '
+                            f'{used:.0f}, pending {pend.get(fam, 0.0):.0f}) and '
+                            f'balance {cap.balance:,.0f} < {need:,.0f} for '
+                            f'{reserve_h:g}h above floor')
+
+
 def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry:
   """Return the entry reset to QUEUED after a failed placement.
 
-  Three cooldowns are stamped, all for `cooldown_s` seconds:
+  Four cooldowns are stamped, all for `cooldown_s` seconds:
     * the CELL it was stuck in (`cooldown_cells`) -- a decaying soft penalty on
       re-picking that exact cell;
     * the ARCH it was on (`cooldown_archs`) -- a flat, STACKING penalty on the
@@ -2433,7 +2882,11 @@ def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry
       (bare timestamp, non-stacking, same `cooldown_penalty`), so a job wedged in
       a metro whose capacity is tight, or on an arch that lives in only one metro
       (b200->sj), is steered to a DIFFERENT metro rather than just the next cell
-      of the same one. Read by best_cell_for_shape."""
+      of the same one. Read by best_cell_for_shape.
+    * the alloc GROUP it ran under (`cooldown_groups`) -- recorded exactly like
+      the arch cooldown (operator 2026-09-23), so the 5,3,9 preference order
+      does not hand a job straight back to the pool it was just re-routed off.
+      Read by route_check's `_pick_group` via `group_cooling`."""
   if entry.cell:
     entry.cooldown_cells[entry.cell] = now + cooldown_s
   # METRO-LEVEL cooldown (operator 2026-09-11), written EXACTLY like the per-cell
@@ -2468,6 +2921,12 @@ def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry
     if not entry.cooldown_archs:
       entry.cooldown_archs = {}
     entry.cooldown_archs[a] = {'until': now + cooldown_s, 'strikes': strikes}
+  # GROUP-LEVEL cooldown (operator 2026-09-23). The pool is the one the stuck
+  # submission was built under: its own record first (apply_placement copies the
+  # row's group onto it), else the row's `group`. Neither is cleared below.
+  cur = entry.current_submission
+  stamp_group_cooldown(entry, (cur.group if cur is not None else None)
+                       or entry.group, now, cooldown_s)
   # ★Preserve the XID before clearing it (infra-v17). A re-routed row gets
   # xid=None, and without this the cancelled experiment becomes invisible to
   # every audit that enumerates known XIDs (xid_recon/recon.py reads
@@ -2939,6 +3398,42 @@ def reconcile_entry(entry: QueueEntry, xm_status: str, reason: str = '',
       entry.last_reason = reason or f'reconciled: XM reports terminal (was local {old.value}); zombie cleaned up'
   elif new_state == JobState.RUNNING:
     entry.last_reason = reason or f'reconciled: XM confirms RUNNING (was local {old.value})'
+  return True
+
+
+def mark_cancelled(entry: QueueEntry, reason: str = '', when: str = '') -> bool:
+  """Retire a row whose CURRENT xid was deliberately stopped with `tpu cancel`.
+
+  The reconcile pass calls this instead of reconcile_entry when XM says the xid
+  is dead (TERMINAL / GONE) AND the registry says a human or a daemon cancelled
+  it on purpose. Without it the row read `FAILED ... zombie cleaned up` in the
+  Local Queue while the `tpu check` board said CANCELLED for the same job, and
+  the auto-resume step could restart a job somebody had just stopped.
+
+  The ROW goes to FAILED, so FINISHED_STATES (archive, snapshot GC, `tpu
+  clear`) treat it exactly like any other ended row; there is no new JobState.
+  The cancel is recorded on the CURRENT SUBMISSION instead: its state becomes
+  'CANCELLED' (already one of SUBMISSION_TERMINAL_STATES) with an ended_reason
+  naming the cancel. Only a LIVE submission that carries an xid is relabelled,
+  the same rule as sync_current_submission, so a SUPERSEDED record is never
+  rewritten. `when` is the registry's cancelled_at string (may be empty).
+
+  Returns True if the row changed. Rows outside RECONCILABLE_STATES are left
+  alone, like reconcile_entry. Pure: no I/O. Deciding NOT to auto-resume is the
+  caller's job (run_reconcile skips it for a cancelled row).
+  """
+  if entry.state not in RECONCILABLE_STATES:
+    return False
+  old = entry.state
+  at = f' at {when}' if when else ''
+  entry.state = JobState.FAILED
+  cur = entry.current_submission
+  if cur is not None and cur.xid and cur.state in SUBMISSION_LIVE_STATES:
+    cur.state = 'CANCELLED'
+    cur.ended_reason = f'cancelled via tpu cancel{at}'
+  entry.last_reason = reason or (
+      f'cancelled (tpu cancel{at}; registry CANCELLED; was local {old.value}) '
+      f'-- not a crash')
   return True
 
 

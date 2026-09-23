@@ -3,6 +3,7 @@
 import random
 from typing import Optional, TypeVar
 import unittest
+from unittest import mock
 
 from google3.experimental.users.qiaos.tpu_utils import route_lib as R
 
@@ -285,6 +286,15 @@ class RerouteTest(unittest.TestCase):
     e.state = R.JobState.QUEUED
     e.submitted_at = 0.0
     self.assertFalse(R.needs_reroute(e, now=1e9, reroute_after_s=600))
+
+  def test_reroute_deadline_has_no_exponential_backoff(self):
+    e = _entry()
+    e.state = R.JobState.SUBMITTED
+    e.submitted_at = 1000.0
+    for r in (0, 1, 4, 10):
+      e.reroutes = r
+      self.assertEqual(R.reroute_deadline_s(e, base_s=300.0), 300.0)
+      self.assertTrue(R.needs_reroute(e, now=1300.0, reroute_after_s=300.0))
 
   def test_mark_reroute_sets_cooldown_and_requeues(self):
     e = _entry()
@@ -1323,6 +1333,86 @@ class ReconcileTest(unittest.TestCase):
         frozenset({R.JobState.RUNNING, R.JobState.SUBMITTED, R.JobState.BUILDING}))
 
 
+class MarkCancelledTest(unittest.TestCase):
+  """route_lib.mark_cancelled: a deliberate `tpu cancel` retires the row as
+  FAILED (FINISHED_STATES unchanged) but labels the CURRENT submission
+  CANCELLED, so the queue record says 'cancelled', not 'zombie'."""
+
+  def _running(self, xid='123'):
+    e = _entry('c', xid=xid)
+    e.state = R.JobState.RUNNING
+    e.submissions[-1].state = 'RUNNING'
+    return e
+
+  def _cur(self, e) -> R.Submission:
+    cur = e.current_submission
+    self.assertIsNotNone(cur)
+    assert cur is not None  # narrows Optional for the type checker
+    return cur
+
+  def test_row_failed_submission_cancelled(self):
+    e = self._running()
+    self.assertTrue(R.mark_cancelled(e, when='2026-09-23 21:41:41'))
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertIn(e.state, R.FINISHED_STATES)
+    cur = self._cur(e)
+    self.assertEqual(cur.state, 'CANCELLED')
+    self.assertIn(cur.state, R.SUBMISSION_TERMINAL_STATES)
+    self.assertEqual(cur.ended_reason,
+                     'cancelled via tpu cancel at 2026-09-23 21:41:41')
+    self.assertIn('cancelled (tpu cancel at 2026-09-23 21:41:41', e.last_reason)
+    self.assertIn('not a crash', e.last_reason)
+    self.assertNotIn('zombie', e.last_reason)
+    self.assertEqual(e.xid, '123')        # the id stays on the record
+
+  def test_empty_when_has_no_dangling_at(self):
+    e = self._running()
+    R.mark_cancelled(e)
+    self.assertEqual(self._cur(e).ended_reason, 'cancelled via tpu cancel')
+    self.assertTrue(e.last_reason.startswith('cancelled (tpu cancel;'))
+
+  def test_explicit_reason_wins(self):
+    e = self._running()
+    R.mark_cancelled(e, reason='custom', when='t')
+    self.assertEqual(e.last_reason, 'custom')
+    self.assertEqual(self._cur(e).state, 'CANCELLED')
+
+  def test_submitted_row_also_cancelled(self):
+    e = _entry('s', xid='9')
+    e.state = R.JobState.SUBMITTED
+    self.assertTrue(R.mark_cancelled(e, when='t'))
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(self._cur(e).state, 'CANCELLED')
+
+  def test_superseded_submission_not_rewritten(self):
+    # Only a LIVE submission with an xid is relabelled (sync_current_submission
+    # rule): a record that already ended keeps its own state and reason.
+    e = self._running()
+    e.submissions[-1].state = 'SUPERSEDED'
+    e.submissions[-1].ended_reason = 'rerouted'
+    R.mark_cancelled(e, when='t')
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(e.submissions[-1].state, 'SUPERSEDED')
+    self.assertEqual(e.submissions[-1].ended_reason, 'rerouted')
+
+  def test_non_reconcilable_rows_untouched(self):
+    for st in (R.JobState.QUEUED, R.JobState.HELD, R.JobState.DONE,
+               R.JobState.FAILED, R.JobState.BUDGET_DEFERRED):
+      e = _entry('x', xid='5')
+      e.state = st
+      before = e.to_dict()
+      self.assertFalse(R.mark_cancelled(e, when='t'), st)
+      self.assertEqual(e.to_dict(), before, st)
+
+  def test_serde_roundtrip_keeps_cancelled(self):
+    e = self._running()
+    R.mark_cancelled(e, when='t')
+    back = R.QueueEntry.from_dict(e.to_dict())
+    self.assertEqual(back.state, R.JobState.FAILED)
+    self.assertEqual(self._cur(back).state, 'CANCELLED')
+    self.assertEqual(back.xid, '123')
+
+
 class NewStateSerdeTest(unittest.TestCase):
   """Step1: the two new states survive the JSON round-trip (readable strings)."""
 
@@ -1512,6 +1602,77 @@ class PlanPrunedRestartTest(unittest.TestCase):
         max_auto_resumes=3)
     self.assertEqual(verdict, R.RESUME_WARM)
 
+  # --- RESUME_COLD: preempted-before-first-checkpoint (Fix 2, gated) --------
+  # allow_cold defaults OFF, so all the tests above exercise the UNCHANGED
+  # behavior. These pass allow_cold=True to exercise the new branch.
+
+  def test_no_ckpt_default_still_holds_when_cold_disabled(self):
+    # GUARD: with allow_cold defaulting False, no-checkpoint is STILL an
+    # unconditional hold -- byte-for-byte the pre-Fix2 behavior, even for a
+    # clearly-preempted, clearly-trained run.
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
+        other_live_writer=False, trained=True, termination_cause='preempted')
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('cold start', why)
+
+  def test_cold_preempted_no_ckpt_reruns(self):
+    # THE FIX: terminal, no code bug, no checkpoint, but a preemption cause.
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
+        other_live_writer=False, termination_cause='preempted', allow_cold=True)
+    self.assertEqual(verdict, R.RESUME_COLD)
+
+  def test_cold_trained_no_cause_no_ckpt_reruns(self):
+    # THE 4-JOB CASE: clean preemption leaves NO cause in stdout, but the log
+    # shows training progress -> cold rerun.
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
+        other_live_writer=False, trained=True, allow_cold=True)
+    self.assertEqual(verdict, R.RESUME_COLD)
+
+  def test_cold_never_trained_unknown_cause_holds(self):
+    # NEGATIVE CONTROL: crashed on startup (never trained, no preempt cause) ->
+    # still HOLD even with allow_cold, or we loop replaying a startup crash.
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
+        other_live_writer=False, trained=False, termination_cause=None,
+        allow_cold=True)
+    self.assertEqual(verdict, R.HOLD)
+
+  def test_cold_still_blocked_by_code_bug(self):
+    # NEGATIVE CONTROL: a real crash signature outranks cold rerun.
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug='segfault (SIGSEGV)',
+        checkpoint=None, other_live_writer=False, trained=True, allow_cold=True)
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('code bug', why)
+
+  def test_cold_still_blocked_by_live_writer(self):
+    # NEGATIVE CONTROL: never add a 2nd writer, cold path included.
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
+        other_live_writer=True, trained=True, allow_cold=True)
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('SECOND writer', why)
+
+  def test_cold_still_bounded_by_budget(self):
+    # NEGATIVE CONTROL: the anti-loop budget caps cold reruns too.
+    verdict, why = R.plan_pruned_restart(
+        self._e(auto_resumes=3), xm_terminal=True, code_bug=None,
+        checkpoint=None, other_live_writer=False, trained=True,
+        termination_cause='preempted', allow_cold=True, max_auto_resumes=3)
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('budget', why)
+
+  def test_cold_prefers_warm_when_ckpt_exists(self):
+    # When a checkpoint DOES exist, we still warm-resume (cold is only the
+    # no-checkpoint fallback), even with allow_cold on.
+    verdict, _ = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug=None,
+        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False,
+        trained=True, termination_cause='preempted', allow_cold=True)
+    self.assertEqual(verdict, R.RESUME_WARM)
 
 class LooksLikeCodeBugTest(unittest.TestCase):
   """The code-bug gate: crashes in the TAIL flag, a healthy pruned tail does not,
@@ -1541,6 +1702,72 @@ class LooksLikeCodeBugTest(unittest.TestCase):
 
   def test_empty_is_none(self):
     self.assertIsNone(R.looks_like_code_bug(''))
+
+  def test_banner_sigsegv_advisory_is_none(self):
+    # REGRESSION (2026-09-18): the launcher boot banner prints this advisory,
+    # and its word 'SIGSEGVs' contains the substring 'SIGSEGV'. A naive
+    # `'SIGSEGV' in tail` test HELD 4 healthy PREEMPTED runs as if they had
+    # segfaulted. The word-boundary matcher must NOT flag it.
+    banner = ('[parcae-torch] \u2605 minloglevel SET BUT UNPROVEN. If rank 0 '
+              'SIGSEGVs in its first collective, THIS is why. Add '
+              '//base/python/clif:cpp_flag to the BUILD deps.')
+    self.assertIsNone(R.looks_like_code_bug(banner))
+
+  def test_banner_advisory_then_healthy_training_is_none(self):
+    # The full shape of the 4 mis-held runs: the advisory banner in the head,
+    # then clean training with NO real crash. Must read as healthy.
+    tail = ('If rank 0 SIGSEGVs in its first collective, THIS is why.\n'
+            '[parcae-torch] step 300 loss 4.77 gnorm 2.06 0.57 step/s\n'
+            '[parcae-torch] step 512 val_loss 4.02 val_ppl 56.1')
+    self.assertIsNone(R.looks_like_code_bug(tail))
+
+  def test_real_parenthesized_sigsegv_still_flags(self):
+    # GUARD AGAINST OVER-FIXING: a real crash line wraps the token in
+    # punctuation, e.g. 'Fatal ... (SIGSEGV)'. The boundary is alnum-only, so
+    # this MUST still match -- the fix narrows false positives, not true ones.
+    self.assertIsNotNone(
+        R.looks_like_code_bug('Fatal Python error: Segmentation fault (SIGSEGV)'))
+    self.assertIsNotNone(R.looks_like_code_bug('caught signal 11 (SIGSEGV), dumping'))
+
+  def test_traceback_signature_with_trailing_colon_still_flags(self):
+    # GUARD: 'TRACEBACK (MOST RECENT CALL LAST)' ends in ')', and in real logs
+    # is followed by ':'. A naive \b right-boundary would REGRESS here; our
+    # alnum-only boundary keeps it matching.
+    self.assertIsNotNone(R.looks_like_code_bug(
+        'Traceback (most recent call last):\n  File a.py'))
+  def test_backported_fatal_signals_flag(self):
+    # 2026-09-18 twin-table sync: SIGILL/SIGBUS/SIGFPE were missing from the
+    # route_lib copy, so a healthy run that trained a little then took one of
+    # these with no checkpoint could slip past the code-bug gate and (once
+    # cold-rerun is armed) be replayed into the same fault. They must flag.
+    self.assertIsNotNone(R.looks_like_code_bug('Fatal: caught signal 4 (SIGILL)'))
+    self.assertIsNotNone(R.looks_like_code_bug('worker died with signal 7'))
+    self.assertIsNotNone(R.looks_like_code_bug('rank 3 got signal 8 (SIGFPE)'))
+
+  def test_backported_exception_signatures_flag(self):
+    self.assertIsNotNone(R.looks_like_code_bug('AttributeError: no attr foo'))
+    self.assertIsNotNone(R.looks_like_code_bug('jaxlib JaxRuntimeError: bad'))
+    self.assertIsNotNone(R.looks_like_code_bug('PermissionError: denied'))
+    self.assertIsNotNone(
+        R.looks_like_code_bug("OSError: Permission denied: '/cns/si-d/x'"))
+    self.assertIsNotNone(
+        R.looks_like_code_bug('NOT_FOUND: Could not find /cns/si-d/data'))
+    self.assertIsNotNone(R.looks_like_code_bug('launcher: unrecoverable failure'))
+    self.assertIsNotNone(R.looks_like_code_bug('main exited with non-zero status'))
+
+  def test_omitted_signatures_stay_banner_safe(self):
+    # DELIBERATE OMISSIONS from the twin table (see _CODE_BUG_SIGNATURES): these
+    # three appear BENIGNLY in a healthy boot banner / device-info line, and the
+    # tail of a short log IS the banner. They must NOT be classed as code bugs,
+    # or every healthy pruned run gets HELD -- the regression this path exists
+    # to prevent. This test FAILS if someone naively re-adds them.
+    self.assertIsNone(R.looks_like_code_bug(
+        "minloglevel readback (ModuleNotFoundError: No module named 'base')"))
+    self.assertIsNone(R.looks_like_code_bug(
+        'note: ImportError fallback path taken for optional dep'))
+    self.assertIsNone(R.looks_like_code_bug(
+        'GPU0 HBM memory limit 40.0 GiB; 8 devices visible'))
+
 
 
 class OutDirFromLogTest(unittest.TestCase):
@@ -1636,6 +1863,59 @@ class BuildWarmRestartEntryTest(unittest.TestCase):
     R.build_warm_restart_entry(dead, '/cns/x/steps/step_1024.pt', 'j2')
     self.assertEqual(dead.auto_resumes, 0)
     self.assertNotIn('load_from', dead.launch_kwargs)
+
+
+class BuildColdRestartEntryTest(unittest.TestCase):
+  """The COLD twin: a healthy run preempted before its first checkpoint reruns
+  from step 0 -- clones the spec, wires NO resume pointer, still bounded by the
+  auto_resume budget."""
+
+  def _dead(self, **kw):
+    base = dict(
+        job_id='h100-8-dead', power='h100-8', archs=('h100',),
+        tier='PROD', allowed_metros=['sin', 'cbf'], state=R.JobState.FAILED,
+        xid='288098495', auto_resumes=0,
+        launch_kwargs={'config': 'cfgX', 'exp_name': 'parcae-dw', 'group': '9'})
+    base.update(kw)
+    return _entry(**base)
+
+  def test_clones_spec_and_sets_no_resume_pointer(self):
+    e = R.build_cold_restart_entry(self._dead(), 'h100-8-new01')
+    self.assertEqual(e.job_id, 'h100-8-new01')
+    self.assertEqual(e.power, 'h100-8')
+    self.assertEqual(e.allowed_archs, ['h100'])
+    self.assertEqual(e.tier, 'PROD')
+    self.assertEqual(e.allowed_metros, ['sin', 'cbf'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['config'], 'cfgX')  # same run
+    # THE POINT: cold means NO resume pointer of any kind.
+    self.assertNotIn('load_from', e.launch_kwargs)
+    self.assertNotIn('restart_from', e.launch_kwargs)
+    self.assertNotIn('restart_step', e.launch_kwargs)
+
+  def test_strips_stale_resume_pointer_from_cloned_spec(self):
+    # If the dead row somehow carried a resume pointer, cold must drop it.
+    dead = self._dead(launch_kwargs={
+        'config': 'cfgX', 'exp_name': 'parcae-dw', 'load_from': '/cns/old/step_1.pt',
+        'restart_from': '/cns/old', 'restart_step': '5'})
+    e = R.build_cold_restart_entry(dead, 'j2')
+    self.assertNotIn('load_from', e.launch_kwargs)
+    self.assertNotIn('restart_from', e.launch_kwargs)
+    self.assertNotIn('restart_step', e.launch_kwargs)
+
+  def test_increments_auto_resumes_and_names_attempt(self):
+    e = R.build_cold_restart_entry(self._dead(auto_resumes=1), 'j2')
+    self.assertEqual(e.auto_resumes, 2)
+    self.assertEqual(e.launch_kwargs['exp_name'], 'parcae-dw-r2')
+
+  def test_records_prior_xid(self):
+    e = R.build_cold_restart_entry(self._dead(), 'j2')
+    self.assertIn('288098495', e.prior_xids)
+
+  def test_does_not_mutate_dead_entry(self):
+    dead = self._dead()
+    R.build_cold_restart_entry(dead, 'j2')
+    self.assertEqual(dead.auto_resumes, 0)
 
 
 class PackageDirTest(unittest.TestCase):
@@ -1879,6 +2159,220 @@ class ResolveJobRefsTest(unittest.TestCase):
     matched, errs = R.resolve_job_refs(rows, ['', '  ', 'eqr-run'])
     self.assertEqual(matched, {'20260916T140000-abcabcabca'})
     self.assertEqual(errs, [])
+
+
+class ApplyWarmRestartInPlaceTest(unittest.TestCase):
+  """The IN-PLACE warm-restart the reroute path uses: the SAME row is kept
+  (job_id, backoff counter, cooldowns), and only the resume pointer is wired in,
+  layout-correctly (ELT restart_from vs torch load_from). The twin of
+  build_warm_restart_entry (which mints a fresh row for the reconcile path); both
+  share _apply_resume_pointer, so the silently-destructive layout trap is decided
+  in one place."""
+
+  def _row(self, **kw):
+    base = dict(
+        job_id='j-keep', power='h100-8', archs=('h100',),
+        tier='PROD', state=R.JobState.QUEUED, auto_resumes=0,
+        launch_kwargs={'config': 'cfgX', 'exp_name': 'parcae-dw'})
+    base.update(kw)
+    return _entry(**base)
+
+  def test_torch_layout_sets_load_from_and_clears_restart(self):
+    # A torch `step_<N>.pt` leaf resumes via $LOAD_FROM; any stale ELT keys must
+    # be cleared (both set trips main_eqr's guard).
+    e = self._row(launch_kwargs={'config': 'cfgX', 'exp_name': 'dw',
+                                 'restart_from': '/old/wd', 'restart_step': '10'})
+    R.apply_warm_restart_in_place(e, '/cns/x/steps/step_2048.pt')
+    self.assertEqual(e.launch_kwargs['load_from'], '/cns/x/steps/step_2048.pt')
+    self.assertNotIn('restart_from', e.launch_kwargs)
+    self.assertNotIn('restart_step', e.launch_kwargs)
+
+  def test_elt_layout_sets_restart_from_step_and_clears_load_from(self):
+    # NEGATIVE CONTROL for the destructive trap: an ELT checkpoints/<int> leaf
+    # must resume via restart_from+restart_step and NEVER via load_from (which
+    # would make orbax prune the checkpoints it resumed from).
+    e = self._row(launch_kwargs={'config': 'cfgX', 'exp_name': 'dw',
+                                 'load_from': '/stale/leaf'})
+    R.apply_warm_restart_in_place(e, '/cns/x/wd/checkpoints/1536')
+    self.assertEqual(e.launch_kwargs['restart_from'], '/cns/x/wd')
+    self.assertEqual(e.launch_kwargs['restart_step'], '1536')
+    self.assertNotIn('load_from', e.launch_kwargs)
+
+  def test_keeps_row_identity_and_bumps_auto_resumes(self):
+    e = self._row(auto_resumes=1)
+    R.apply_warm_restart_in_place(e, '/cns/x/steps/step_1.pt')
+    self.assertEqual(e.job_id, 'j-keep')     # SAME row, not a fresh one
+    self.assertEqual(e.power, 'h100-8')
+    self.assertEqual(e.auto_resumes, 2)      # shared budget bumped
+
+  def test_exp_name_suffix_does_not_stack(self):
+    e = self._row(auto_resumes=2, launch_kwargs={'exp_name': 'dw-r2'})
+    R.apply_warm_restart_in_place(e, '/cns/x/steps/step_1.pt')
+    self.assertEqual(e.launch_kwargs['exp_name'], 'dw-r3')
+
+  def test_exp_name_falls_back_to_name_then_job_id(self):
+    e = self._row(job_id='jx', launch_kwargs={})
+    e.name = 'readable-name'
+    R.apply_warm_restart_in_place(e, '/cns/x/steps/step_1.pt')
+    self.assertEqual(e.launch_kwargs['exp_name'], 'readable-name-r1')
+
+  def test_elt_layout_does_not_rollback_higher_restart_step(self):
+    e = self._row(launch_kwargs={
+        'config': 'cfgX', 'exp_name': 'dw-r3',
+        'restart_from': '/cns/newer/wd', 'restart_step': '35000',
+    })
+    R.apply_warm_restart_in_place(e, '/cns/older/wd/checkpoints/25001')
+    self.assertEqual(e.launch_kwargs['restart_from'], '/cns/newer/wd')
+    self.assertEqual(e.launch_kwargs['restart_step'], '35000')
+
+
+class ClassifyFailureTest(unittest.TestCase):
+  """Tests for the AUTO-RESUME RULE SET in route_lib.classify_failure."""
+
+  def test_affinity_group_in_use_resumes(self):
+    verdict, why = R.classify_failure(
+        'FAILED_PRECONDITION: AffinityGroup name: "nk_qiaos.1/qiaos" is still in'
+        ' use... { error: AFFINITY_GROUP_IN_USE }'
+    )
+    self.assertEqual(verdict, R.RESUME_XID)
+    self.assertIn('affinity group', why.lower())
+
+  def test_affinity_group_verdict_phrase_resumes(self):
+    verdict, why = R.classify_failure(
+        'Borg AffinityGroup in use (transient conflict; retry/reroute)'
+    )
+    self.assertEqual(verdict, R.RESUME_XID)
+    self.assertIn('affinity group', why.lower())
+
+  def test_task_action_fish_ici_resumes(self):
+    verdict, why = R.classify_failure(
+        'Borg task failed: TASK_ACTION_FISH_ICI_SECURITY_SETUP'
+    )
+    self.assertEqual(verdict, R.RESUME_XID)
+    self.assertIn('ici', why.lower())
+
+  def test_ici_setup_failure_phrase_resumes(self):
+    verdict, why = R.classify_failure(
+        'TPU ICI setup failure (hardware/bad node; reroute)'
+    )
+    self.assertEqual(verdict, R.RESUME_XID)
+    self.assertIn('ici', why.lower())
+
+  def test_zero_work_unit_holds(self):
+    verdict, why = R.classify_failure(
+        'reconciled: XM resolves the id but reports ZERO work units; experiment'
+        ' is gone'
+    )
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('work unit', why.lower())
+
+  def test_unrecognised_reason_defaults_to_hold(self):
+    verdict, why = R.classify_failure('some random unrecognised error')
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('unrecognised', why.lower())
+
+  def test_empty_reason_defaults_to_hold(self):
+    verdict, why = R.classify_failure('')
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('cannot classify', why.lower())
+
+
+class PlanOneWhyNotTest(unittest.TestCase):
+  """plan_one's one-line why-not for a row it cannot place (shown by the
+  worker's requeue, `tpu check` and `tpu queue-status`). Diagnostic only: the
+  placement decision itself must not change."""
+
+  def test_no_free_slice(self):
+    e = _entry(power='v7-32', archs=('v7',))
+    self.assertIsNone(R.plan_one(e, {'c7': _avail('c7', 'v7', free=0)},
+                                 now=0.0))
+    self.assertEqual(e.last_filter_reason, 'v7-32: no free slice')
+
+  def test_oversold_reads_as_no_free_slice(self):
+    e = _entry(power='v7-32', archs=('v7',))
+    self.assertIsNone(R.plan_one(
+        e, {'c7': _avail('c7', 'v7', free=320, oversold=True)}, now=0.0))
+    self.assertEqual(e.last_filter_reason, 'v7-32: no free slice')
+
+  def test_metro_filter_is_named(self):
+    e = _entry(power='v7-32', archs=('v7',), allowed_metros=['cbf'])
+    self.assertIsNone(R.plan_one(
+        e, {'c7': _avail('c7', 'v7', free=320, metro='kul')}, now=0.0))
+    self.assertEqual(e.last_filter_reason, 'v7-32: no free slice in cbf')
+
+  def test_one_note_per_arch_in_the_order_tried(self):
+    e = _entry(power='v7-32', archs=('v7', 'v6p'))
+    self.assertIsNone(R.plan_one(e, {}, now=0.0))
+    self.assertEqual(e.last_filter_reason,
+                     'v7-32: no free slice | v6p-32: no free slice')
+
+  def test_arch_with_several_shapes_is_named_once(self):
+    e = _entry(power='v7-32', archs=('v7',), power_tolerance=1.0)
+    self.assertGreater(len(R.candidate_shapes(e)), 1)      # precondition
+    self.assertIsNone(R.plan_one(e, {}, now=0.0))
+    self.assertEqual(e.last_filter_reason.count('v7-'), 1)
+
+  def test_over_the_limit_order_cap_is_named(self):
+    e = _entry(power='v7-32', archs=('v7',))
+    self.assertIsNone(R.plan_one(
+        e, {'c7': _avail('c7', 'v7', free=320, price=25.0)}, now=0.0))
+    self.assertEqual(e.last_filter_reason,
+                     'v7-32: 1 cell(s) over limit-order cap 20')
+
+  def test_no_group_storage_is_named(self):
+    e = _entry(power='v7-32', archs=('v7',))
+    avail = {f'c{i}': _avail(f'c{i}', 'v7', free=320, metro='nostore')
+             for i in range(5)}
+    with mock.patch.object(R, '_metro_has_group_storage',
+                           lambda m: m != 'nostore'):
+      self.assertIsNone(R.plan_one(e, avail, now=0.0))
+    self.assertEqual(
+        e.last_filter_reason,
+        'v7-32: 5 cell(s) in metros without group storage (c0,c1,c2,...)')
+
+  def test_no_accepted_shape_is_named(self):
+    # A locked v6p-32 (2x4x4) matches no v6e mesh, so no shape is tried.
+    e = _entry(power='v6p-32', archs=('v6e',), topology_locked=True)
+    self.assertEqual(R.candidate_shapes(e), [])             # precondition
+    self.assertIsNone(R.plan_one(e, {'c': _avail('c', 'v6e', 640)}, now=0.0))
+    self.assertTrue(e.last_filter_reason.startswith(
+        'no accepted shape: power v6p-32 fits none of archs v6e'),
+                    e.last_filter_reason)
+    self.assertIn('topology lock', e.last_filter_reason)
+
+  def test_reset_on_every_call_and_empty_on_placement(self):
+    e = _entry(power='v7-32', archs=('v7',))
+    e.last_filter_reason = 'stale verdict from an earlier pass'
+    _ok(R.plan_one(e, {'c7': _avail('c7', 'v7', free=320)}, now=0.0))
+    self.assertEqual(e.last_filter_reason, '')
+    e.last_filter_reason = 'stale verdict from an earlier pass'
+    self.assertIsNone(R.plan_one(e, {}, now=0.0))
+    self.assertEqual(e.last_filter_reason, 'v7-32: no free slice')
+
+  def test_cooldown_fallback_placement_leaves_no_reason(self):
+    e = _entry(power='v7-32', archs=('v7', 'v6p'))
+    e.cooldown_cells = {'c7': 1e12}
+    p = _ok(R.plan_one(e, {'c7': _avail('c7', 'v7', free=320)}, now=0.0))
+    self.assertEqual(p.cell, 'c7')
+    self.assertEqual(e.last_filter_reason, '')
+
+  def test_length_is_bounded(self):
+    s = R._unplaced_reason(_entry(), ['x' * 100] * 5)
+    self.assertEqual(len(s), R._FILTER_REASON_MAX_CHARS)
+    self.assertTrue(s.endswith('...'))
+
+  def test_select_and_plan_leaves_a_reason_on_each_unplaced_row(self):
+    a = _entry('a', power='v7-32', archs=('v7',))
+    b = _entry('b', power='v7-32', archs=('v7',))
+    got = R.select_and_plan([a, b], {'c7': _avail('c7', 'v7', free=32)},
+                            now=0.0, rng=random.Random(0))
+    self.assertEqual(len(got), 1)                 # one slice for two rows
+    placed = {got[0].job_id}
+    for e in (a, b):
+      if e.job_id in placed:
+        self.assertEqual(e.last_filter_reason, '')
+      else:
+        self.assertEqual(e.last_filter_reason, 'v7-32: no free slice')
 
 
 if __name__ == '__main__':

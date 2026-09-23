@@ -243,8 +243,8 @@ _REROUTE = flags.DEFINE_bool(
     'still PENDING past --reroute_after_s: cancel and return them to QUEUED so '
     'the next tick re-places them on a cell that can actually schedule.')
 _REROUTE_AFTER_S = flags.DEFINE_float(
-    'reroute_after_s', 600.0, 'A SUBMITTED job still PENDING this many seconds '
-    'after submit is cancelled and re-routed (operator default: 10 min).')
+    'reroute_after_s', 300.0, 'A SUBMITTED job still PENDING this many seconds '
+    'after submit is cancelled and re-routed (operator default: 5 min).')
 _COOLDOWN_S = flags.DEFINE_float(
     'cooldown_s', 7200.0, 'After a re-route, cool the stuck cell AND the arch '
     'for this long (operator 2026-09-10: 30min -> 2h). The old 30min window '
@@ -261,14 +261,13 @@ _FRESH_OUTPUT_S = flags.DEFINE_float(
     'says (disk evidence beats a PENDING snapshot). Default 20 min > a BATCH '
     'work-unit segment.')
 _NOMINAL_RUNNING_GRACE_S = flags.DEFINE_float(
-    'reroute_nominal_running_grace_s', 1200.0, 'How long a row may sit RUNNING '
+    'reroute_nominal_running_grace_s', 300.0, 'How long a row may sit RUNNING '
     'with NO Borg VM group in RUN and nothing ever written before it is treated '
     'as stuck and re-routed. XManager reports RUNNING for a job whose VM groups '
     'never left PENDING; that shape burned 12 h on one XID with zero output. '
     'Only the full conjunction acts (Borg answered + no group RUN + nothing '
     'written + past this grace); any doubt promotes as before. Operator '
-    '2026-09-11: lowered 3600 -> 1200 (20 min) -- an hour stuck in STARTING '
-    'without chips is too long to wait before re-routing.')
+    '2026-09-21: lowered 1200 -> 300 (5 min).')
 _INPLACE_REROUTE = flags.DEFINE_bool(
     'inplace_reroute', True, 'Also re-route a nominally-RUNNING row that Borg '
     'keeps restarting IN PLACE (same slice; the work unit never drops to '
@@ -633,6 +632,15 @@ def claim_next_build(path: str, now: float, worker_id: str,
     pick = route_lib.next_queued
   with with_queue_lock(path):
     entries = load_queue(path)
+    host_prefix = worker_id.split(':', 1)[0] + ':' if ':' in (worker_id or '') else ''
+    if host_prefix:
+      for e in entries:
+        if (e.state == route_lib.JobState.BUILDING
+            and e.worker_id and e.worker_id != worker_id
+            and e.worker_id.startswith(host_prefix)):
+          dead_pid = e.worker_id.split(':', 1)[1]
+          if dead_pid.isdigit() and not os.path.exists(f'/proc/{dead_pid}'):
+            e.build_started_at = 0.0
     route_lib.reclaim_stale_building(entries, now, stale_after_s)
     if not route_lib.can_claim_build(entries, now, stale_after_s):
       save_queue(path, entries)   # persist any reclaim even if we don't claim
@@ -725,7 +733,10 @@ NUL cannot occur in either stream's text, so the split is unambiguous."""
 def extract_xid(output: str) -> Optional[str]:
   """The XID from `tpu queue` output, ANSI-stripped, or None. Same rule as the
   wrapper: accept both the create line and the resume 'work unit(s)' line."""
-  m = _XID_RE.search(_ANSI_RE.sub('', output or ''))
+  clean = _ANSI_RE.sub('', output or '')
+  if 'No work units were added to this experiment' in clean:
+    return None
+  m = _XID_RE.search(clean)
   return m.group(1) if m else None
 
 
@@ -773,9 +784,9 @@ class Submitter:
     # untouched: xm_launcher already reads several TPU_* vars the same way, and
     # the launch path does not scrub the environment. Empty job_id => unset =>
     # the launcher simply skips the tag (a no-op, exactly today's behavior).
-    sub_env = None
+    sub_env = dict(os.environ)
+    sub_env['TPU_SKIP_PREFLIGHT'] = '1'
     if job_id:
-      sub_env = dict(os.environ)
       sub_env['TPU_LOCAL_JOB_ID'] = job_id
     # ★STREAM the output (§5.4 early binding). The build blocks for minutes; the
     # `Experiment id: N` creation line prints in the first instant. Reading
@@ -977,12 +988,17 @@ class XManagerStatusProbe:
 
   def __init__(self):
     self._client = None
+    self._reasons: dict[str, str] = {}
 
   def _get_client(self):
     if self._client is None:
       from google3.learning.deepmind.xmanager2.client import xmanager_api
       self._client = xmanager_api.XManagerApi()
     return self._client
+
+  def reason(self, xid: str) -> str:
+    """Latest status/failure message observed for `xid` during `status(xid)`."""
+    return self._reasons.get(str(xid), '')
 
   def status(self, xid: str) -> str:
     try:
@@ -994,22 +1010,29 @@ class XManagerStatusProbe:
       return STATUS_UNKNOWN
     if not wus:
       # ★GONE, not UNKNOWN. `get_experiment` SUCCEEDED -- the id resolves -- and
-      # the experiment reports no work units at all. A live job always has at
-      # least one WU, so this is a definite verdict about the world, not a
-      # failure to read it. Returning UNKNOWN here is what deadlocked 13 rows
-      # for 5-8 days (measured 2026-08-31): reconcile's "never act on UNKNOWN"
-      # guard left them SUBMITTED forever, while `tpu dequeue` refuses any row
-      # that still carries an xid -- so nothing could ever clean them up.
-      # The distinction that makes this safe is the try/except above: a probe
-      # that cannot reach XM still returns UNKNOWN and still acts on nothing.
+      # the experiment reports no work units at all.
+      self._reasons[str(xid)] = 'ZERO work units'
       return STATUS_GONE
     # A job is "still pending" only if EVERY work unit is pending; if any WU is
     # running/coming up, the placement took.
     states = []
+    last_msg = ''
     for wu in wus:
-      # is_completed is kept SEPARATE from the failure booleans. OR-ing it in
-      # here is what made every finished job read as a zombie: by the time the
-      # decision layer saw 'TERMINAL' the success/failure bit no longer existed.
+      # Extract any status message or raw proto BORG_STATE_FAILURE so
+      # run_reconcile can preserve the actual failure cause instead of
+      # overwriting last_reason with generic "zombie cleaned up" filler.
+      wu_msg = ''
+      st_obj = getattr(wu, 'status', None)
+      if st_obj is not None:
+        wu_msg = getattr(st_obj, 'message', '') or ''
+      if not wu_msg:
+        raw_wu = getattr(wu, '_work_unit', None)
+        if raw_wu is not None and hasattr(raw_wu, 'status'):
+          wu_msg = getattr(raw_wu.status, 'message', '') or ''
+          if not wu_msg and str(getattr(raw_wu.status, 'state', '') or ''):
+            wu_msg = str(getattr(raw_wu.status, 'state', ''))
+      if wu_msg:
+        last_msg = wu_msg
       is_completed = bool(getattr(wu, 'is_completed', False))
       is_terminal = bool(getattr(wu, 'is_failed', False)
                          or getattr(wu, 'is_stopped', False))
@@ -1018,14 +1041,12 @@ class XManagerStatusProbe:
           bool(getattr(wu, 'is_running', False)),
           is_terminal,
           is_completed))
+    if last_msg:
+      self._reasons[str(xid)] = last_msg
     if all(s == STATUS_PENDING for s in states):
       return STATUS_PENDING
     if any(s == STATUS_RUNNING for s in states):
       return STATUS_RUNNING
-    # Order matters below: a job is only COMPLETED if EVERY work unit completed.
-    # A mixed ending (some completed, some failed) is a FAILURE, not a success --
-    # so TERMINAL is tested as 'any', matching the pre-existing conservative
-    # bias that an ambiguous ending is never silently called a success.
     if all(s == STATUS_COMPLETED for s in states):
       return STATUS_COMPLETED
     if all(s in (STATUS_TERMINAL, STATUS_COMPLETED) for s in states):
@@ -1137,17 +1158,19 @@ class XManagerJobIdProbe:
     except Exception:  # pylint: disable=broad-except
       return None, None, 'UNKNOWN'
     known = {str(x) for x in (known_xids or [])}
+    def _exp_id(exp_obj) -> str:
+      return str(getattr(exp_obj, 'experiment_id', getattr(exp_obj, 'id', '')))
     # Keep only experiments the row has never recorded -- the escaped one(s).
-    unknown = [e for e in exps if str(e.experiment_id) not in known]
+    unknown = [e for e in exps if _exp_id(e) and _exp_id(e) not in known]
     if not unknown:
       return None, None, 'NONE'
     if len(unknown) > 1:
       return None, None, 'AMBIGUOUS'
     exp = unknown[0]
-    xid = str(exp.experiment_id)
+    xid = _exp_id(exp)
     placement = None
     try:
-      placement = parse_placement_from_launch_args(exp.launch_args)
+      placement = parse_placement_from_launch_args(getattr(exp, 'launch_args', ''))
     except Exception:  # pylint: disable=broad-except
       placement = None
     return xid, placement, 'FOUND'
@@ -1403,38 +1426,92 @@ class CnsRestartProbe:
           newest = mt
     return newest
 
+  def _parse_attempt_rows(
+      self, rows: list[list[str]]
+  ) -> list[tuple[int, int, float]]:
+    """Parse `fileutil ls -l` rows into sorted `(attempt_idx, size_bytes, mtime)`.
+
+    Deduplicates the `(parent_stub, rank0_worker)` pair that PyTorch GPU
+    `re-exec fan-out` binaries emit on a single Borg task start: the parent
+    process logs ~2.2 KB (`< 3000` bytes) of fan-out lines to
+    `rank_0_attempt<k>.log` before re-exec'ing 8 workers whose rank 0 then
+    claims `rank_0_attempt<k+1>.log`. Counting both turns 1 start into 2 and
+    trips `threshold=3` on a single migration.
+    """
+    parsed: list[tuple[int, int, float]] = []
+    for fields in rows:
+      if len(fields) < 8 or fields[0].startswith('total'):
+        continue
+      path = fields[-1]
+      m = re.search(r'rank_0_attempt(\d+)\.log$', path)
+      if not m:
+        continue
+      mt = _parse_fileutil_mtime(fields)
+      if mt is None:
+        continue
+      try:
+        sz = int(fields[4])
+      except (ValueError, IndexError):
+        sz = 0
+      parsed.append((int(m.group(1)), sz, mt))
+    parsed.sort(key=lambda x: x[0])
+
+    deduped: list[tuple[int, int, float]] = []
+    i = 0
+    while i < len(parsed):
+      idx, sz, mt = parsed[i]
+      if (0 < sz < 3000 and i + 1 < len(parsed)
+          and parsed[i + 1][0] == idx + 1
+          and (parsed[i + 1][1] >= 3000 or 0.0 <= parsed[i + 1][2] - mt <= 300.0)):
+        # `idx` is the re-exec parent fan-out stub for worker `idx + 1`;
+        # keep the worker entry so one task start counts once.
+        deduped.append(parsed[i + 1])
+        i += 2
+      else:
+        deduped.append((idx, sz, mt))
+        i += 1
+    return deduped
+
   def _restart_mtimes(self, bucket: str, xid: str) -> Optional[list[float]]:
-    """mtimes of every rank-0 attempt log (one per in-place restart), or None."""
+    """mtimes of every rank-0 attempt log (one per in-place start), or None."""
     rows = self._ls_l(
         f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*/logs/rank_0_attempt*.log')
     if rows is None:
       return None
-    mtimes: list[float] = []
-    for fields in rows:
-      if len(fields) < 8 or fields[0].startswith('total'):
-        continue
-      if 'rank_0_attempt' not in fields[-1] or not fields[-1].endswith('.log'):
-        continue
-      mt = _parse_fileutil_mtime(fields)
-      if mt is not None:
-        mtimes.append(mt)
-    return mtimes or None
+    deduped = self._parse_attempt_rows(rows)
+    return [mt for _, _, mt in deduped] or None
 
-  def restarts_since_progress(self,
-                             entry: 'route_lib.QueueEntry') -> Optional[int]:
+  def restarts_since_progress(
+      self,
+      entry: 'route_lib.QueueEntry',
+      now: Optional[float] = None,
+  ) -> Optional[int]:
     xid = entry.xid
     bucket = _bucket_for_entry(entry)
     if not xid or not bucket:
       return None
-    mtimes = self._restart_mtimes(bucket, xid)
-    if not mtimes:
+    rows = self._ls_l(
+        f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*/logs/rank_0_attempt*.log')
+    if rows is None:
       return None
+    deduped = self._parse_attempt_rows(rows)
+    if not deduped:
+      return None
+    # ★NEVER KILL A RUN THAT IS ACTIVELY TRAINING PAST STARTUP. Startup + model
+    # init + compile banner is ~5 KB; a latest attempt log >= 8 KB whose mtime
+    # moved within the last 10 minutes is actively emitting training steps right
+    # now (e.g. a long interval before the first checkpoint save), not thrashing
+    # in a preemption loop.
+    now_ts = time.time() if now is None else now
+    _, latest_sz, latest_mt = deduped[-1]
+    if latest_sz >= 8192 and (now_ts - latest_mt) <= 600.0:
+      return 0
+    mtimes = [mt for _, _, mt in deduped]
     ckpt = self._newest_checkpoint_mtime(bucket, xid)
-    # No checkpoint ever written -> every restart is a no-progress restart, so
-    # count them all (ref=0). A job that has checkpointed -> count only restarts
-    # since that save.
-    ref = ckpt if ckpt is not None else 0.0
-    return sum(1 for m in mtimes if m > ref)
+    if ckpt is None:
+      # Attempt 0 is the initial launch; only subsequent attempts are restarts.
+      return max(0, len(mtimes) - 1)
+    return sum(1 for m in mtimes if m > ckpt)
 
 
 # --- Pruned-restart evidence: the CNS I/O that feeds plan_pruned_restart -----
@@ -1495,9 +1572,11 @@ def _read_log_head_tail(path: str, head_bytes: int, tail_bytes: int,
   q = shlex.quote(path)
   def _slice(cmd: str) -> str:
     try:
-      out = subprocess.run(f'fileutil cat {q} | {cmd}', shell=True,
+      out = subprocess.run(f'fileutil cat {q} 2>/dev/null | {cmd}', shell=True,
                            capture_output=True, text=True, timeout=timeout_s)
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired as e:
+      return _decode_stream(e.stdout)
+    except OSError:
       return ''
     return out.stdout or ''
   return (_slice(f'head -c {int(head_bytes)}'),
@@ -1566,6 +1645,58 @@ def _latest_complete_checkpoint(out_dir: str,
   return best
 
 
+# ★COLD-RERUN MASTER SWITCH (Fix 2). Enabled so a healthy run preempted before
+# its first checkpoint (or rejected at creation by transient Borg
+# AFFINITY_GROUP_IN_USE / ICI_SECURITY_SETUP / TASK_ACTION_FISH) cold-reruns
+# within the auto_resume budget instead of stranding in FAILED.
+_ALLOW_COLD_RERUN = True
+
+
+def _summarize_xm_failure(xm_msg: str) -> str:
+  """Concise human-readable failure cause from an XManager work-unit message."""
+  if not xm_msg:
+    return ''
+  up = xm_msg.upper()
+  if 'AFFINITY_GROUP_IN_USE' in up or ('AFFINITY' in up and 'IN USE' in up):
+    return 'Borg AFFINITY_GROUP_IN_USE (transient conflict)'
+  if 'TASK_ACTION_FISH_' in up or 'ICI_SECURITY_SETUP' in up:
+    return 'TPU ICI setup failure'
+  if 'PREEMPT' in up or 'DESCHEDULED' in up:
+    return 'preempted/descheduled'
+  cb = route_lib.looks_like_code_bug(xm_msg)
+  if cb:
+    return f'CODE BUG: {cb}'
+  if 'JOB TERMINATED IN STATE FAILURE' in up or 'BORG_STATE_FAILURE' in up:
+    return 'task exited in state FAILURE (check CNS logs or pre-InitGoogle imports/configs)'
+  return ''
+
+
+def _termination_cause_of(entry: 'route_lib.QueueEntry') -> Optional[str]:
+  """Best-effort termination cause for a dead row, or None.
+
+  A clean preemption leaves NO cause in the job's own stdout, so this reads the
+  QUEUE ROW instead: an explicit preempt/evict/drain/reclaim word in
+  last_reason, or -- failing that -- the presence of any eviction STRIKE, which
+  the router stamps precisely when a cell evicts this job. Returns a lowercase
+  cause substring that route_lib._PREEMPTION_CAUSES matches, or None when there
+  is no positive signal (in which case the cold decision falls back to the
+  `trained` evidence). Never raises.
+  """
+  reason = (getattr(entry, 'last_reason', '') or '').lower()
+  for word in (
+      'preempt', 'evict', 'drain', 'reclaim', 'pruned', 'affinity', 'ici', 'fish'
+  ):
+    if word in reason:
+      return word
+  evictions = getattr(entry, 'evictions', None) or {}
+  try:
+    if any(int((v or {}).get('strikes', 0)) > 0 for v in evictions.values()):
+      return 'evict'
+  except (AttributeError, TypeError, ValueError):
+    pass
+  return None
+
+
 class CnsRestartEvidence:
   """Gathers the two CNS facts plan_pruned_restart needs about a dead row: any
   code-bug signature in the log tail, and the newest complete checkpoint. Held
@@ -1580,38 +1711,186 @@ class CnsRestartEvidence:
 
   def code_bug_and_checkpoint(
       self, entry: 'route_lib.QueueEntry'
-  ) -> tuple[Optional[str], Optional[str]]:
+  ) -> tuple[Optional[str], Optional[str], bool]:
+    """Returns (code_bug, checkpoint, trained). `trained` is True when the log
+    shows the run reached at least one training step -- the signal that a
+    no-checkpoint death was a preemption of a HEALTHY run (retry cold) rather
+    than a startup crash (hold). Kept in this same read so the cold-rerun
+    decision needs no extra CNS round-trip."""
     bucket = _bucket_for_entry(entry)
     if not bucket or not entry.xid:
-      return None, None
+      return None, None, False
     log_path = _find_newest_rank0_log(bucket, str(entry.xid), self._timeout_s)
     if not log_path:
-      return None, None
+      return None, None, False
     head, tail = _read_log_head_tail(
         log_path, self._head_bytes, self._tail_bytes, self._timeout_s)
     code_bug = route_lib.looks_like_code_bug(tail)
     out_dir = (route_lib.out_dir_from_log(head)
                or route_lib.out_dir_from_log(tail))
+    if not out_dir and '/logs/rank_0_attempt' in log_path:
+      out_dir = os.path.dirname(os.path.dirname(log_path))
     checkpoint = (_latest_complete_checkpoint(out_dir, self._timeout_s)
                   if out_dir else None)
-    return code_bug, checkpoint
+    trained = route_lib.looks_trained(head) or route_lib.looks_trained(tail)
+    return code_bug, checkpoint, trained
 
 
 def _restart_decision(dead: 'route_lib.QueueEntry',
                       entries: list['route_lib.QueueEntry'],
-                      evidence, max_resumes: int):
+                      evidence, max_resumes: int,
+                      *, log: Optional[list] = None, tag: str = ''):
   """(plan, checkpoint) for a just-failed row: gather CNS evidence, apply the
   pure decision. plan is (verdict, why). Kept separate so both the dry-run and
   the live branch of run_reconcile decide identically.
+
+  ★COLD-RERUN GATE. A row that is terminal with NO checkpoint but shows training
+  progress (or a preemption cause) is a healthy run killed before its first
+  save; the pure decision can return RESUME_COLD for it, but ONLY when
+  allow_cold is set. That switch is _ALLOW_COLD_RERUN, module-level and OFF in
+  phase 2a: the evidence is gathered and the shadow decision is logged, but the
+  live verdict stays exactly what it was before (HOLD). Phase 2b flips it on.
   """
-  cb, ckpt = (evidence.code_bug_and_checkpoint(dead)
-              if evidence else (None, None))
+  ev = (evidence.code_bug_and_checkpoint(dead)
+        if evidence else (None, None, False))
+  # Back-compat: a fake/legacy evidence returning a 2-tuple still works.
+  if len(ev) == 3:
+    cb, ckpt, trained = ev
+  else:
+    cb, ckpt = ev
+    trained = False
+  if not ckpt:
+    lk = getattr(dead, 'launch_kwargs', None) or {}
+    prior_lf = str(lk.get('load_from') or '').strip()
+    prior_rf = str(lk.get('restart_from') or '').strip()
+    prior_rs = str(lk.get('restart_step') or '').strip()
+    if prior_lf:
+      ckpt = prior_lf
+    elif prior_rf and prior_rs.isdigit():
+      ckpt = f"{prior_rf.rstrip('/')}/checkpoints/{prior_rs}"
   other = route_lib.has_live_config_sibling(dead, entries)
+  cause = _termination_cause_of(dead)
   plan = route_lib.plan_pruned_restart(
       dead, xm_terminal=True, code_bug=cb, checkpoint=ckpt,
-      other_live_writer=other, max_auto_resumes=max_resumes)
+      other_live_writer=other, max_auto_resumes=max_resumes,
+      trained=trained, termination_cause=cause, allow_cold=_ALLOW_COLD_RERUN)
+  # ★SHADOW (phase 2a). When the live gate is OFF, re-run the SAME pure decision
+  # with allow_cold=True and log what it WOULD have done -- without acting. This
+  # is how we watch, on the real reconcile stream, which no-checkpoint HOLDs the
+  # cold path would rescue, before ever changing behavior. No-op once
+  # _ALLOW_COLD_RERUN is True (the live plan already is the cold plan).
+  if log is not None and not _ALLOW_COLD_RERUN:
+    shadow_verdict, shadow_why = route_lib.plan_pruned_restart(
+        dead, xm_terminal=True, code_bug=cb, checkpoint=ckpt,
+        other_live_writer=other, max_auto_resumes=max_resumes,
+        trained=trained, termination_cause=cause, allow_cold=True)
+    if shadow_verdict != plan[0]:
+      log.append(
+          f'[shadow][cold-rerun] {tag}: WOULD be {shadow_verdict} if enabled '
+          f'(trained={trained}, cause={cause!r}) -- {shadow_why}')
   return plan, ckpt
 
+
+# --- Registry cancel lookup: a deliberate `tpu cancel` is not a crash --------
+# `tpu cancel <xid>` marks the registry row status=CANCELLED + cancelled_at, but
+# leaves the queue row holding that xid. run_reconcile asks this lookup before it
+# writes a dead row off as a zombie, so a cancelled job is recorded as CANCELLED
+# and never auto-resumed. Kill-switch (read at call time, no rebuild): set
+# TPU_RECONCILE_NO_CANCEL_DETECT in the loop env and restart the loop.
+_CANCEL_DETECT_KILL_SWITCH = 'TPU_RECONCILE_NO_CANCEL_DETECT'
+
+
+def _registry_cancelled_at_of(row) -> Optional[str]:
+  """cancelled_at ('' when absent) if a registry row records a deliberate
+  cancel, else None.
+
+  Both markers count, because the check daemon's board write-back can later
+  overwrite status=CANCELLED with FAILED while cancelled_at survives. A row the
+  router archived after its OWN reroute cancel (archived_by='reroute') does not
+  count: the router cancelled it only to move it, so if the queue row still
+  holds that xid the requeue was lost and the old recovery path (zombie ->
+  FAILED, auto-resume) is the right one.
+  """
+  if not isinstance(row, dict):
+    return None
+  when = row.get('cancelled_at')
+  if row.get('status') != 'CANCELLED' and not when:
+    return None
+  if str(row.get('archived_by') or '') == 'reroute':
+    return None
+  return str(when or '')
+
+
+def make_registry_cancelled_lookup(
+    jobs_file: Optional[str] = None,
+    legacy_file: Optional[str] = None,
+) -> Optional[Callable[[str], Optional[str]]]:
+  """The production `cancelled_lookup` for run_reconcile, or None when the
+  kill-switch is set.
+
+  Files resolve like _archive_rerouted_xid (`TPU_JOBS_FILE` /
+  `TPU_JOBS_LEGACY_FILE`, defaulting to ~/.tpu_jobs.json and
+  ~/.tpu_jobs_legacy.json). The live file is consulted first and the legacy
+  archive second; the first file that has the xid decides. Each file is read at
+  most once per lookup object and only when first needed, so make a fresh
+  lookup per reconcile pass. FAIL-SAFE: a missing, unreadable or half-written
+  file, or any other error, reads as 'not cancelled' (None), which is exactly
+  the pre-change behaviour. Read-only; takes no lock.
+  """
+  if os.environ.get(_CANCEL_DETECT_KILL_SWITCH):
+    return None
+  jobs_path = os.path.expanduser(
+      jobs_file or os.environ.get('TPU_JOBS_FILE') or '~/.tpu_jobs.json')
+  legacy_path = os.path.expanduser(
+      legacy_file or os.environ.get('TPU_JOBS_LEGACY_FILE')
+      or '~/.tpu_jobs_legacy.json')
+  cache: dict[str, Optional[dict]] = {}
+
+  def _load(path: str) -> Optional[dict]:
+    if path not in cache:
+      data = None
+      for _ in range(3):
+        try:
+          with open(path) as f:
+            data = json.load(f)
+          break
+        except ValueError:
+          data = None       # a writer mid-rewrite; retry briefly, then give up
+          time.sleep(0.1)
+        except OSError:
+          data = None
+          break
+      cache[path] = data if isinstance(data, dict) else None
+    return cache[path]
+
+  def lookup(xid: str) -> Optional[str]:
+    try:
+      for path in (jobs_path, legacy_path):
+        data = _load(path)
+        if data is None or str(xid) not in data:
+          continue
+        return _registry_cancelled_at_of(data[str(xid)])
+      return None
+    except Exception:  # pylint: disable=broad-except
+      return None
+
+  return lookup
+
+
+def _registry_cancel_verdict(
+    lookup: Optional[Callable[[str], Optional[str]]],
+    xid: str, log: list[str], tag: str) -> Optional[str]:
+  """Call `lookup` defensively: its cancelled_at string, or None on no lookup,
+  a non-string answer, or any exception (which is logged, never raised)."""
+  if lookup is None:
+    return None
+  try:
+    v = lookup(xid)
+  except Exception as exc:  # pylint: disable=broad-except
+    log.append(f'[reconcile] {tag}: registry cancel lookup failed (non-fatal; '
+               f'treated as not cancelled): {exc!r}')
+    return None
+  return v if isinstance(v, str) else None
 
 # --- Step2: XM-truth reconcile pass (fixes R3 zombie pollution) -------------
 def run_reconcile(
@@ -1623,9 +1902,22 @@ def run_reconcile(
     auto_resume_pruned: bool = False,
     auto_resume_max: int = 3,
     restart_evidence=None,
+    cancelled_lookup: Optional[Callable[[str], Optional[str]]] = None,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """Re-verify every non-terminal (RECONCILABLE_STATES) entry against XManager
   and clean up stale local state. Returns (entries, log_lines).
+
+  ★DELIBERATE CANCELS ARE NOT CRASHES. `cancelled_lookup(xid)` returns the
+  registry's cancelled_at string ('' when the row says CANCELLED with no
+  timestamp) for an xid that `tpu cancel` stopped, else None. When XM says a
+  row's xid is dead (TERMINAL / GONE) and the lookup says it was cancelled, the
+  row is retired through route_lib.mark_cancelled: row FAILED, current
+  submission CANCELLED, and NO auto-resume, because somebody stopped that job
+  on purpose. Without this the Local Queue said `FAILED ... zombie cleaned up`
+  next to a CANCELLED board row and auto-resume could restart the job. The
+  lookup is fail-safe: None, or any exception it raises, means the old path
+  runs unchanged; with cancelled_lookup=None (the default) this function is
+  byte-for-byte what it was.
 
   This is the reconcile half of the standalone tpu-reroute process. It fixes R3:
   .tpu_local_queue.json keeps state=RUNNING/SUBMITTED for jobs XManager no longer
@@ -1645,12 +1937,31 @@ def run_reconcile(
     log.append('[reconcile] no non-terminal entries to reconcile.')
     return entries, log
   n_zombie = n_promoted = n_unknown = n_noop = n_done = n_resumed = 0
+  n_cancelled = 0
   for e in targets:
     xid = e.xid
     if not xid:
       # A BUILDING/SUBMITTED row with no xid has no XM identity to check.
       continue
+    cur = e.current_submission
+    if (e.state == route_lib.JobState.BUILDING and
+        (cur is None or cur.state not in route_lib.SUBMISSION_LIVE_STATES)):
+      # ★A BUILDING row whose newest submission already ENDED still holds that
+      # OLD attempt's id (the `xid` view keeps reporting a FAILED/DONE
+      # submission). The build in progress has no experiment of its own yet, so
+      # the old id says nothing about it. Judging the row by it is how
+      # 20260923T003437-cc68d736fe was declared a zombie MID-BUILD at 15:43:44Z
+      # (its previous xid 292403341 was TERMINAL) and auto-resumed as a second
+      # row -- two copies of one run training from the same step. Wait for the
+      # builder to bind the new attempt (open_creating), then reconcile that.
+      n_noop += 1
+      log.append(f'[reconcile] {e.job_id} (local BUILDING, xid={xid} belongs '
+                 f'to an ended attempt) -> left alone until the build binds a '
+                 f'new XID')
+      continue
     st = probe.status(str(xid))
+    xm_reason = getattr(probe, 'reason', lambda _: '')(str(xid)) or ''
+    prior_reason = e.last_reason or ''
     tag = f'{e.job_id} (xid={xid}, local {e.state.value}, XM {st})'
     # Age gates the GONE verdict only (a young row is legitimately 0-WU).
     # submitted_at is None on a re-routed row, which reads as 'age unknown'
@@ -1663,16 +1974,38 @@ def run_reconcile(
       else:
         n_noop += 1
       continue
+    cancelled_at = (
+        _registry_cancel_verdict(cancelled_lookup, str(xid), log, tag)
+        if new_state == route_lib.JobState.FAILED else None)
+    if cancelled_at is not None:
+      # A deliberate `tpu cancel`: retire the row as CANCELLED and never
+      # auto-resume it (see the docstring). Counted apart from zombies.
+      n_cancelled += 1
+      at = f' at {cancelled_at}' if cancelled_at else ''
+      if dry_run:
+        log.append(f'[DRY][reconcile] would set {tag} -> CANCELLED '
+                   f'(tpu cancel{at}; registry CANCELLED; no auto-resume)')
+        continue
+      route_lib.mark_cancelled(e, when=cancelled_at)
+      log.append(f'[reconcile] {tag} -> CANCELLED (tpu cancel{at}; registry '
+                 f'CANCELLED; not a crash, no auto-resume)')
+      continue
     if dry_run:
       log.append(f'[DRY][reconcile] would set {tag} -> {new_state.value}')
       if new_state == route_lib.JobState.FAILED:
         n_zombie += 1
         if auto_resume_pruned:
-          (verdict, why), ckpt = _restart_decision(
-              e, entries, restart_evidence, auto_resume_max)
+          e.last_reason = f'{prior_reason} {xm_reason}'.strip()
+          try:
+            (verdict, why), ckpt = _restart_decision(
+                e, entries, restart_evidence, auto_resume_max, log=log, tag=tag)
+          finally:
+            e.last_reason = prior_reason
           if verdict == route_lib.RESUME_WARM:
             log.append(f'[DRY][auto-resume] {tag}: would warm-restart from '
                        f'{ckpt} ({why})')
+          elif verdict == route_lib.RESUME_COLD:
+            log.append(f'[DRY][auto-resume] {tag}: would COLD rerun ({why})')
           else:
             log.append(f'[DRY][auto-resume] {tag}: HOLD ({why})')
       elif new_state == route_lib.JobState.DONE:
@@ -1680,7 +2013,15 @@ def run_reconcile(
       else:
         n_promoted += 1
       continue
-    changed = route_lib.reconcile_entry(e, st, age_s=age_s)
+    old_val = e.state.value
+    summary = _summarize_xm_failure(xm_reason) if st != STATUS_GONE else ''
+    reconcile_reason = (
+        f'reconciled: XM reports terminal (was local {old_val}; '
+        f'cause: {summary}); zombie cleaned up'
+        if summary else ''
+    )
+    changed = route_lib.reconcile_entry(
+        e, st, reason=reconcile_reason, age_s=age_s)
     if changed:
       if e.state == route_lib.JobState.FAILED:
         n_zombie += 1
@@ -1688,10 +2029,16 @@ def run_reconcile(
           log.append(f'[reconcile] {tag} -> FAILED '
                      f'(experiment GONE: 0 work units, age {int(age_s or 0)}s)')
         else:
-          log.append(f'[reconcile] {tag} -> FAILED (zombie cleaned up)')
+          log.append(f'[reconcile] {tag} -> FAILED (zombie cleaned up'
+                     f'{"; " + summary if summary else ""})')
         if auto_resume_pruned:
-          (verdict, why), ckpt = _restart_decision(
-              e, entries, restart_evidence, auto_resume_max)
+          saved_reconciled_reason = e.last_reason
+          e.last_reason = f'{prior_reason} {xm_reason}'.strip()
+          try:
+            (verdict, why), ckpt = _restart_decision(
+                e, entries, restart_evidence, auto_resume_max, log=log, tag=tag)
+          finally:
+            e.last_reason = saved_reconciled_reason
           if verdict == route_lib.RESUME_WARM and ckpt:
             new = route_lib.build_warm_restart_entry(
                 e, ckpt, _new_resume_job_id(e.power))
@@ -1699,7 +2046,16 @@ def run_reconcile(
             n_resumed += 1
             log.append(f'[auto-resume] {tag}: warm-restart queued as '
                        f'{new.job_id} from {ckpt}')
+          elif verdict == route_lib.RESUME_COLD:
+            new = route_lib.build_cold_restart_entry(
+                e, _new_resume_job_id(e.power))
+            entries.append(new)
+            n_resumed += 1
+            log.append(f'[auto-resume] {tag}: COLD rerun queued as '
+                       f'{new.job_id} ({why})')
           else:
+            if 'code bug (' in why and 'cause:' not in (e.last_reason or ''):
+              e.last_reason = f'{e.last_reason} [{why.split(";")[0]}]'
             log.append(f'[auto-resume] {tag}: HOLD ({why})')
       elif e.state == route_lib.JobState.DONE:
         n_done += 1
@@ -1709,11 +2065,13 @@ def run_reconcile(
         log.append(f'[reconcile] {tag} -> RUNNING (placement confirmed)')
   log.append(
       f'[reconcile] {len(targets)} checked: {n_zombie} zombie->FAILED, '
-      f'{n_done} completed->DONE, '
+      + (f'{n_cancelled} cancelled (tpu cancel; no auto-resume), '
+         if cancelled_lookup is not None else '')
+      + f'{n_done} completed->DONE, '
       f'{n_promoted} promoted->RUNNING, {n_unknown} UNKNOWN (left alone), '
       f'{n_noop} already-correct'
-      + (f', {n_resumed} auto warm-restart(s) queued.' if auto_resume_pruned
-         else '.'))
+      + (f', {n_resumed} auto restart(s) queued (warm/cold).'
+         if auto_resume_pruned else '.'))
   return entries, log
 
 
@@ -1802,13 +2160,104 @@ def _archive_rerouted_xid(xid: Optional[str], log: list[str]) -> None:
     log.append(f'[reroute] archive of xid {xid} FAILED (non-fatal): {exc!r}')
 
 
+def _reroute_requeue_after_cancel(
+    e: route_lib.QueueEntry,
+    xid: str,
+    now: float,
+    *,
+    entries: list[route_lib.QueueEntry],
+    submitter: '_Submitter',
+    dry_run: bool,
+    cooldown_s: float,
+    hist: list[float],
+    history_file: Optional[str],
+    log: list[str],
+    restart_evidence,
+    auto_resume_max: int,
+    record_evict: bool,
+    dry_reason: str,
+    ok_reason: str,
+    fail_prefix: str,
+    persist_fn: Optional[Callable[[], None]] = None,
+) -> None:
+  """The shared tail of all THREE reroute cancel sites (a: in-place thrash,
+  b: PENDING x2, c: nominally-RUNNING): once the decision to cancel+requeue is
+  made, honour dry_run, cancel, and on success reset the row to QUEUED --
+  resuming WARM from a surviving checkpoint when one exists, else COLD via a
+  bare mark_reroute exactly as before.
+
+  ★RECONCILE/REROUTE PARITY -- THE DATA-LOSS FIX. Before this, all three sites
+  called mark_reroute alone, which returns the row to QUEUED carrying NO resume
+  pointer -- so a job with a complete checkpoint on CNS COLD-STARTED from step 0
+  after a reroute, throwing away every step of durable progress. run_reconcile
+  already preserved a dead job's checkpoint on the FAILED path (CnsRestartEvidence
+  -> plan_pruned_restart -> a warm-restart entry); this threads the SAME
+  machinery into the reroute cancel paths via `restart_evidence`. With
+  restart_evidence=None (the default, and every existing test/call site) the plan
+  is always HOLD, so the requeue is a bare cold start -- behaviour UNCHANGED.
+
+  We KEEP the row (same job_id, same reroute-backoff counter, and the cell
+  cooldown + eviction strike just stamped on it) and resume it warm IN PLACE
+  (route_lib.apply_warm_restart_in_place) rather than appending a fresh row as
+  reconcile does: build_warm_restart_entry carries none of those penalties
+  forward, so a substituted fresh row would re-land on the very cell it was just
+  evicted from. The layout-correct resume wiring (ELT restart_from vs torch
+  load_from) is shared with reconcile through route_lib._apply_resume_pointer.
+  """
+  # Plan the warm restart BEFORE any mutation: the checkpoint lookup reads
+  # e.xid and e.cell, and mark_reroute below clears BOTH. No complete checkpoint
+  # (the common h100 case -- the job never survived to its first checkpoint)
+  # yields HOLD, i.e. an unchanged cold requeue. _restart_decision is the exact
+  # same evidence+verdict helper run_reconcile uses, so the two paths agree.
+  # ★Do not let `auto_resumes >= auto_resume_max` suppress checkpoint updates on
+  # a reroute: unlike reconcile (where HOLD leaves a dead row terminal),
+  # mark_reroute below ALWAYS re-queues the row, so returning HOLD on budget
+  # would re-queue it WITHOUT its newest checkpoint (rolling back progress).
+  effective_max_resumes = max(
+      auto_resume_max, int(getattr(e, 'auto_resumes', 0) or 0) + 1)
+  (verdict, warm_why), ckpt = _restart_decision(
+      e, entries, restart_evidence, effective_max_resumes)
+  warm = verdict == route_lib.RESUME_WARM and bool(ckpt)
+  if dry_run:
+    log.append(f'[DRY][reroute] would cancel + re-route {dry_reason}'
+               + (f'; then WARM-restart from {ckpt} ({warm_why})' if warm
+                  else ''))
+    return
+  ok, out = submitter.cancel(xid)
+  if not ok:
+    log.append(f'{fail_prefix} {_tail(out)}')
+    return
+  hist.append(time.time())
+  _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
+  if record_evict:
+    # ★record_eviction BEFORE mark_reroute: the latter clears e.cell, and the
+    # strike must land on the cell that did the evicting -- that is what makes
+    # the NEXT placement avoid it (evict_penalty in cell_score).
+    route_lib.record_eviction(e, now)
+  route_lib.mark_reroute(e, now, cooldown_s)
+  if warm:
+    # Wire the surviving checkpoint into the SAME (now QUEUED) row so the next
+    # placement resumes warm instead of cold-starting. mark_reroute already
+    # superseded the dead xid into prior_xids and cleared cell/arch/chips.
+    route_lib.apply_warm_restart_in_place(e, ckpt)
+    log.append(f'{ok_reason}; WARM-restart from {ckpt} ({warm_why})')
+  else:
+    log.append(ok_reason)
+  _archive_rerouted_xid(xid, log)
+  if persist_fn is not None:
+    try:
+      persist_fn()
+    except Exception as exc:  # pylint: disable=broad-except
+      log.append(f'[reroute] inline persist after cancel of {xid} failed (non-fatal): {exc!r}')
+
+
 # --- the re-route sweep ---------------------------------------------------
 def run_reroute(
     entries: list[route_lib.QueueEntry],
     now: float,
     probe: _StatusProbe,
     submitter: Optional[_Submitter] = None,
-    reroute_after_s: float = 600.0,
+    reroute_after_s: float = 300.0,
     cooldown_s: float = 1800.0,
     dry_run: bool = True,
     output_probe: Optional[_OutputProbe] = None,
@@ -1817,11 +2266,14 @@ def run_reroute(
     sleep_fn: Callable[[float], None] = time.sleep,
     history_file: Optional[str] = None,
     borg_probe: Optional['_BorgVmProbe'] = None,
-    nominal_running_grace_s: float = 3600.0,
+    nominal_running_grace_s: float = 300.0,
     placement_probe: 'Optional[_PlacementProbe]' = None,
     restart_probe: 'Optional[_RestartProbe]' = None,
     inplace_reroute: bool = True,
     inplace_restart_threshold: int = 3,
+    restart_evidence=None,
+    auto_resume_max: int = 3,
+    persist_fn: Optional[Callable[[], None]] = None,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """Cancel SUBMITTED jobs stuck PENDING past the deadline and return them to
   QUEUED for the next tick to re-place. Returns (entries, log_lines).
@@ -1830,6 +2282,15 @@ def run_reroute(
   and the side effects (cancel + mark_reroute, which cools the stuck cell). A
   job that has meanwhile started RUNNING is promoted; a terminal one is left for
   infra_check to reconcile.
+
+  ★CHECKPOINT PRESERVATION (reconcile/reroute parity): when a cancelled row has
+  a complete checkpoint in its lineage, the requeue resumes WARM from it instead
+  of cold-starting from step 0 -- the same CnsRestartEvidence +
+  plan_pruned_restart + warm-restart machinery run_reconcile uses on the FAILED
+  path, threaded here via `restart_evidence` and shared across all three cancel
+  sites by _reroute_requeue_after_cancel. Default None => an unchanged cold
+  requeue, so every existing test and call site is untouched. `auto_resume_max`
+  is the shared warm-restart budget (same flag as reconcile).
 
   HARDENING (2026-08-24, after xid 282605596 was wrongly re-routed): a single
   PENDING snapshot is NOT enough to cancel -- a BATCH job's EMA shadow work
@@ -1882,6 +2343,13 @@ def run_reroute(
 
   sub = submitter or Submitter()
   for e in candidates + [r for r in recheck if r not in candidates]:
+    if not dry_run and route_lib.global_reroute_brake(hist, time.time()):
+      n = len([t for t in hist if t >= time.time() - 3600.0])
+      log.append(
+          f'[reroute] ★GLOBAL BRAKE ENGAGED mid-pass ({n} re-routes in last '
+          f'hour, limit {route_lib.REROUTE_GLOBAL_MAX_PER_HOUR}); stopping '
+          f'further cancellations in this pass.')
+      break
     # `or now` would read a submitted_at of 0.0 as "no timestamp" and report
     # age 0 -- harmless while every real stamp is an epoch second, and wrong the
     # moment anything (a test, a reset, a hand-edited row) carries a literal 0.
@@ -1891,8 +2359,18 @@ def run_reroute(
     state = probe.status(xid) if xid else STATUS_UNKNOWN
     tag = f'{e.job_id} (xid={xid}, {e.cell}, pending {age}s)'
     if state == STATUS_PENDING and xid:
-      # GUARD (a): disk evidence of life. A fresh write beats a PENDING snapshot.
-      mtime = output_probe.latest_mtime(e) if output_probe else None
+      # GUARD (a): disk evidence of life. A fresh write beats a PENDING snapshot
+      # ONLY when Borg does not explicitly confirm that zero VM groups are RUN.
+      # ★Bug 3 fix (2026-09-21): a RUNNING job that gets preempted back to
+      # PENDING wrote rank logs right before eviction; while `has_running_vmgroup`
+      # answers False, Borg has confirmed the slice is gone, so those CNS writes
+      # are pre-preemption history and must not stall rerouting for 20 minutes.
+      vm_running_now = borg_probe.has_running_vmgroup(e) if borg_probe else None
+      if vm_running_now is False and output_probe is not None:
+        log.append(f'[reroute] {tag}: no Borg VM group is RUN -> ignoring '
+                   f'pre-preemption CNS output freshness')
+      mtime = (output_probe.latest_mtime(e)
+               if (output_probe and vm_running_now is not False) else None)
       out_fresh = route_lib.output_is_fresh(mtime, now, fresh_output_s)
       if out_fresh:
         age_out = int(now - mtime) if mtime else -1
@@ -1905,7 +2383,9 @@ def run_reroute(
       sleep_fn(confirm_gap_s)
       # A cheap disk re-check inside the window costs nothing and catches a
       # write that landed during the gap (v26: time-staggered second sample).
-      mtime2 = output_probe.latest_mtime(e) if output_probe else None
+      vm_running_2 = borg_probe.has_running_vmgroup(e) if borg_probe else None
+      mtime2 = (output_probe.latest_mtime(e)
+                if (output_probe and vm_running_2 is not False) else None)
       if route_lib.output_is_fresh(mtime2, time.time(), fresh_output_s):
         age_out = int(time.time() - mtime2) if mtime2 else -1
         e.last_reason = f'alive: output written {age_out}s ago (2nd check)'
@@ -1918,19 +2398,16 @@ def run_reroute(
                    f'-> alive/ambiguous, no action')
         continue
       # Double-confirmed stuck: both probes PENDING and no fresh output.
-      if dry_run:
-        log.append(f'[DRY][reroute] would cancel + re-route {tag}: '
-                   f'PENDING x2, no fresh output')
-        continue
-      ok, out = sub.cancel(xid)
-      if ok:
-        hist.append(time.time())
-        _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
-        route_lib.mark_reroute(e, now, cooldown_s)
-        log.append(f'[reroute] cancelled + re-queued {tag}; cell cooled {int(cooldown_s)}s')
-        _archive_rerouted_xid(xid, log)
-      else:
-        log.append(f'[reroute] cancel FAILED for {tag}, left SUBMITTED. {_tail(out)}')
+      _reroute_requeue_after_cancel(
+          e, xid, now, entries=entries, submitter=sub, dry_run=dry_run,
+          cooldown_s=cooldown_s, hist=hist, history_file=history_file, log=log,
+          restart_evidence=restart_evidence, auto_resume_max=auto_resume_max,
+          record_evict=False,
+          dry_reason=f'{tag}: PENDING x2, no fresh output',
+          ok_reason=(f'[reroute] cancelled + re-queued {tag}; cell cooled '
+                     f'{int(cooldown_s)}s'),
+          fail_prefix=f'[reroute] cancel FAILED for {tag}, left SUBMITTED.',
+          persist_fn=persist_fn)
     elif state == STATUS_RUNNING:
       # ★XM RUNNING IS NOT "HAS CHIPS", AND PROMOTING ON IT IS A ONE-WAY DOOR.
       # needs_reroute() selects SUBMITTED rows only, so the moment RUNNING is
@@ -1988,25 +2465,18 @@ def run_reroute(
           why = (f'in-place preemption thrash: {rsp} restart(s) on {e.cell} '
                  f'since the last checkpoint '
                  f'(>= {inplace_restart_threshold}), zero durable progress')
-          if dry_run:
-            log.append(f'[DRY][reroute] would cancel + re-route {tag}: {why}')
-            continue
-          ok, out = sub.cancel(xid)
-          if ok:
-            hist.append(time.time())
-            _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
-            # ★record_eviction BEFORE mark_reroute: the latter clears e.cell,
-            # and the strike must land on the cell that did the evicting -- that
-            # is what makes the NEXT placement avoid it (evict_penalty in
-            # cell_score), which is the whole point of pulling it back.
-            route_lib.record_eviction(e, now)
-            route_lib.mark_reroute(e, now, cooldown_s)
-            log.append(f'[reroute] cancelled + re-queued {tag}: {why}; cell '
-                       f'cooled {int(cooldown_s)}s, eviction strike recorded')
-            _archive_rerouted_xid(xid, log)
-          else:
-            log.append(f'[reroute] cancel FAILED for thrashing {tag}, left '
-                       f'as-is. {_tail(out)}')
+          _reroute_requeue_after_cancel(
+              e, xid, now, entries=entries, submitter=sub, dry_run=dry_run,
+              cooldown_s=cooldown_s, hist=hist, history_file=history_file,
+              log=log, restart_evidence=restart_evidence,
+              auto_resume_max=auto_resume_max,
+              record_evict=True,  # thrash: blame the cell that evicted it
+              dry_reason=f'{tag}: {why}',
+              ok_reason=(f'[reroute] cancelled + re-queued {tag}: {why}; cell '
+                         f'cooled {int(cooldown_s)}s, eviction strike recorded'),
+              fail_prefix=(f'[reroute] cancel FAILED for thrashing {tag}, left '
+                           f'as-is.'),
+              persist_fn=persist_fn)
           continue
       vm_running = borg_probe.has_running_vmgroup(e) if borg_probe else None
       cell_known = bool((e.cell or '').strip())
@@ -2050,20 +2520,17 @@ def run_reroute(
           f'unrecoverable from XM)' if not cell_known
           else f'XM says RUNNING but NO Borg VM group is RUN and nothing was '
                f'ever written ({age}s > {int(nominal_running_grace_s)}s grace)')
-      if dry_run:
-        log.append(f'[DRY][reroute] would cancel + re-route {tag}: {stuck_why}')
-        continue
-      ok, out = sub.cancel(xid)
-      if ok:
-        hist.append(time.time())
-        _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
-        route_lib.mark_reroute(e, now, cooldown_s)
-        log.append(f'[reroute] cancelled + re-queued {tag}: nominally RUNNING '
-                   f'({stuck_why}); cell cooled {int(cooldown_s)}s')
-        _archive_rerouted_xid(xid, log)
-      else:
-        log.append(f'[reroute] cancel FAILED for nominally-RUNNING {tag}, '
-                   f'left as-is. {_tail(out)}')
+      _reroute_requeue_after_cancel(
+          e, xid, now, entries=entries, submitter=sub, dry_run=dry_run,
+          cooldown_s=cooldown_s, hist=hist, history_file=history_file, log=log,
+          restart_evidence=restart_evidence, auto_resume_max=auto_resume_max,
+          record_evict=False,
+          dry_reason=f'{tag}: {stuck_why}',
+          ok_reason=(f'[reroute] cancelled + re-queued {tag}: nominally RUNNING '
+                     f'({stuck_why}); cell cooled {int(cooldown_s)}s'),
+          fail_prefix=(f'[reroute] cancel FAILED for nominally-RUNNING {tag}, '
+                       f'left as-is.'),
+          persist_fn=persist_fn)
     elif state == STATUS_TERMINAL:
       e.state = route_lib.JobState.FAILED
       route_lib.sync_current_submission(
@@ -2331,6 +2798,31 @@ def run_worker_once(
     log.append(f'[worker] {claimed.job_id} -> HELD ({reason}); slot released, not churned.')
     return 'held', log, new_fail_count
 
+  # PLAN a cell for it (live availability) BEFORE any XManager jobid-tag RPC:
+  # if no cell can place this entry right now, release the slot immediately
+  # without paying for a remote XManager lookup.
+  placement = plan_one_entry(claimed, provider, now)
+  if placement is None:
+    # Nothing placeable right now -> release the slot, back to QUEUED.
+    # Note: claim_next_build overwrote claimed.last_reason with
+    # 'building (worker ...)', while route_lib.plan_one wrote the real
+    # capacity verdict into claimed.last_filter_reason.
+    filter_why = getattr(claimed, 'last_filter_reason', '') or ''
+    prior_why = claimed.last_reason or ''
+    if prior_why.startswith('building ('):
+      prior_why = ''
+    reason = filter_why or prior_why or 'nothing placeable right now'
+    def _requeue(e: route_lib.QueueEntry) -> None:
+      e.state = route_lib.JobState.QUEUED
+      e.build_started_at = None
+      e.worker_id = None
+      if filter_why:
+        e.last_filter_reason = filter_why
+      e.last_reason = f'waiting: {reason}'
+    update_entry(queue_file, claimed.job_id, _requeue)
+    log.append(f'[worker] {claimed.job_id}: {reason}; released slot, back to QUEUED.')
+    return 'requeued', log, new_fail_count
+
   # PRE-BUILD ESCAPE CHECK (§5.4, last resort). Early binding closes the crash
   # window in all but one case: the router died AFTER create_experiment
   # succeeded on XManager but BEFORE on_early_xid persisted the CREATING
@@ -2392,20 +2884,6 @@ def run_worker_once(
                  f'unreachable); slot released, will retry -- not rebuilding.')
       return 'deferred', log, new_fail_count
     # r_status == 'NONE': nothing escaped -- fall through and build normally.
-
-  # PLAN a cell for it (live availability).
-  placement = plan_one_entry(claimed, provider, now)
-  if placement is None:
-    # Nothing placeable right now -> release the slot, back to QUEUED.
-    reason = claimed.last_reason or 'nothing placeable right now'
-    def _requeue(e: route_lib.QueueEntry) -> None:
-      e.state = route_lib.JobState.QUEUED
-      e.build_started_at = None
-      e.worker_id = None
-      e.last_reason = f'waiting: {reason}'
-    update_entry(queue_file, claimed.job_id, _requeue)
-    log.append(f'[worker] {claimed.job_id}: {reason}; released slot, back to QUEUED.')
-    return 'requeued', log, new_fail_count
 
   # BUILD + SUBMIT: the one build. build_tpu_queue_cmd + submit(cwd=workdir).
   # ★Prefer the group the ROUTER admitted this job under (g5/g3 before g9).
@@ -2478,6 +2956,22 @@ def run_worker_once(
                f'build failure; attempts unchanged); slot released.')
     return 'budget_deferred', log, new_fail_count
 
+  if '[[STAGE_PARENT_MISSING]]' in (out or ''):
+    def _stage_transient(e: route_lib.QueueEntry) -> None:
+      e.state = route_lib.JobState.QUEUED
+      e.build_started_at = None
+      e.worker_id = None
+      e.last_reason = (
+          f'staging parent dir temporarily unavailable (CitC/srcfsd mount); '
+          f'requeued without burning attempts (attempts={e.attempts})'
+      )
+    update_entry(queue_file, claimed.job_id, _stage_transient)
+    log.append(
+        f'[worker] {claimed.job_id} -> STAGE_PARENT_MISSING (CitC/srcfsd transient, '
+        f'attempts unchanged at {claimed.attempts}); requeued.'
+    )
+    return 'requeued', log, new_fail_count
+
   # MODE-1 GUARD: no XID / found[] zombie -> NOT submitted. Count the attempt.
   # Requeue for a retry UNLESS it has now failed max_build_attempts times, in
   # which case park it in HELD so one bad job cannot churn the worker forever
@@ -2506,6 +3000,111 @@ def run_worker_once(
   log.append(f'[worker] {claimed.job_id} -> NO XID (found[]/build crash); requeued '
              f'({attempts_after}/{max_build_attempts}). tail: {_tail(out)}')
   return 'requeued', log, new_fail_count
+
+
+# --- Group capacity from the checker caches (the "can g5 hold it" gate) -----
+# quota_check writes ~/.tpu_quota_cache_dir/g<N>.txt (floor/used per type);
+# money_check writes money.txt (income + balance per group) and market.json
+# (prices + limit orders). The daemon refreshes all three about once a minute,
+# and route_lib.group_can_hold refuses anything older than
+# GROUP_CAPACITY_MAX_AGE_S, so a dead daemon closes the gate instead of leaving
+# a stale "room" open.
+QUOTA_CACHE_DIR = os.path.expanduser('~/.tpu_quota_cache_dir')
+_NUM_RE = re.compile(r'-?\d[\d,]*(?:\.\d+)?')
+
+
+def _cache_num(s: str) -> Optional[float]:
+  m = _NUM_RE.search(s or '')
+  return float(m.group(0).replace(',', '')) if m else None
+
+
+def _family_of_quota_label(label: str) -> Optional[str]:
+  """'GPU H100' -> 'h100', 'TPU v7' -> 'v7', 'GPU A100-40G' -> 'a100'; labels
+  that are not a router family ('TPU v5e Pod') -> None."""
+  s = (label or '').strip().lower()
+  for prefix in ('tpu ', 'gpu '):
+    if s.startswith(prefix):
+      s = s[len(prefix):].strip()
+      break
+  else:
+    return None
+  if not s or ' ' in s:
+    return None
+  return {'a100-40g': 'a100', 'a100-80g': 'a100_80gib'}.get(s, s)
+
+
+def parse_group_quota(text: str) -> tuple[dict, dict]:
+  """(floor, used) per family from the PROD rows of one quota_check table."""
+  floor: dict = {}
+  used: dict = {}
+  tier = ''
+  for line in _ANSI_RE.sub('', text or '').splitlines():
+    c = [x.strip() for x in line.split('\u2502')]
+    if len(c) < 6:
+      continue
+    tier = c[1] or tier          # the tier cell is blank on continuation rows
+    fam = _family_of_quota_label(c[2])
+    q, u = _cache_num(c[3]), _cache_num(c[4])
+    if tier.upper() == 'PROD' and fam and q is not None and u is not None:
+      floor[fam], used[fam] = q, u
+  return floor, used
+
+
+def parse_group_money(text: str, group: str) -> tuple[Optional[float], float]:
+  """(income credits/hr or None, balance credits) for G<group> in money_check's
+  groups table. An unreadable balance reads 0.0: money_check prints
+  'n/a (static pool)' also for a DYNAMIC pool whose balance is exactly 0, and a
+  balance we cannot read must not buy anything."""
+  for line in _ANSI_RE.sub('', text or '').splitlines():
+    c = [x.strip() for x in line.split('\u2502')]
+    if len(c) >= 6 and c[1] == f'G{group}':
+      income = _cache_num(c[4]) if 'credits/hr' in c[4].lower() else None
+      bal = None if 'n/a' in c[5].lower() else _cache_num(c[5])
+      return income, (bal if bal is not None else 0.0)
+  return None, 0.0
+
+
+def load_group_capacity(group: str, cache_dir: str = QUOTA_CACHE_DIR,
+                        now: Optional[float] = None
+                        ) -> Optional[route_lib.GroupCapacity]:
+  """GroupCapacity for alloc group `group`, or None when the caches are missing
+  or unparseable (the gate then refuses the group -- fail closed)."""
+  now = time.time() if now is None else now
+  qpath = os.path.join(cache_dir, f'g{group}.txt')
+  mpath = os.path.join(cache_dir, 'money.txt')
+  kpath = os.path.join(cache_dir, 'market.json')
+  try:
+    age = now - min(os.path.getmtime(p) for p in (qpath, mpath, kpath))
+    with open(qpath) as f:
+      floor, used = parse_group_quota(f.read())
+    with open(mpath) as f:
+      _, balance = parse_group_money(f.read(), group)
+    with open(kpath) as f:
+      market = json.load(f)
+  except (OSError, ValueError):
+    return None
+  if not floor and not used:
+    return None
+  pool = avail_provider.DEFAULT_PRICE_POOL
+  alloc = avail_provider._GROUP_MAP.get(str(group), '')  # pylint: disable=protected-access
+  short = alloc.rsplit('/', 1)[-1]
+  arch_of_card = {card: arch for arch, cards in avail_provider.ARCH_CARDS.items()
+                  for card in cards}
+  caps: dict = {}
+  for key, rec in ((market or {}).get('limit_orders') or {}).items():
+    parts = str(key).split('|')
+    if (len(parts) == 4 and parts[0] == pool and parts[1] == short
+        and parts[3] == 'PROD' and parts[2].isdigit()
+        and isinstance(rec, dict) and rec.get('cap') is not None):
+      arch = arch_of_card.get(int(parts[2]))
+      if arch:
+        caps[arch] = float(rec['cap'])
+  prices = avail_provider.load_prices(kpath, pool)
+  burn = sum(max(0.0, used.get(f, 0.0) - floor.get(f, 0.0)) * prices.get(f, 0.0)
+             for f in used)
+  return route_lib.GroupCapacity(group=str(group), floor=floor, used=used,
+                                 balance=balance, above_floor_burn=burn,
+                                 limit_caps=caps, age_s=age, prices=prices)
 
 
 # --- Step3: the budget seam (reuse wiki_agent budget_check --query) ----------
@@ -2547,6 +3146,8 @@ def run_dispatch_once(
     budget_query_fn: 'Callable[..., Optional[dict]]' = budget_query,
     dry_run: bool = True,
     group_order: Optional[list[str]] = None,
+    provider: Optional[_Provider] = None,
+    group_capacity_fn: 'Optional[Callable[[str], Optional[route_lib.GroupCapacity]]]' = None,
 ) -> tuple[str, list[str]]:
   """ONE router-dispatch round (the DISPATCH half of the rewritten worker).
 
@@ -2592,6 +3193,52 @@ def run_dispatch_once(
     log.append('[dispatch] no QUEUED jobs to dispatch.')
     return 'idle', log
 
+  # 2b. CAPACITY PRE-FILTER (when `provider` is supplied): do NOT promote an
+  #     entry to BUILD_REQUESTED if no cell in the cluster can place it right
+  #     now. Promoting unplaceable entries forces the serial worker to claim and
+  #     requeue all of them one by one while holding the backpressure gate shut
+  #     against newly enqueued jobs that DO have capacity.
+  # The placement each placeable candidate WOULD get right now, keyed by job_id.
+  # Step 3 prices the budget gate from it (see _type_of): the shape the builder
+  # will actually submit, not the `--power` string the job was enqueued with.
+  placement_by_id: dict = {}
+  if provider is not None:
+    placeable_queued: list[route_lib.QueueEntry] = []
+    unplaceable_reasons: dict[str, tuple[str, str]] = {}
+    for e in queued:
+      pl = plan_one_entry(e, provider, now)
+      if pl is not None:
+        placement_by_id[e.job_id] = pl
+        placeable_queued.append(e)
+      else:
+        f_why = getattr(e, 'last_filter_reason', '') or ''
+        p_why = e.last_reason or ''
+        if p_why.startswith('building ('):
+          p_why = ''
+        why = f_why or p_why or 'nothing placeable right now'
+        if not why.startswith('waiting: '):
+          why = f'waiting: {why}'
+        unplaceable_reasons[e.job_id] = (why, f_why)
+    if unplaceable_reasons and not dry_run:
+      with with_queue_lock(queue_file):
+        live_q = load_queue(queue_file)
+        changed_q = False
+        for e in live_q:
+          if e.job_id in unplaceable_reasons and e.state == route_lib.JobState.QUEUED:
+            new_r, new_f = unplaceable_reasons[e.job_id]
+            if e.last_reason != new_r or (new_f and e.last_filter_reason != new_f):
+              e.last_reason = new_r
+              if new_f:
+                e.last_filter_reason = new_f
+              changed_q = True
+        if changed_q:
+          save_queue(queue_file, live_q)
+    if not placeable_queued:
+      log.append(f'[dispatch] 0/{len(queued)} QUEUED job(s) have placeable '
+                 f'capacity right now; holding in QUEUED.')
+      return 'idle', log
+    queued = placeable_queued
+
   # 3. headroom (XM-truth). One query for the round's starting headroom; the
   #    per-candidate cost also comes from the seam, and plan_dispatch pre-debits
   #    in memory so we do not double-count within the round.
@@ -2619,6 +3266,24 @@ def run_dispatch_once(
   # 0.0 chips with ~122k credits idle.
   _cost_cache: dict = {}
   def _type_of(e: route_lib.QueueEntry) -> str:
+    """The accelerator type the budget gate should price this row as.
+
+    ★PRICE THE SHAPE THE BUILDER WILL SUBMIT, NOT THE ENQUEUE `--power`.
+    `--power` is a compute TARGET that several (arch, chips) shapes may meet.
+    Pricing it literally (v6e-64 -> 1450 cr/hr) deferred every multi-arch ELT
+    row even while the only shape that could actually place was v4-256 at
+    371 cr/hr -- v6e was above its limit-order cap and could never have been
+    submitted at all. The capacity pre-filter above has already run the SAME
+    plan_one the builder runs (same provider, same cap gate, same cooldowns),
+    so its placement is the shape that will be built; pricing any OTHER shape
+    (e.g. "the cheapest shape that fits the headroom") would let the builder
+    then submit a dearer one than the gate admitted.
+    Fallbacks, in order: the row's own arch/chips (no provider this round, e.g.
+    tests), then the literal power string (the pre-fix behaviour).
+    """
+    pl = placement_by_id.get(e.job_id)
+    if pl is not None:
+      return f'{pl.arch}-{pl.chips}'
     if e.arch and e.chips:
       return f'{e.arch}-{e.chips}'
     return e.power
@@ -2645,34 +3310,121 @@ def run_dispatch_once(
     by absl or dropped at build time."""
     pin = route_lib.pinned_group(e)
     if pin:
+      if pin != group_order[-1]:
+        _debit_group(e, pin)   # a pinned job still takes that pool's room
       return pin, (_probe_group(e, pin) or {})
     last = (group_order[-1], {})
     for g in group_order:
+      if g != group_order[-1]:
+        why_not = _group_gate(e, g)
+        if why_not:
+          skipped.setdefault(e.job_id, []).append(why_not)
+          continue        # this pool cannot take it now: try the next one
       pr = _probe_group(e, g)
       if not pr:
         continue          # probe failed for this group: try the next one
       last = (g, pr)
       if pr.get('fits'):
+        if g != group_order[-1]:
+          _debit_group(e, g)
         return g, pr
     return last
+  # ★GROUP GATES (operator 2026-09-23: "和对tpu type / cell做冷却时一样的逻辑，
+  # 再次之外加一个'g5能不能用'的判断，如果不能就不route到g5"). Before this the
+  # order was consulted blind: g5 is budget-EXEMPT, so its probe always "fits"
+  # and every unpinned job went to g5 (20,613 dispatch lines to g5, 0 to g3) on
+  # a day g5's H100 floor was full and its balance ~0 -- the jobs sat PENDING
+  # ("99% of SCUs in your pool are queued ahead") or were reclaimed ("guarantee
+  # reclaim -- we were ABOVE"), were re-routed, and were sent straight back to
+  # g5 (one row 10 times). Two gates now guard every NON-FALLBACK group; the
+  # last group of the order (the g9 floor) is never gated, so a gate can only
+  # move a job on to g9, never strand it:
+  #   1. group cooldown -- this job was re-routed off that pool recently
+  #      (route_lib.group_cooling, stamped by mark_reroute like cell/arch);
+  #   2. can the pool hold it -- route_lib.group_can_hold over the checker
+  #      caches (group limit order vs price, then floor room, else balance to
+  #      buy above-floor weight), failing closed. Gate 2 is off when
+  #      group_capacity_fn is None (unit tests of the bare preference order).
+  # group -> {family: chips} sent to that pool and not running yet: SUBMITTED
+  # rows (absent from the quota table's Used, but GQM must seat them first), plus
+  # every job admitted to it earlier in THIS round (_debit_group). BUILD_REQUESTED
+  # / BUILDING rows need no entry: backpressure above returned if any existed.
+  pending_by_group: dict = {}
+  for x in entries:
+    if (x.state == route_lib.JobState.SUBMITTED and x.group and x.arch
+        and x.chips):
+      fams = pending_by_group.setdefault(str(x.group), {})
+      fams[x.arch.lower()] = fams.get(x.arch.lower(), 0.0) + float(x.chips)
+  verdicts: dict = {}     # (job_id, group) -> route_lib.HoldVerdict
+  skipped: dict = {}      # job_id -> [why each preferred pool was passed over]
+  _cap_cache: dict = {}
+  def _shape_of(e: route_lib.QueueEntry) -> tuple:
+    pl = placement_by_id.get(e.job_id)
+    if pl is not None:
+      return pl.arch, pl.chips, pl.price
+    return e.arch, e.chips, None
+  def _group_gate(e: route_lib.QueueEntry, g: str) -> str:
+    """'' if non-fallback group `g` may take `e` now, else why it may not."""
+    rec = route_lib.group_cooling(e, g, now)
+    if rec is not None:
+      return (f'g{g} cooling for this job ({int(float(rec["until"]) - now)}s '
+              f'left, strike {rec.get("strikes", 1)})')
+    if group_capacity_fn is None:
+      return ''
+    if g not in _cap_cache:
+      try:
+        _cap_cache[g] = group_capacity_fn(g)
+      except Exception:  # pylint: disable=broad-except
+        _cap_cache[g] = None   # fail closed: an unreadable pool is not usable
+    arch, chips, price = _shape_of(e)
+    try:
+      v = route_lib.group_can_hold(_cap_cache[g], arch, chips, price,
+                                   pending=pending_by_group.get(g))
+    except Exception as ex:  # pylint: disable=broad-except
+      # Fail closed and never crash the round: a gate bug must cost this pool
+      # one job, not stop dispatch fleet-wide (the wrapper would restart-loop).
+      v = route_lib.HoldVerdict(False, f'g{g}: capacity gate error: {ex!r}')
+    verdicts[(e.job_id, g)] = v
+    return '' if v.ok else v.reason
+  def _debit_group(e: route_lib.QueueEntry, g: str) -> None:
+    """Count a job admitted to pool `g` as pending there for the rest of the
+    round, so later jobs see its chips as taken."""
+    arch, chips, _ = _shape_of(e)
+    if arch and chips:
+      fams = pending_by_group.setdefault(str(g), {})
+      fams[arch.lower()] = fams.get(arch.lower(), 0.0) + float(chips)
+  # Decide each job's pool ONCE, in the order plan_dispatch admits them
+  # (priority first, stable), so a higher-priority job gets first claim on a
+  # pool's floor room and the round debit is never counted twice.
+  picks: dict = {}
+  for e in sorted(queued, key=lambda x: -x.priority):
+    picks[e.job_id] = _pick_group(e)
   def _probe(e: route_lib.QueueEntry) -> dict:
-    return _pick_group(e)[1]
+    return picks[e.job_id][1]
   def cost_of(e: route_lib.QueueEntry) -> float:
     return float(_probe(e).get('new_cost', 0.0))
   def is_exempt(e: route_lib.QueueEntry) -> bool:
     return bool(_probe(e).get('exempt', False))
 
   # Remember which pool won for each candidate, so the BUILDER submits under it.
-  chosen: dict = {e.job_id: _pick_group(e)[0] for e in queued}
+  chosen: dict = {jid: p[0] for jid, p in picks.items()}
   for e in queued:
     g = chosen.get(e.job_id)
     pin = route_lib.pinned_group(e)
     if pin:
       log.append(f'[dispatch] {e.job_id} -> group g{g} (PINNED by caller; '
                  f'preference order {",".join(group_order)} not consulted)')
-    elif g and g != group_order[-1]:
-      log.append(f'[dispatch] {e.job_id} -> group g{g} (exempt from the g9 '
-                 f'income/10 bar)')
+      continue
+    notes = []
+    if g and g != group_order[-1]:
+      notes.append('exempt from the g9 income/10 bar')
+      v = verdicts.get((e.job_id, g))
+      if v is not None:
+        notes.append(v.reason)
+    if skipped.get(e.job_id):
+      notes.append('skipped ' + '; '.join(skipped[e.job_id]))
+    if notes:
+      log.append(f'[dispatch] {e.job_id} -> group g{g} ({"; ".join(notes)})')
 
   plan = route_lib.plan_dispatch(queued, headroom, cost_of, is_exempt)
 
@@ -2700,7 +3452,7 @@ def run_dispatch_once(
   if dry_run:
     for d in plan:
       log.append(f'[DRY][dispatch] {d.job_id} -> {d.decision.value} '
-                 f'[group g{chosen.get(d.job_id, group_order[-1])}] ({d.reason})')
+                  f'[group g{chosen.get(d.job_id, group_order[-1])}] ({d.reason})')
     return 'dispatched', log
   log.append(f'[dispatch] dispatched {n_req} -> BUILD_REQUESTED, '
              f'{n_def} -> BUDGET_DEFERRED.')
@@ -2720,25 +3472,47 @@ def run_worker_loop(
     max_build_attempts: int = 3,
     max_iterations: Optional[int] = None,
 ) -> None:
-  """The worker loop: run_worker_once forever, sleeping poll_s when idle/busy/
-  braked. `provider_factory` builds a fresh provider per build (one RPC each).
-  `max_iterations` bounds the loop for tests."""
+  """The worker loop: run_worker_once forever, sleeping poll_s only after every
+  QUEUED candidate in the current sweep has been checked and none could be
+  submitted (or when idle/busy/braked). `max_iterations` bounds the loop for tests."""
   last_fail = None
   it = 0
+  requeued_in_sweep: set[str] = set()
+  cached_provider: Optional[_Provider] = None
   while max_iterations is None or it < max_iterations:
     it += 1
-    provider = provider_factory()
+    if cached_provider is None:
+      cached_provider = provider_factory()
+    last_picked: list[str] = []
+    def _pick_untried(entries: list[route_lib.QueueEntry]) -> Optional[route_lib.QueueEntry]:
+      cand = route_lib.next_queued([e for e in entries if e.job_id not in requeued_in_sweep])
+      if cand is not None:
+        last_picked[:] = [cand.job_id]
+      return cand
     outcome, log, last_fail = run_worker_once(
-        queue_file, provider, submitter, now=time.time(), worker_id=worker_id,
+        queue_file, cached_provider, submitter, now=time.time(), worker_id=worker_id,
         build_stale_s=build_stale_s, group=group, stage_probe=stage_probe,
         srcfs_fail_brake=srcfs_fail_brake, last_fail_count=last_fail,
-        max_build_attempts=max_build_attempts, jobid_probe=XManagerJobIdProbe())
+        max_build_attempts=max_build_attempts, claim_pick=_pick_untried,
+        jobid_probe=XManagerJobIdProbe())
     for line in log:
       print(line, flush=True)
-    # After a successful build, immediately try the next (drain fast); otherwise
-    # sleep so an empty/busy/braked queue does not spin.
-    if outcome not in ('submitted',):
-      time.sleep(poll_s)
+    if outcome == 'submitted':
+      requeued_in_sweep.clear()
+      cached_provider = None
+      continue
+    if outcome in ('requeued', 'held'):
+      if last_picked:
+        requeued_in_sweep.add(last_picked[0])
+      has_untried = any(
+          e.state == route_lib.JobState.QUEUED and e.job_id not in requeued_in_sweep
+          for e in load_queue(queue_file)
+      )
+      if has_untried:
+        continue
+    requeued_in_sweep.clear()
+    cached_provider = None
+    time.sleep(poll_s)
 
 
 def run_dispatch_worker_loop(
@@ -2755,6 +3529,7 @@ def run_dispatch_worker_loop(
     max_build_attempts: int = 3,
     budget_query_fn: 'Callable[..., Optional[dict]]' = budget_query,
     max_iterations: Optional[int] = None,
+    group_capacity_fn: 'Optional[Callable[[str], Optional[route_lib.GroupCapacity]]]' = load_group_capacity,
 ) -> None:
   """Step3 combined loop (the rewritten worker): DISPATCH then BUILD, forever.
 
@@ -2762,30 +3537,31 @@ def run_dispatch_worker_loop(
     1. run_dispatch_once: promote deferred -> backpressure gate -> greedy
        plan_dispatch with XM-truth headroom -> mark BUILD_REQUESTED/BUDGET_DEFERRED.
     2. drain THIS round's BUILD_REQUESTED serially: claim one (via
-       next_build_requested, NOT next_queued), run `tpu queue`, record. The
-       single-build invariant (one BUILDING at a time) is unchanged. A no-XID
-       with the budget marker parks BUDGET_DEFERRED (R2), a real failure counts
-       an attempt as before.
-  This is ONE process = router+builder (design 3.1). R1 dies because this is the
-  ONLY place that calls `tpu queue`; the daemon's in-lane place pass is gated off
-  at go-live (TPU_ROUTE_INLANE_PLACE=0). `max_iterations` bounds it for tests.
+       next_build_requested, NOT next_queued), run `tpu queue`, record. If a job
+       is requeued/held (no capacity right now) and more BUILD_REQUESTED entries
+       remain in this sweep, immediately try the next without sleeping; sleep
+       poll_s only after all BUILD_REQUESTED candidates in the sweep have been
+       checked and none could be submitted.
   """
   last_fail = None
   it = 0
+  cached_provider: Optional[_Provider] = None
   while max_iterations is None or it < max_iterations:
     it += 1
-    # 1. DISPATCH round.
+    if cached_provider is None:
+      cached_provider = provider_factory()
+    # 1. DISPATCH round (with capacity pre-filter via cached_provider).
     _, dlog = run_dispatch_once(
         queue_file, now=time.time(), group=group,
         budget_query_fn=budget_query_fn, dry_run=False,
-        group_order=group_order)
+        group_order=group_order, provider=cached_provider,
+        group_capacity_fn=group_capacity_fn)
     for line in dlog:
       print(line, flush=True)
     # 2. BUILD one BUILD_REQUESTED (serial). Claim from BUILD_REQUESTED so we
     #    never build a job the router has not budget-admitted this round.
-    provider = provider_factory()
     outcome, wlog, last_fail = run_worker_once(
-        queue_file, provider, submitter, now=time.time(), worker_id=worker_id,
+        queue_file, cached_provider, submitter, now=time.time(), worker_id=worker_id,
         build_stale_s=build_stale_s, group=group, stage_probe=stage_probe,
         srcfs_fail_brake=srcfs_fail_brake, last_fail_count=last_fail,
         max_build_attempts=max_build_attempts,
@@ -2793,10 +3569,14 @@ def run_dispatch_worker_loop(
         jobid_probe=XManagerJobIdProbe())
     for line in wlog:
       print(line, flush=True)
-    # Drain fast after a successful build; otherwise sleep so an idle/busy/braked
-    # queue does not spin.
-    if outcome not in ('submitted',):
-      time.sleep(poll_s)
+    if outcome == 'submitted':
+      cached_provider = None
+      continue
+    if outcome in ('requeued', 'held'):
+      if route_lib.count_build_pending(load_queue(queue_file)) > 0:
+        continue
+    cached_provider = None
+    time.sleep(poll_s)
 
 
 def main(argv):
@@ -2884,7 +3664,9 @@ def main(argv):
             auto_resume_pruned=_AUTO_RESUME_PRUNED.value,
             auto_resume_max=_AUTO_RESUME_MAX.value,
             restart_evidence=(CnsRestartEvidence()
-                              if _AUTO_RESUME_PRUNED.value else None))
+                              if _AUTO_RESUME_PRUNED.value else None),
+            # Fresh per pass: the lookup caches each registry file once.
+            cancelled_lookup=make_registry_cancelled_lookup())
         for line in rc_log:
           print(f'  [reroute-loop:reconcile] {line}', flush=True)
         if not _DRY_RUN.value:
@@ -2907,7 +3689,17 @@ def main(argv):
             placement_probe=XManagerPlacementProbe(),
             restart_probe=CnsRestartProbe(),
             inplace_reroute=_INPLACE_REROUTE.value,
-            inplace_restart_threshold=_INPLACE_RESTART_THRESHOLD.value)
+            inplace_restart_threshold=_INPLACE_RESTART_THRESHOLD.value,
+            # Preserve a cancelled job's checkpoint on the reroute path too, the
+            # same evidence layer reconcile uses (A) above -- gated on the same
+            # flag so warm-restart is one opt-in choice across both passes.
+            restart_evidence=(CnsRestartEvidence()
+                              if _AUTO_RESUME_PRUNED.value else None),
+            auto_resume_max=_AUTO_RESUME_MAX.value,
+            persist_fn=(
+                (lambda _s=snap, _b=baseline: merge_and_save_touched(
+                    _QUEUE_FILE.value, _s, baseline=_b))
+                if not _DRY_RUN.value else None))
         for line in rr_log:
           print(f'  [reroute-loop:reroute] {line}', flush=True)
         if not _DRY_RUN.value:
@@ -2935,7 +3727,8 @@ def main(argv):
         auto_resume_pruned=_AUTO_RESUME_PRUNED.value,
         auto_resume_max=_AUTO_RESUME_MAX.value,
         restart_evidence=(CnsRestartEvidence()
-                          if _AUTO_RESUME_PRUNED.value else None))
+                          if _AUTO_RESUME_PRUNED.value else None),
+        cancelled_lookup=make_registry_cancelled_lookup())
   elif _REROUTE.value:
     # Sweep SUBMITTED jobs stuck PENDING; cancel + return to QUEUED.
     updated, log = run_reroute(
@@ -2949,7 +3742,10 @@ def main(argv):
         placement_probe=XManagerPlacementProbe(),
         restart_probe=CnsRestartProbe(),
         inplace_reroute=_INPLACE_REROUTE.value,
-        inplace_restart_threshold=_INPLACE_RESTART_THRESHOLD.value)
+        inplace_restart_threshold=_INPLACE_RESTART_THRESHOLD.value,
+        restart_evidence=(CnsRestartEvidence()
+                          if _AUTO_RESUME_PRUNED.value else None),
+        auto_resume_max=_AUTO_RESUME_MAX.value)
   else:
     # Drain QUEUED jobs into the XM queue, trying groups IN PREFERENCE ORDER.
     # `--group_order=5,9` places what the free vqfree pool (g5) can take first

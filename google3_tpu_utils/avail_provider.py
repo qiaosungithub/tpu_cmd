@@ -216,6 +216,23 @@ def parse_cell_availability(resp: Any, platform_int: int) -> dict[str, tuple[int
   return {cell: (chips, cell in oversold) for cell, chips in free.items()}
 
 
+# Borg STAGING/TEST "twin" cells -- e.g. `yucbfad-c-staging` -- show free chips
+# in GetCellAvailability (nobody competes for them, so they look attractive to
+# the placement path), but every PROD job placed on one fails 100% at Borg
+# turn-up with `INVALID_ARGUMENT: Try to create job`: they are not configured to
+# run PROD workloads. They are NEVER a valid PROD placement, so they must not
+# enter the router's candidate pool. The market/pricing layer already excludes
+# them unconditionally (`remeasure_cell_locality.market_cells`); this is the
+# SAME regex, kept byte-identical on purpose so the two layers never drift.
+_NONPROD_CELL_RE = re.compile(r'-c(-staging|-test)?$')
+
+
+def is_nonprod_cell(cell: str) -> bool:
+  """True for a Borg staging/test twin cell that ACCEPTS placement but fails
+  every PROD turn-up. See `_NONPROD_CELL_RE`."""
+  return bool(_NONPROD_CELL_RE.search(cell))
+
+
 def build_availability(
     per_arch: dict[str, dict[str, tuple[int, bool]]],
     arch_price: dict[str, float],
@@ -246,6 +263,11 @@ def build_availability(
     price = arch_price.get(arch)
     by_cell = cell_price.get(arch, {})
     for cell, (free_chips, oversold) in cells.items():
+      if is_nonprod_cell(cell):
+        # Staging/test twin cell: never a valid PROD placement. Skip so it
+        # enters NEITHER the candidate pool (avail_by_cell) NOR the arch-pool
+        # magnitude used for the price discount. See `_NONPROD_CELL_RE`.
+        continue
       pool += max(0, free_chips)
       avail_by_cell[f'{cell}|{arch}'] = route_lib.CellAvail(
           cell=cell, arch=arch, free_chips=free_chips, oversold=oversold,
@@ -401,7 +423,8 @@ class AvailabilityProvider:
                alloc_resolver: Optional[Callable[[str], Any]] = None,
                platform_enum: Optional[Callable[[str], int]] = None,
                request_factory: Optional[Callable[[], Any]] = None,
-               deadline_s: float = 60.0):
+               deadline_s: float = 60.0,
+               cache_ttl_s: Optional[float] = None):
     self.archs = list(archs) if archs else list(ARCH_PLATFORM.keys())
     self.group = group
     self.market_json_path = market_json_path
@@ -410,6 +433,18 @@ class AvailabilityProvider:
     self._platform_enum = platform_enum
     self._request_factory = request_factory
     self.deadline_s = deadline_s
+    # Default 30s TTL in production (stub_factory is None) so an N-entry worker
+    # sweep shares one RPC round instead of firing 9 RPCs per queued row; 0.0
+    # when a test injects stub_factory unless cache_ttl_s is set explicitly.
+    self.cache_ttl_s = (
+        float(cache_ttl_s)
+        if cache_ttl_s is not None
+        else (30.0 if stub_factory is None else 0.0)
+    )
+    self._cached_result: Optional[
+        tuple[dict[str, route_lib.CellAvail], dict[str, float], dict[str, float]]
+    ] = None
+    self._cached_at: float = 0.0
 
   # -- default google3-backed factories (lazy imports) ----------------------
   def _default_stub(self) -> Any:
@@ -446,8 +481,14 @@ class AvailabilityProvider:
     `_looks_half_initialised`): a transient gRPC failure during a lazy import
     otherwise pins a long-lived worker forever.
     """
+    import copy
+    import time
+    if (self.cache_ttl_s > 0.0
+        and self._cached_result is not None
+        and (time.monotonic() - self._cached_at) < self.cache_ttl_s):
+      return copy.deepcopy(self._cached_result)
     try:
-      return self._fetch_once()
+      res = self._fetch_once()
     except Exception as e:  # pylint: disable=broad-except
       if not _looks_half_initialised(e):
         raise
@@ -457,7 +498,11 @@ class AvailabilityProvider:
             f'place and retrying once: {healed[:8]}', flush=True)
       if not healed:
         raise
-      return self._fetch_once()
+      res = self._fetch_once()
+    if self.cache_ttl_s > 0.0:
+      self._cached_result = copy.deepcopy(res)
+      self._cached_at = time.monotonic()
+    return res
 
   def _fetch_once(self) -> tuple[dict[str, route_lib.CellAvail], dict[str, float], dict[str, float]]:
     """The unguarded fetch. One RPC per arch."""

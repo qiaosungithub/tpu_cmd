@@ -142,6 +142,7 @@ _CELL_LOCALITY = {
     'el':          ('grq', 'eu'),
     'en':          ('grq', 'eu'),
     'eq':          ('grq', 'eu'),
+    'er':          ('grq', 'eu'),
     'lclhrb':      ('lhr', 'eu'),
     'sv':          ('lhr', 'eu'),
     'yulhrp':      ('lhr', 'eu'),
@@ -1368,6 +1369,15 @@ def main(argv) -> None:
               f'(最多空转 25 分钟)。请检查 xm_abc 懒加载是否变了。')
     # ----------------------------------------------------------------------
 
+    if not _RESUME_XID.value:
+        # Validate cell->metro->bucket BEFORE create_experiment() so a cell in
+        # a metro without group storage (or an unmeasured cell) exits cleanly
+        # without creating an empty 0-work-unit experiment shell on XManager.
+        _local_bucket()
+
+    if not _RESUME_XID.value:
+        _local_bucket()
+
     experiment_context = xm_abc.get_experiment(experiment_id=_RESUME_XID.value) if _RESUME_XID.value else xm_abc.create_experiment(experiment_title=exp_name)
     with experiment_context as experiment:
 
@@ -2079,15 +2089,111 @@ def main(argv) -> None:
                     if _f not in _bazel_args:
                         _bazel_args.append(_f)
                 print(f"[gpu] bazel CUDA build flags for {res_name}: {_gpu_flags}")
-            (executable,) = experiment.package(
-                [xm.bazel_binary(
-                    label=target_label,
-                    bazel_args=_bazel_args,
-                    executor_spec=final_executor.Spec(),
-                    args=executable_args,
-                    env_vars=job_env_vars,
-                )]
+            _ca_mpm_cache_file = os.path.expanduser(
+                os.environ.get("TPU_CA_MPM_CACHE_FILE", "~/.tpu_ca_mpm_cache.json")
             )
+            _ca_mpm_ttl_s = float(os.environ.get("TPU_CA_MPM_TTL_S", str(5 * 86400)))
+            _ca_mpm_enabled = (
+                "/eqr_run_ca_" in target_label
+                and os.environ.get("TPU_CA_MPM_REUSE", "1") != "0"
+            )
+            _ca_mpm_key = f"{target_label}|{' '.join(sorted(_bazel_args))}"
+            _cached_mpm = None
+            if _ca_mpm_enabled and os.path.exists(_ca_mpm_cache_file):
+                try:
+                    with open(_ca_mpm_cache_file, "r") as _cf:
+                        fcntl.flock(_cf, fcntl.LOCK_SH)
+                        _cache_data = json.load(_cf)
+                        fcntl.flock(_cf, fcntl.LOCK_UN)
+                    _cand = _cache_data.get(_ca_mpm_key)
+                    if (
+                        isinstance(_cand, dict)
+                        and _cand.get("pkg_name")
+                        and _cand.get("version")
+                        and _cand.get("binary_path")
+                        and (time.time() - float(_cand.get("ts", 0))) < _ca_mpm_ttl_s
+                    ):
+                        _cached_mpm = _cand
+                except Exception as _ce:
+                    print(f"[ca-mpm] cache read warning: {_ce}", flush=True)
+
+            executable = None
+            if _cached_mpm is not None:
+                try:
+                    _t0_mpm = time.time()
+                    print(
+                        f"[ca-mpm] reusing prebuilt MPM for {target_label}: "
+                        f"{_cached_mpm['pkg_name']}@{_cached_mpm['version']} "
+                        f"(skipping blaze + mpm build)",
+                        flush=True,
+                    )
+                    (executable,) = experiment.package(
+                        [xm_abc.prebuilt_mpm(
+                            executor_spec=final_executor.Spec(),
+                            name=_cached_mpm["pkg_name"],
+                            version=_cached_mpm["version"],
+                            binary_path=_cached_mpm["binary_path"],
+                            args=executable_args,
+                            env_vars=job_env_vars,
+                        )]
+                    )
+                    if getattr(executable, "binary_mpm", None) is not None:
+                        executable.binary_mpm.base_name = os.path.basename(
+                            _cached_mpm["pkg_name"]
+                        )
+                        executable.binary_mpm.unique_suffix = None
+                    print(
+                        f"[ca-mpm] prebuilt MPM verified & packaged in "
+                        f"{time.time() - _t0_mpm:.2f}s",
+                        flush=True,
+                    )
+                except Exception as _pe:
+                    print(
+                        f"[ca-mpm] prebuilt MPM reuse failed ({_pe}); "
+                        f"falling back to full xm.bazel_binary build.",
+                        flush=True,
+                    )
+                    executable = None
+
+            if executable is None:
+                (executable,) = experiment.package(
+                    [xm.bazel_binary(
+                        label=target_label,
+                        bazel_args=_bazel_args,
+                        executor_spec=final_executor.Spec(),
+                        args=executable_args,
+                        env_vars=job_env_vars,
+                    )]
+                )
+                if _ca_mpm_enabled:
+                    _bin_mpm = getattr(executable, "binary_mpm", None)
+                    _pkg_name = getattr(_bin_mpm, "pkg_name", None)
+                    _pkg_ver = getattr(_bin_mpm, "version", None)
+                    _bin_path = getattr(executable, "binary_path", None)
+                    if _pkg_name and _pkg_ver and _bin_path:
+                        try:
+                            with open(_ca_mpm_cache_file, "a+") as _cf:
+                                fcntl.flock(_cf, fcntl.LOCK_EX)
+                                _cf.seek(0)
+                                _raw = _cf.read()
+                                _cache_data = json.loads(_raw) if _raw.strip() else {}
+                                _cache_data[_ca_mpm_key] = {
+                                    "pkg_name": _pkg_name,
+                                    "version": _pkg_ver,
+                                    "binary_path": _bin_path,
+                                    "ts": time.time(),
+                                }
+                                _cf.seek(0)
+                                _cf.truncate()
+                                json.dump(_cache_data, _cf, indent=2)
+                                fcntl.flock(_cf, fcntl.LOCK_UN)
+                            print(
+                                f"[ca-mpm] cached MPM for {target_label}: "
+                                f"{_pkg_name}@{_pkg_ver}",
+                                flush=True,
+                            )
+                        except Exception as _se:
+                            print(f"[ca-mpm] cache save warning: {_se}", flush=True)
         else: # python mode default
             base_image_accel = executors[0].requirements.accelerator
             # Pick the container framework from the accelerator: a GPU job needs

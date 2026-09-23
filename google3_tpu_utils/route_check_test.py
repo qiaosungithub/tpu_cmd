@@ -5,7 +5,10 @@ import os
 import tempfile
 import json
 import subprocess
+import time
+from typing import Callable, Optional
 import unittest
+from unittest import mock
 
 from google3.experimental.users.qiaos.tpu_utils import avail_provider as AP
 from google3.experimental.users.qiaos.tpu_utils import route_check as RC
@@ -457,11 +460,15 @@ class RunTickTest(unittest.TestCase):
 class _FakeProbe:
   """Returns a scripted STATUS_* per xid."""
 
-  def __init__(self, by_xid):
+  def __init__(self, by_xid, reasons=None):
     self._by_xid = by_xid
+    self._reasons = reasons or {}
 
   def status(self, xid):
     return self._by_xid.get(xid, RC.STATUS_UNKNOWN)
+
+  def reason(self, xid):
+    return self._reasons.get(str(xid), '')
 
 
 class _BudgetRefusedSubmitter:
@@ -666,6 +673,22 @@ class RerouteHardeningTest(unittest.TestCase):
     self.assertEqual(e.state, R.JobState.SUBMITTED)
     self.assertEqual(probe.calls['222'], 1)              # short-circuited before 2nd probe
     self.assertTrue(any('FRESH output' in l for l in log))
+
+  def test_preempted_pending_with_no_borg_vmgroup_ignores_fresh_output_and_reroutes(self):
+    # Bug 3 fix: when Borg explicitly confirms NO VM group is RUNNING (the job
+    # was preempted back to PENDING), any CNS file write is pre-preemption
+    # history and must NOT block rerouting for fresh_output_s (1200s).
+    e = _submitted('j1', '223', 'yutulpz', submitted_at=0.0)
+    probe = _SeqProbe({'223': [RC.STATUS_PENDING, RC.STATUS_PENDING]})
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
+                            reroute_after_s=300.0, cooldown_s=1800.0, dry_run=False,
+                            output_probe=_FakeOutputProbe({'223': 640.0}),  # 60s ago
+                            borg_probe=_FakeBorgProbe(False),
+                            fresh_output_s=1200.0, sleep_fn=self._no_sleep)
+    self.assertEqual(sub.cancels, ['223'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertTrue(any('no Borg VM group is RUN' in l for l in log))
 
   def test_both_pending_no_fresh_output_is_rerouted(self):
     # The genuine stuck case: two PENDING samples, stale output -> DO reroute.
@@ -1488,6 +1511,48 @@ class RunDispatchTest(unittest.TestCase):
         dry_run=False)
     self.assertEqual(out, 'idle')
 
+  # --- budget is priced at the shape that will be BUILT, not at `--power` ----
+  _COSTS = {'v6e-64': 1450.2, 'v4-256': 371.2}
+
+  def _multiarch(self, jid='m'):
+    # A v6e-64 compute target that v4-256 also meets (0.60*256 = 153.6 vs
+    # 2.0*64 = 128, inside the default 0.5 power tolerance).
+    return self._q(jid, power='v6e-64', archs=('v6e', 'v4'))
+
+  def test_budget_priced_at_placeable_shape_not_power(self):
+    # Only v4 has a free slice, so plan_one places v4-256. The literal power
+    # (v6e-64 @ 1450) exceeds headroom 1105; the shape that will actually be
+    # built (v4-256 @ 371) fits. The row must be admitted.
+    self._seed([self._multiarch()])
+    prov = _FakeProvider({'nm|v4': _avail('nm', 'v4', 512, price=1.45)},
+                         arch_price={'v4': 1.45}, arch_pool={'v4': 512})
+    out, log = RC.run_dispatch_once(
+        self.path, now=100.0,
+        budget_query_fn=self._budget(1105.5, self._COSTS),
+        dry_run=False, provider=prov)
+    self.assertEqual(self._byid('m').state, R.JobState.BUILD_REQUESTED)
+
+  def test_budget_negative_control_no_provider_keeps_power_pricing(self):
+    # Same row, no provider this round: no placement is known, so the gate
+    # falls back to the literal power and defers exactly as before the fix.
+    self._seed([self._multiarch()])
+    out, log = RC.run_dispatch_once(
+        self.path, now=100.0,
+        budget_query_fn=self._budget(1105.5, self._COSTS), dry_run=False)
+    self.assertEqual(self._byid('m').state, R.JobState.BUDGET_DEFERRED)
+
+  def test_budget_priced_at_dear_shape_when_that_is_what_places(self):
+    # If the placeable shape IS the dear one, it must be priced dear: the fix
+    # may not under-price a job the builder will submit on expensive chips.
+    self._seed([self._multiarch()])
+    prov = _FakeProvider({'bh|v6e': _avail('bh', 'v6e', 256, price=1.0)},
+                         arch_price={'v6e': 1.0}, arch_pool={'v6e': 256})
+    out, log = RC.run_dispatch_once(
+        self.path, now=100.0,
+        budget_query_fn=self._budget(1105.5, self._COSTS),
+        dry_run=False, provider=prov)
+    self.assertEqual(self._byid('m').state, R.JobState.BUDGET_DEFERRED)
+
 
 class GroupOrderTest(unittest.TestCase):
   """The place pass tries groups in preference order (e.g. vqfree g5 then g9).
@@ -1635,6 +1700,324 @@ class RunReconcileTest(unittest.TestCase):
     self.assertIn('1 promoted->RUNNING', summary[0])
     self.assertIn('1 UNKNOWN', summary[0])
 
+  # --- a deliberate `tpu cancel` is not a crash (cancelled_lookup) ----------
+  # `tpu cancel` marks the REGISTRY row CANCELLED but leaves the queue row
+  # holding the xid. Reconcile used to write it off as a zombie (FAILED) and
+  # could auto-resume it. With the registry saying CANCELLED, the row must be
+  # retired as CANCELLED and never restarted.
+
+  _WHEN = '2026-09-23 21:41:41'
+
+  def _resumable(self, job_id='cx', xid='901'):
+    # A row that the auto-resume path WOULD warm-restart (see the negative
+    # control): terminal on XM, a surviving checkpoint, no code bug.
+    e = _submitted(job_id, xid, 'yulpptr', submitted_at=0.0,
+                   launch_kwargs={'config': 'cfgX', 'exp_name': 'elt-x',
+                                  'group': '9'})
+    e.state = R.JobState.RUNNING
+    e.submissions[-1].state = 'RUNNING'
+    e.last_reason = 'running in yulpptr'
+    return e
+
+  def _evidence(self, xid='901'):
+    return _FakeRestartEvidence(
+        {xid: (None, '/cns/x/steps/step_1024.pt', True)})
+
+  @staticmethod
+  def _lookup(cancelled: dict) -> '_FakeCancelLookup':
+    return _FakeCancelLookup(cancelled)
+
+  def test_registry_cancelled_terminal_is_cancelled_not_resumed(self):
+    e = self._resumable()
+    probe = _FakeProbe({'901': RC.STATUS_TERMINAL})
+    entries = [e]
+    out, log = RC.run_reconcile(
+        entries, now=100.0, probe=probe, dry_run=False,
+        auto_resume_pruned=True, restart_evidence=self._evidence(),
+        cancelled_lookup=self._lookup({'901': self._WHEN}))
+    self.assertEqual(e.state, R.JobState.FAILED)          # FINISHED_STATES kept
+    cur = _cur_sub(e)
+    self.assertEqual(cur.xid, '901')
+    self.assertEqual(cur.state, 'CANCELLED')
+    self.assertEqual(cur.ended_reason, f'cancelled via tpu cancel at {self._WHEN}')
+    self.assertIn(f'cancelled (tpu cancel at {self._WHEN}', e.last_reason)
+    self.assertIn('not a crash', e.last_reason)
+    self.assertNotIn('zombie', e.last_reason)
+    # THE point: no warm/cold restart row, even with auto-resume ON and
+    # evidence that WOULD warm-restart it.
+    self.assertEqual(len(out), 1)
+    self.assertEqual([x for x in out if x.state == R.JobState.QUEUED], [])
+    self.assertFalse(any('[auto-resume]' in l for l in log))
+    self.assertTrue(any('-> CANCELLED' in l and '[reconcile]' in l
+                        and self._WHEN in l for l in log))
+    self.assertFalse(any('zombie cleaned up' in l for l in log))
+
+  def test_registry_cancelled_gone_is_cancelled(self):
+    # GONE (zero work units, old enough) is the other FAILED verdict. A
+    # submitted_at of 0.0 reads as 'age unknown' (falsy), so give it a real one.
+    e = self._resumable()
+    e.submitted_at = 1.0
+    probe = _FakeProbe({'901': RC.STATUS_GONE})
+    out, log = RC.run_reconcile(
+        [e], now=100000.0, probe=probe, dry_run=False,
+        auto_resume_pruned=True, restart_evidence=self._evidence(),
+        cancelled_lookup=self._lookup({'901': self._WHEN}))
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(_cur_sub(e).state, 'CANCELLED')
+    self.assertEqual(len(out), 1)
+    self.assertTrue(any('-> CANCELLED' in l for l in log))
+
+  def test_registry_cancelled_without_timestamp(self):
+    # status=CANCELLED with no cancelled_at: the lookup returns '' -> still a
+    # cancel, and the text carries no dangling 'at'.
+    e = self._resumable()
+    probe = _FakeProbe({'901': RC.STATUS_TERMINAL})
+    out, log = RC.run_reconcile(
+        [e], now=100.0, probe=probe, dry_run=False,
+        auto_resume_pruned=True, restart_evidence=self._evidence(),
+        cancelled_lookup=self._lookup({'901': ''}))
+    self.assertEqual(_cur_sub(e).state, 'CANCELLED')
+    self.assertEqual(_cur_sub(e).ended_reason, 'cancelled via tpu cancel')
+    self.assertEqual(len(out), 1)
+
+  def test_not_cancelled_in_registry_keeps_zombie_path_and_resumes(self):
+    # NEGATIVE CONTROL: the same row, the same evidence, but the registry does
+    # NOT say cancelled -> the old zombie FAILED path, and auto-resume DOES
+    # warm-restart it. Proves the no-resume above comes from the cancel check.
+    e = self._resumable()
+    probe = _FakeProbe({'901': RC.STATUS_TERMINAL})
+    lookup = self._lookup({})
+    out, log = RC.run_reconcile(
+        [e], now=100.0, probe=probe, dry_run=False,
+        auto_resume_pruned=True, restart_evidence=self._evidence(),
+        cancelled_lookup=lookup)
+    self.assertEqual(lookup.calls, ['901'])
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(_cur_sub(e).state, 'FAILED')
+    self.assertIn('zombie', e.last_reason)
+    new = [x for x in out if x.state == R.JobState.QUEUED]
+    self.assertEqual(len(new), 1)
+    self.assertEqual(new[0].launch_kwargs['load_from'],
+                     '/cns/x/steps/step_1024.pt')
+    self.assertTrue(any('warm-restart queued' in l for l in log))
+    self.assertFalse(any('-> CANCELLED' in l for l in log))
+
+  def test_lookup_raising_falls_back_to_old_path(self):
+    def boom(xid):
+      raise RuntimeError(f'registry unreadable for {xid}')
+    e = self._resumable()
+    probe = _FakeProbe({'901': RC.STATUS_TERMINAL})
+    out, log = RC.run_reconcile(
+        [e], now=100.0, probe=probe, dry_run=False,
+        auto_resume_pruned=True, restart_evidence=self._evidence(),
+        cancelled_lookup=boom)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(_cur_sub(e).state, 'FAILED')
+    self.assertIn('zombie', e.last_reason)
+    self.assertEqual(len([x for x in out if x.state == R.JobState.QUEUED]), 1)
+    self.assertTrue(any('registry cancel lookup failed' in l for l in log))
+
+  def test_lookup_non_string_answer_is_not_cancelled(self):
+    e = self._resumable()
+    probe = _FakeProbe({'901': RC.STATUS_TERMINAL})
+    # A Mock answering True (not a str) must not count as a cancel.
+    RC.run_reconcile([e], now=100.0, probe=probe, dry_run=False,
+                     cancelled_lookup=mock.Mock(return_value=True))
+    self.assertEqual(_cur_sub(e).state, 'FAILED')
+    self.assertIn('zombie', e.last_reason)
+
+  def test_cancelled_dry_run_does_not_mutate(self):
+    e = self._resumable()
+    before = e.to_dict()
+    probe = _FakeProbe({'901': RC.STATUS_TERMINAL})
+    ev = self._evidence()
+    out, log = RC.run_reconcile(
+        [e], now=100.0, probe=probe, dry_run=True,
+        auto_resume_pruned=True, restart_evidence=ev,
+        cancelled_lookup=self._lookup({'901': self._WHEN}))
+    self.assertEqual(e.to_dict(), before)                 # untouched
+    self.assertEqual(len(out), 1)
+    self.assertTrue(any('[DRY][reconcile] would set' in l and '-> CANCELLED' in l
+                        for l in log))
+    self.assertFalse(any('[DRY][auto-resume]' in l for l in log))
+    self.assertFalse(any('[shadow]' in l for l in log))
+    self.assertEqual(ev.calls, [])                        # no CNS evidence read
+
+  def test_lookup_only_consulted_for_failed_verdicts(self):
+    # A promotion or a completion never asks the registry.
+    promo = _submitted('p', 'p1', 'c', submitted_at=0.0)
+    done = self._running('d', 'd1')
+    lookup = self._lookup({'p1': self._WHEN, 'd1': self._WHEN})
+    probe = _FakeProbe({'p1': RC.STATUS_RUNNING, 'd1': RC.STATUS_COMPLETED})
+    RC.run_reconcile([promo, done], now=100.0, probe=probe, dry_run=False,
+                     cancelled_lookup=lookup)
+    self.assertEqual(lookup.calls, [])
+    self.assertEqual(promo.state, R.JobState.RUNNING)
+    self.assertEqual(done.state, R.JobState.DONE)
+
+  def test_summary_counts_cancelled_separately(self):
+    cancelled = self._resumable('c', 'c1')
+    zombie = self._running('z', 'z1')
+    promo = _submitted('p', 'p1', 'c', submitted_at=0.0)
+    probe = _FakeProbe({'c1': RC.STATUS_TERMINAL, 'z1': RC.STATUS_TERMINAL,
+                        'p1': RC.STATUS_RUNNING})
+    _, log = RC.run_reconcile(
+        [cancelled, zombie, promo], now=100.0, probe=probe, dry_run=False,
+        cancelled_lookup=self._lookup({'c1': self._WHEN}))
+    summary = [l for l in log if 'checked:' in l]
+    self.assertEqual(len(summary), 1)
+    self.assertIn('3 checked', summary[0])
+    self.assertIn('1 zombie->FAILED', summary[0])
+    self.assertIn('1 cancelled', summary[0])
+    self.assertIn('1 promoted->RUNNING', summary[0])
+
+  def test_no_lookup_summary_and_rows_unchanged(self):
+    # With cancelled_lookup=None (every pre-existing caller) nothing changes:
+    # the summary has no 'cancelled' field and the row takes the zombie path.
+    # A lookup that never says cancelled mutates rows identically.
+    a, b = self._resumable('a', '901'), self._resumable('a', '901')
+    probe = _FakeProbe({'901': RC.STATUS_TERMINAL})
+    out_a, log_a = RC.run_reconcile(
+        [a], now=100.0, probe=probe, dry_run=False, auto_resume_pruned=True,
+        restart_evidence=self._evidence())
+    out_b, _ = RC.run_reconcile(
+        [b], now=100.0, probe=probe, dry_run=False, auto_resume_pruned=True,
+        restart_evidence=self._evidence(), cancelled_lookup=self._lookup({}))
+    summary = [l for l in log_a if 'checked:' in l][0]
+    self.assertNotIn('cancelled', summary)
+    self.assertEqual(a.to_dict(), b.to_dict())
+    self.assertEqual(len(out_a), len(out_b))
+    self.assertEqual(len(out_a), 2)                      # zombie + warm restart
+
+
+class RunReconcileColdRerunTest(unittest.TestCase):
+  """Fix 2 (2b): a HEALTHY run preempted BEFORE its first checkpoint -- terminal
+  on XM, no checkpoint, no code bug, but training progress / a preemption cause
+  -- must be COLD-rerun by run_reconcile, not held. This is the exact 4-job
+  2026-09-18 incident, exercised end-to-end through the live execution path."""
+
+  def setUp(self):
+    # These tests exercise the LIVE cold-execution path, so they force the
+    # master switch ON regardless of its current rollout value (phase B ships it
+    # OFF). The negative controls below then prove the guards hold EVEN WITH the
+    # switch on -- not merely because the switch is off.
+    super().setUp()
+    p = mock.patch.object(RC, '_ALLOW_COLD_RERUN', True)
+    p.start()
+    self.addCleanup(p.stop)
+
+  def _dead_preempted(self, job_id='c1', xid='111'):
+    e = _submitted(job_id, xid, 'yulpptr', submitted_at=0.0,
+                   launch_kwargs={'config': 'cfgX', 'exp_name': 'parcae-dw',
+                                  'group': '9'})
+    e.state = R.JobState.RUNNING
+    e.last_reason = 'guarantee reclaim: preempted out of sh'  # preemption cause
+    return e
+
+  def test_preempted_no_ckpt_trained_cold_reruns(self):
+    # THE FIX: no checkpoint, but the log shows training -> a NEW cold entry is
+    # appended (auto_resumes bumped), the dead row goes FAILED.
+    e = self._dead_preempted()
+    probe = _FakeProbe({'111': RC.STATUS_TERMINAL})
+    ev = _FakeRestartEvidence({'111': (None, None, True)})  # trained, no ckpt
+    entries = [e]
+    out, log = RC.run_reconcile(entries, now=100.0, probe=probe, dry_run=False,
+                                auto_resume_pruned=True, restart_evidence=ev,
+                                auto_resume_max=3)
+    self.assertEqual(e.state, R.JobState.FAILED)          # dead row cleaned up
+    new = [x for x in out if x.state == R.JobState.QUEUED]
+    self.assertEqual(len(new), 1)                          # one cold rerun queued
+    self.assertEqual(new[0].auto_resumes, 1)
+    self.assertNotIn('load_from', new[0].launch_kwargs)    # COLD: no resume ptr
+    self.assertIn('111', new[0].prior_xids)
+    self.assertTrue(any('COLD rerun queued' in l for l in log))
+
+  def test_affinity_group_in_use_untrained_cold_reruns(self):
+    # Regression (2026-09-22): reconcile_entry used to overwrite e.last_reason
+    # BEFORE _restart_decision called _termination_cause_of(e), AND
+    # XManagerStatusProbe dropped wu.status.message. When trained=False (died at
+    # job creation with AFFINITY_GROUP_IN_USE), _termination_cause_of must see
+    # probe.reason(xid) and cold-rerun instead of stranding in FAILED.
+    e = _submitted('c_aff', '119', 'yulpptr', submitted_at=0.0,
+                   launch_kwargs={'config': 'cfgX', 'exp_name': 'elt_aff'})
+    e.state = R.JobState.RUNNING
+    e.last_reason = 'running in nk'
+    probe = _FakeProbe(
+        {'119': RC.STATUS_TERMINAL},
+        reasons={
+            '119': (
+                'FAILED_PRECONDITION: AffinityGroup name is still in use '
+                '[borg.BorgMasterErrorResponse] { error: AFFINITY_GROUP_IN_USE }'
+            )
+        },
+    )
+    ev = _FakeRestartEvidence({'119': (None, None, False)})  # trained=False!
+    entries = [e]
+    out, log = RC.run_reconcile(entries, now=100.0, probe=probe, dry_run=False,
+                                auto_resume_pruned=True, restart_evidence=ev,
+                                auto_resume_max=3)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertIn('AFFINITY_GROUP_IN_USE', e.last_reason)
+    new = [x for x in out if x.state == R.JobState.QUEUED]
+    self.assertEqual(len(new), 1)
+
+  def test_never_trained_no_cause_holds(self):
+    # NEGATIVE CONTROL: crashed on startup (no training, no preempt cause) ->
+    # HOLD, no new entry, even with cold enabled.
+    e = _submitted('c2', '222', 'yulpptr', submitted_at=0.0,
+                   launch_kwargs={'config': 'cfgX', 'exp_name': 'dw'})
+    e.state = R.JobState.RUNNING
+    e.last_reason = 'running in sh'          # no preemption signal
+    probe = _FakeProbe({'222': RC.STATUS_TERMINAL})
+    ev = _FakeRestartEvidence({'222': (None, None, False)})  # never trained
+    entries = [e]
+    out, log = RC.run_reconcile(entries, now=100.0, probe=probe, dry_run=False,
+                               auto_resume_pruned=True, restart_evidence=ev,
+                               auto_resume_max=3)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual([x for x in out if x.state == R.JobState.QUEUED], [])
+    self.assertTrue(any('HOLD' in l for l in log))
+
+  def test_code_bug_still_holds_no_cold(self):
+    # NEGATIVE CONTROL: a real crash outranks cold rerun even if trained.
+    e = self._dead_preempted('c3', '333')
+    probe = _FakeProbe({'333': RC.STATUS_TERMINAL})
+    ev = _FakeRestartEvidence({'333': ('segfault (SIGSEGV)', None, True)})
+    entries = [e]
+    out, log = RC.run_reconcile(entries, now=100.0, probe=probe, dry_run=False,
+                               auto_resume_pruned=True, restart_evidence=ev,
+                               auto_resume_max=3)
+    self.assertEqual([x for x in out if x.state == R.JobState.QUEUED], [])
+    self.assertTrue(any('HOLD' in l for l in log))
+
+  def test_budget_exhausted_holds_no_cold(self):
+    # NEGATIVE CONTROL: the anti-loop budget caps cold reruns too.
+    e = self._dead_preempted('c4', '444')
+    e.auto_resumes = 3
+    probe = _FakeProbe({'444': RC.STATUS_TERMINAL})
+    ev = _FakeRestartEvidence({'444': (None, None, True)})
+    entries = [e]
+    out, log = RC.run_reconcile(entries, now=100.0, probe=probe, dry_run=False,
+                               auto_resume_pruned=True, restart_evidence=ev,
+                               auto_resume_max=3)
+    self.assertEqual([x for x in out if x.state == R.JobState.QUEUED], [])
+    self.assertTrue(any('HOLD' in l for l in log))
+
+  def test_warm_preferred_when_ckpt_exists(self):
+    # When a checkpoint DID survive, we warm-resume (cold is only the no-ckpt
+    # fallback): the new entry carries a load_from pointer.
+    e = self._dead_preempted('c5', '555')
+    probe = _FakeProbe({'555': RC.STATUS_TERMINAL})
+    ev = _FakeRestartEvidence({'555': (None, '/cns/x/steps/step_1024.pt', True)})
+    entries = [e]
+    out, log = RC.run_reconcile(entries, now=100.0, probe=probe, dry_run=False,
+                               auto_resume_pruned=True, restart_evidence=ev,
+                               auto_resume_max=3)
+    new = [x for x in out if x.state == R.JobState.QUEUED]
+    self.assertEqual(len(new), 1)
+    self.assertEqual(new[0].launch_kwargs['load_from'],
+                     '/cns/x/steps/step_1024.pt')  # WARM, not cold
+    self.assertTrue(any('warm-restart queued' in l for l in log))
 
 
 # --- submit timeout: local failure is not remote absence -------------------
@@ -2168,6 +2551,557 @@ class ArchiveReroutedXidTest(unittest.TestCase):
                    reroute_after_s=600.0, dry_run=True, sleep_fn=lambda _: None)
     self.assertEqual(sub.cancels, [])                     # no cancel in dry-run
     self.assertIn('111', self._read_jobs())              # so no archive either
+
+
+def _cur_sub(e: R.QueueEntry) -> R.Submission:
+  """The row's current submission, asserted present (narrows the Optional)."""
+  cur = e.current_submission
+  assert cur is not None, f'{e.job_id} has no submission'
+  return cur
+
+
+class _FakeCancelLookup:
+  """Scripted `cancelled_lookup` for run_reconcile: xid -> cancelled_at (or
+  absent = not cancelled). `calls` records every xid it was asked about."""
+
+  def __init__(self, cancelled: dict):
+    self._cancelled = cancelled
+    self.calls: list[str] = []
+
+  def __call__(self, xid: str) -> Optional[str]:
+    self.calls.append(xid)
+    return self._cancelled.get(xid)
+
+
+class RegistryCancelledLookupTest(unittest.TestCase):
+  """make_registry_cancelled_lookup: the production `cancelled_lookup` that
+  run_reconcile gets. Reads the live registry, then the legacy archive, from
+  the TPU_JOBS_FILE / TPU_JOBS_LEGACY_FILE env (redirected to temps here so no
+  test can read or touch ~/.tpu_jobs.json). Must fail SAFE: anything odd reads
+  as 'not cancelled' (None)."""
+
+  def setUp(self):
+    super().setUp()
+    self._saved = {k: os.environ.get(k) for k in
+                   ('TPU_JOBS_FILE', 'TPU_JOBS_LEGACY_FILE',
+                    RC._CANCEL_DETECT_KILL_SWITCH)}
+    self.jobs = tempfile.mkstemp(suffix='.jobs.json')[1]
+    self.legacy = tempfile.mkstemp(suffix='.legacy.json')[1]
+    os.environ['TPU_JOBS_FILE'] = self.jobs
+    os.environ['TPU_JOBS_LEGACY_FILE'] = self.legacy
+    os.environ.pop(RC._CANCEL_DETECT_KILL_SWITCH, None)
+
+  def tearDown(self):
+    for k, v in self._saved.items():
+      if v is None:
+        os.environ.pop(k, None)
+      else:
+        os.environ[k] = v
+    for p in (self.jobs, self.legacy):
+      if os.path.exists(p):
+        os.unlink(p)
+    super().tearDown()
+
+  def _write(self, path, d):
+    with open(path, 'w') as f:
+      json.dump(d, f)
+
+  def _mk(self, **kw) -> Callable[[str], Optional[str]]:
+    lookup = RC.make_registry_cancelled_lookup(**kw)
+    assert lookup is not None, 'kill-switch unexpectedly set'
+    return lookup
+
+  def test_live_cancelled_returns_timestamp(self):
+    self._write(self.jobs, {'1': {'status': 'CANCELLED',
+                                  'cancelled_at': '2026-09-23 21:41:41'}})
+    self._write(self.legacy, {})
+    lookup = self._mk()
+    self.assertEqual(lookup('1'), '2026-09-23 21:41:41')
+
+  def test_legacy_consulted_when_live_lacks_xid(self):
+    # The real 292494154 shape: cancelled, then archived by the budget enforcer.
+    self._write(self.jobs, {'2': {'status': 'RUNNING'}})
+    self._write(self.legacy, {'1': {
+        'status': 'CANCELLED', 'cancelled_at': '2026-09-23 21:41:41',
+        'archived_by': 'budget_enforcer (paused, re-queued in place)'}})
+    lookup = self._mk()
+    self.assertEqual(lookup('1'), '2026-09-23 21:41:41')
+    self.assertIsNone(lookup('2'))                       # live, not cancelled
+    self.assertIsNone(lookup('3'))                       # nowhere
+
+  def test_live_row_decides_over_legacy(self):
+    self._write(self.jobs, {'1': {'status': 'RUNNING'}})
+    self._write(self.legacy, {'1': {'status': 'CANCELLED',
+                                    'cancelled_at': 'old'}})
+    self.assertIsNone(self._mk()('1'))
+
+  def test_status_cancelled_without_timestamp_is_empty_string(self):
+    self._write(self.jobs, {'1': {'status': 'CANCELLED'}})
+    self.assertEqual(self._mk()('1'), '')
+
+  def test_cancelled_at_survives_status_overwrite(self):
+    # The check daemon can later rewrite status to FAILED; cancelled_at stays.
+    self._write(self.jobs, {'1': {'status': 'FAILED', 'cancelled_at': 't0'}})
+    self.assertEqual(self._mk()('1'), 't0')
+
+  def test_not_cancelled_statuses(self):
+    self._write(self.jobs, {'1': {'status': 'FAILED'},
+                            '2': {'status': 'RUNNING', 'cancelled_at': ''},
+                            '3': 'not-a-dict'})
+    lookup = self._mk()
+    for x in ('1', '2', '3'):
+      self.assertIsNone(lookup(x), x)
+
+  def test_reroute_archived_cancel_is_not_a_user_cancel(self):
+    # The router's own reroute cancel archives the xid with archived_by=reroute;
+    # that cancel only MOVED the job, so it must keep the old recovery path.
+    self._write(self.jobs, {})
+    self._write(self.legacy, {'1': {'status': 'CANCELLED',
+                                    'archived_by': 'reroute'}})
+    self.assertIsNone(self._mk()('1'))
+
+  def test_missing_and_corrupt_files_fail_safe(self):
+    os.unlink(self.jobs)
+    with open(self.legacy, 'w') as f:
+      f.write('{half-written')
+    with mock.patch.object(RC.time, 'sleep'):
+      lookup = self._mk()
+      self.assertIsNone(lookup('1'))
+    self._write(self.jobs, ['not', 'a', 'dict'])
+    self.assertIsNone(self._mk()('1'))
+
+  def test_explicit_paths_override_env(self):
+    self._write(self.jobs, {})
+    other = tempfile.mkstemp(suffix='.other.json')[1]
+    self.addCleanup(os.unlink, other)
+    self._write(other, {'1': {'status': 'CANCELLED', 'cancelled_at': 'x'}})
+    lookup = self._mk(jobs_file=other, legacy_file=self.legacy)
+    self.assertEqual(lookup('1'), 'x')
+
+  def test_kill_switch_disables_detection(self):
+    self._write(self.jobs, {'1': {'status': 'CANCELLED', 'cancelled_at': 't'}})
+    os.environ[RC._CANCEL_DETECT_KILL_SWITCH] = '1'
+    self.assertIsNone(RC.make_registry_cancelled_lookup())
+
+  def test_end_to_end_with_run_reconcile(self):
+    # The real lookup wired into run_reconcile: a registry-cancelled xid is
+    # retired as CANCELLED; a non-cancelled neighbour still takes the zombie
+    # path. Registry files are only read, never written.
+    self._write(self.jobs, {'11': {'status': 'CANCELLED',
+                                   'cancelled_at': '2026-09-23 21:43:57'},
+                            '22': {'status': 'RUNNING'}})
+    self._write(self.legacy, {})
+    before = (open(self.jobs).read(), open(self.legacy).read())
+    c = _submitted('c', '11', 'yulpptr', submitted_at=0.0)
+    c.state = R.JobState.RUNNING
+    z = _submitted('z', '22', 'yulpptr', submitted_at=0.0)
+    z.state = R.JobState.RUNNING
+    probe = _FakeProbe({'11': RC.STATUS_TERMINAL, '22': RC.STATUS_TERMINAL})
+    _, log = RC.run_reconcile(
+        [c, z], now=100.0, probe=probe, dry_run=False,
+        cancelled_lookup=self._mk())
+    self.assertEqual(_cur_sub(c).state, 'CANCELLED')
+    self.assertIn('2026-09-23 21:43:57', c.last_reason)
+    self.assertEqual(_cur_sub(z).state, 'FAILED')
+    self.assertIn('zombie', z.last_reason)
+    self.assertEqual((open(self.jobs).read(), open(self.legacy).read()), before)
+    summary = [l for l in log if 'checked:' in l][0]
+    self.assertIn('1 zombie->FAILED, 1 cancelled', summary)
+
+
+class _FakeRestartEvidence:
+  """Scripted (code_bug, checkpoint) per xid, standing in for CnsRestartEvidence
+  so the reroute warm-restart path runs with NO CNS/fileutil I/O. Default
+  (None, None) = a healthy tail with no surviving checkpoint -> a cold requeue.
+  `calls` records the xid it was asked about (it must be read BEFORE mark_reroute
+  clears the xid)."""
+
+  def __init__(self, by_xid=None):
+    self._by_xid = by_xid or {}
+    self.calls = []
+
+  def code_bug_and_checkpoint(self, entry):
+    self.calls.append(entry.xid)
+    v = self._by_xid.get(entry.xid, (None, None))
+    # Accept a scripted 2-tuple (code_bug, ckpt) -- trained defaults False -- or
+    # a 3-tuple (code_bug, ckpt, trained). The real CnsRestartEvidence returns
+    # the 3-tuple; the 2-tuple keeps every pre-Fix2 test literal working.
+    if len(v) == 3:
+      return v
+    return (v[0], v[1], False)
+
+
+class RerouteWarmRestartTest(unittest.TestCase):
+  """THE DATA-LOSS FIX. A reroute-cancel of a job that HAS a complete checkpoint
+  must requeue WARM (carrying the layout-correct resume pointer) instead of
+  cold-starting from step 0 -- the same CnsRestartEvidence + plan_pruned_restart
+  + warm-restart machinery run_reconcile uses on the FAILED path, now threaded
+  into ALL THREE reroute cancel sites: (a) in-place preemption thrash,
+  (b) PENDING x2, (c) nominally RUNNING. With no checkpoint (or with any HOLD
+  guard tripped) behaviour is UNCHANGED: a bare cold requeue."""
+
+  def setUp(self):
+    super().setUp()
+    fh = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
+    fh.write(b'[]')
+    fh.close()
+    self._hist = fh.name
+    # These tests reroute for real (dry_run=False), which now flows through the
+    # sibling _archive_rerouted_xid tail. Redirect BOTH registry files to temps
+    # via the exact env vars it reads, so a live run can NEVER touch the daemon's
+    # ~/.tpu_jobs.json (the same isolation ArchiveReroutedXidTest uses).
+    self._saved_env = {k: os.environ.get(k) for k in
+                       ('TPU_JOBS_FILE', 'TPU_JOBS_LEGACY_FILE',
+                        'TPU_REROUTE_NO_ARCHIVE')}
+    self._jobs = tempfile.mkstemp(suffix='.jobs.json')[1]
+    self._legacy = tempfile.mkstemp(suffix='.legacy.json')[1]
+    os.environ['TPU_JOBS_FILE'] = self._jobs
+    os.environ['TPU_JOBS_LEGACY_FILE'] = self._legacy
+    os.environ.pop('TPU_REROUTE_NO_ARCHIVE', None)
+
+  def tearDown(self):
+    for k, v in self._saved_env.items():
+      if v is None:
+        os.environ.pop(k, None)
+      else:
+        os.environ[k] = v
+    for p in (self._hist, self._jobs, self._legacy):
+      if os.path.exists(p):
+        os.unlink(p)
+    super().tearDown()
+
+  def _no_sleep(self, _):
+    pass
+
+  _TORCH_CKPT = '/cns/x/steps/step_1024.pt'
+  _ELT_CKPT = '/cns/x/wd/checkpoints/1536'
+
+  # ---- site (b): double-confirmed PENDING ----
+  def _run_pending(self, evidence, *, dry_run=False, auto_resumes=0):
+    e = _submitted('j1', '111', 'yutulpz', submitted_at=0.0, auto_resumes=auto_resumes,
+                   launch_kwargs={'config': 'cfgX', 'exp_name': 'dw'})
+    probe = _SeqProbe({'111': [RC.STATUS_PENDING, RC.STATUS_PENDING]})
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(
+        [e], now=700.0, probe=probe, submitter=sub, reroute_after_s=600.0,
+        cooldown_s=1800.0, dry_run=dry_run,
+        output_probe=_FakeOutputProbe({'111': None}), confirm_gap_s=15.0,
+        sleep_fn=self._no_sleep, history_file=self._hist,
+        restart_evidence=evidence, auto_resume_max=3)
+    return e, sub, log
+
+  # ---- site (a): in-place preemption thrash ----
+  def _run_thrash(self, evidence, *, dry_run=False):
+    e = _running('j1', '111', 'ej', submitted_at=0.0,
+                 launch_kwargs={'config': 'cfgX', 'exp_name': 'dw'})
+    probe = _FakeProbe({'111': RC.STATUS_RUNNING})
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(
+        [e], now=4000.0, probe=probe, submitter=sub, cooldown_s=1800.0,
+        dry_run=dry_run, output_probe=_FakeOutputProbe({'111': 3999.0}),
+        restart_probe=_FakeRestartProbe({'111': 5}), inplace_reroute=True,
+        inplace_restart_threshold=3, nominal_running_grace_s=3600.0,
+        history_file=self._hist, sleep_fn=self._no_sleep,
+        restart_evidence=evidence, auto_resume_max=3)
+    return e, sub, log
+
+  # ---- site (c): nominally RUNNING (XM RUNNING, no Borg RUN, nothing written) ----
+  def _run_nominal(self, evidence, *, dry_run=False):
+    e = _running('j1', '111', 'sj', submitted_at=0.0,
+                 launch_kwargs={'config': 'cfgX', 'exp_name': 'dw'})
+    probe = _FakeProbe({'111': RC.STATUS_RUNNING})
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(
+        [e], now=7200.0, probe=probe, submitter=sub, reroute_after_s=600.0,
+        cooldown_s=1800.0, dry_run=dry_run,
+        output_probe=_FakeOutputProbe({'111': None}), sleep_fn=self._no_sleep,
+        history_file=self._hist, borg_probe=_FakeBorgProbe(False),
+        nominal_running_grace_s=3600.0, restart_evidence=evidence,
+        auto_resume_max=3)
+    return e, sub, log
+
+  # ===== THE NEGATIVE-CONTROL FLIP (prove the test can fail) =====
+  def test_negative_control_checkpoint_present_warm_absent_cold(self):
+    # WITH a checkpoint -> the requeued row carries the resume pointer (WARM).
+    warm, _, wlog = self._run_pending(
+        _FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}))
+    self.assertEqual(warm.launch_kwargs.get('load_from'), self._TORCH_CKPT)
+    self.assertTrue(any('WARM-restart from' in l for l in wlog))
+    # BREAK THE WIRING: force checkpoint=None. The SAME assertions must now FLIP
+    # to cold-start (no resume pointer, no WARM log). If the fix were absent the
+    # first assertion would fail; if it warm-restarted unconditionally, this
+    # one would -- so the test genuinely can fail in both directions.
+    cold, _, clog = self._run_pending(_FakeRestartEvidence({'111': (None, None)}))
+    self.assertNotIn('load_from', cold.launch_kwargs)
+    self.assertFalse(any('WARM-restart' in l for l in clog))
+
+  # ===== site (b): PENDING x2 =====
+  def test_pending_with_checkpoint_warm_restarts(self):
+    e, sub, log = self._run_pending(
+        _FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}))
+    self.assertEqual(sub.cancels, ['111'])               # still cancelled
+    self.assertEqual(e.state, R.JobState.QUEUED)         # still re-queued
+    self.assertIsNone(e.xid)                             # dead xid superseded
+    self.assertEqual(e.launch_kwargs['load_from'], self._TORCH_CKPT)
+    self.assertEqual(e.auto_resumes, 1)                 # budget consumed
+    self.assertGreater(e.cooldown_cells.get('yutulpz', 0), 700.0)  # cell cooled
+
+  def test_pending_no_checkpoint_cold_starts(self):
+    e, sub, log = self._run_pending(_FakeRestartEvidence({'111': (None, None)}))
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertNotIn('load_from', e.launch_kwargs)      # cold: nothing to resume
+    self.assertEqual(e.auto_resumes, 0)
+    self.assertGreater(e.cooldown_cells.get('yutulpz', 0), 700.0)
+
+  # ===== site (a): in-place thrash =====
+  def test_thrash_with_checkpoint_warm_restarts_and_keeps_eviction_strike(self):
+    e, sub, log = self._run_thrash(
+        _FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}))
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['load_from'], self._TORCH_CKPT)
+    # THE STRIKE + COOLDOWN MUST SURVIVE the warm restart (spec item #3): the
+    # whole point of pulling a thrashing job off a cell is that the next
+    # placement avoids it.
+    self.assertEqual(e.evictions['ej']['strikes'], 1)
+    self.assertGreater(e.cooldown_cells.get('ej', 0), 4000.0)
+    self.assertTrue(any('eviction strike recorded' in l for l in log))
+    self.assertTrue(any('WARM-restart from' in l for l in log))
+
+  def test_thrash_no_checkpoint_cold_starts(self):
+    e, sub, log = self._run_thrash(_FakeRestartEvidence({'111': (None, None)}))
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertNotIn('load_from', e.launch_kwargs)
+    self.assertEqual(e.evictions['ej']['strikes'], 1)   # strike still recorded
+
+  # ===== site (c): nominally RUNNING =====
+  def test_nominal_running_with_checkpoint_warm_restarts(self):
+    e, sub, log = self._run_nominal(
+        _FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}))
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['load_from'], self._TORCH_CKPT)
+    self.assertTrue(any('WARM-restart from' in l for l in log))
+
+  def test_nominal_running_no_checkpoint_cold_starts(self):
+    e, sub, log = self._run_nominal(_FakeRestartEvidence({'111': (None, None)}))
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertNotIn('load_from', e.launch_kwargs)
+
+  # ===== the silently-destructive layout trap: assert BOTH directions =====
+  def test_torch_layout_produces_load_from_not_restart_from(self):
+    e, _, _ = self._run_pending(
+        _FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}))
+    self.assertEqual(e.launch_kwargs['load_from'], self._TORCH_CKPT)
+    self.assertNotIn('restart_from', e.launch_kwargs)
+    self.assertNotIn('restart_step', e.launch_kwargs)
+
+  def test_elt_layout_produces_restart_from_and_step_not_load_from(self):
+    e, _, _ = self._run_pending(
+        _FakeRestartEvidence({'111': (None, self._ELT_CKPT)}))
+    self.assertEqual(e.launch_kwargs['restart_from'], '/cns/x/wd')
+    self.assertEqual(e.launch_kwargs['restart_step'], '1536')
+    self.assertNotIn('load_from', e.launch_kwargs)
+
+  # ===== dry_run: log the intent, mutate nothing =====
+  def test_dry_run_logs_warm_intent_but_mutates_nothing(self):
+    e, sub, log = self._run_pending(
+        _FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}), dry_run=True)
+    self.assertEqual(sub.cancels, [])                    # no cancel
+    self.assertEqual(e.state, R.JobState.SUBMITTED)      # untouched
+    self.assertEqual(e.xid, '111')                       # xid intact
+    self.assertNotIn('load_from', e.launch_kwargs)       # nothing wired in
+    self.assertTrue(any('[DRY][reroute]' in l and 'WARM-restart from' in l
+                        for l in log))
+
+  # ===== the global brake still suppresses everything =====
+  def test_global_brake_suppresses_warm_restart(self):
+    # Seed the window with REAL wall-clock stamps: _load_reroute_history drops
+    # anything older than time.time()-3600, so epoch-0-ish stamps would be
+    # filtered out and the brake would never engage (that is a test bug, not a
+    # code bug -- the production loop always writes time.time()).
+    with open(self._hist, 'w') as f:
+      json.dump([time.time()] * R.REROUTE_GLOBAL_MAX_PER_HOUR, f)
+    e, sub, log = self._run_pending(
+        _FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}))
+    self.assertEqual(sub.cancels, [])                    # brake => no cancel
+    self.assertEqual(e.state, R.JobState.SUBMITTED)      # untouched
+    self.assertNotIn('load_from', e.launch_kwargs)
+    self.assertTrue(any('GLOBAL BRAKE' in l for l in log))
+
+  # ===== HOLD guards fall back to a cold requeue (negative controls) =====
+  def test_no_evidence_default_is_cold_start(self):
+    # restart_evidence=None (the default, every legacy caller) never warm-starts.
+    e, sub, log = self._run_pending(None)
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertNotIn('load_from', e.launch_kwargs)
+    self.assertFalse(any('WARM-restart' in l for l in log))
+
+  def test_code_bug_holds_cold_start(self):
+    # A code-bug signature in the tail must NOT warm-restart (it would replay the
+    # bug). Cold requeue instead.
+    e, sub, log = self._run_pending(
+        _FakeRestartEvidence({'111': ('CODE BUG: segfault (SIGSEGV)',
+                                      self._TORCH_CKPT)}))
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertNotIn('load_from', e.launch_kwargs)
+    self.assertFalse(any('WARM-restart' in l for l in log))
+
+  def test_reroute_past_auto_resume_max_still_preserves_checkpoint(self):
+    # Regression (2026-09-21 elt_sitxl2): unlike run_reconcile (where HOLD stops
+    # a dead row from respawning), a reroute ALWAYS re-queues the row via
+    # mark_reroute(e). Refusing to wire the surviving checkpoint when
+    # auto_resumes >= auto_resume_max rolled the job back to an older step!
+    e, sub, log = self._run_pending(
+        _FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}), auto_resumes=3)
+    self.assertEqual(e.state, R.JobState.QUEUED)         # re-routed
+    self.assertEqual(e.launch_kwargs.get('load_from'), self._TORCH_CKPT)
+    self.assertEqual(e.auto_resumes, 4)
+    self.assertTrue(any('WARM-restart' in l for l in log))
+
+  def test_live_config_sibling_holds_cold_start(self):
+    # A live job writing the SAME out_dir (same config) blocks the warm restart
+    # (double-writer hazard) -> cold requeue.
+    e = _submitted('j1', '111', 'yutulpz', submitted_at=0.0,
+                   launch_kwargs={'config': 'cfgX', 'exp_name': 'dw'})
+    sib = _running('j2', '222', 'other', submitted_at=0.0,
+                   launch_kwargs={'config': 'cfgX'})
+    probe = _SeqProbe({'111': [RC.STATUS_PENDING, RC.STATUS_PENDING]})
+    sub = _FakeSubmitter()
+    RC.run_reroute(
+        [e, sib], now=700.0, probe=probe, submitter=sub, reroute_after_s=600.0,
+        cooldown_s=1800.0, dry_run=False,
+        output_probe=_FakeOutputProbe({'111': None}), confirm_gap_s=15.0,
+        sleep_fn=self._no_sleep, history_file=self._hist,
+        restart_evidence=_FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}),
+        auto_resume_max=3)
+    self.assertEqual(sub.cancels, ['111'])              # e still re-routed
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertNotIn('load_from', e.launch_kwargs)      # but cold: sibling live
+
+
+class CnsRestartProbeTest(unittest.TestCase):
+  """Unit tests for CnsRestartProbe re-exec deduplication and active-training guard."""
+
+  def _row(self, size: int, day_time: str, name: str) -> list[str]:
+    return ['-rw-rw----', '1', 'qiaos', 'empty', str(size),
+            '2026/09/20', day_time, f'/cns/is-d/home/qiaos/logs/xid_111/logs/{name}']
+
+  def test_reexec_parent_stub_deduplicated_and_active_training_returns_zero(self):
+    probe = RC.CnsRestartProbe()
+    # Two starts via re-exec fan-out (attempt0+1 and attempt2+3), where attempt3
+    # is 16 KB and freshly written -> actively training, must report 0 restarts.
+    rows = [
+        self._row(2225, '00:56:41', 'rank_0_attempt0.log'),
+        self._row(5108, '01:10:00', 'rank_0_attempt1.log'),
+        self._row(2169, '01:15:00', 'rank_0_attempt2.log'),
+        self._row(16791, '02:27:40', 'rank_0_attempt3.log'),
+    ]
+    with mock.patch.object(probe, '_ls_l', side_effect=[rows, None, None]), \
+         mock.patch.object(RC, '_bucket_for_entry', return_value='/cns/is-d/home/qiaos'):
+      latest_mt = RC._parse_fileutil_mtime(rows[-1])
+      assert latest_mt is not None
+      e = _running('j1', '111', 'if', submitted_at=0.0)
+      self.assertEqual(probe.restarts_since_progress(e, now=latest_mt + 60.0), 0)
+
+  def test_four_short_crashed_starts_without_ckpt_counts_three_restarts(self):
+    probe = RC.CnsRestartProbe()
+    # 4 distinct crashed starts (each parent stub + crashed 5KB worker), no ckpt,
+    # and latest is < 8KB -> 4 starts = 1 initial + 3 restarts (>= threshold 3).
+    rows = [
+        self._row(2200, '00:01:00', 'rank_0_attempt0.log'),
+        self._row(5100, '00:02:00', 'rank_0_attempt1.log'),
+        self._row(2200, '00:11:00', 'rank_0_attempt2.log'),
+        self._row(5100, '00:12:00', 'rank_0_attempt3.log'),
+        self._row(2200, '00:21:00', 'rank_0_attempt4.log'),
+        self._row(5100, '00:22:00', 'rank_0_attempt5.log'),
+        self._row(2200, '00:31:00', 'rank_0_attempt6.log'),
+        self._row(5100, '00:32:00', 'rank_0_attempt7.log'),
+    ]
+    with mock.patch.object(probe, '_ls_l', side_effect=[rows, None, None]), \
+         mock.patch.object(RC, '_bucket_for_entry', return_value='/cns/is-d/home/qiaos'):
+      latest_mt = RC._parse_fileutil_mtime(rows[-1])
+      assert latest_mt is not None
+      e = _running('j1', '111', 'if', submitted_at=0.0)
+      self.assertEqual(probe.restarts_since_progress(e, now=latest_mt + 60.0), 3)
+
+
+class RequeueReasonTest(unittest.TestCase):
+  """When the worker cannot place a claimed job it must record WHY. It used to
+  copy claim_for_build's 'building (worker ...)' into every requeue, so
+  `tpu check` showed "waiting: building" for jobs that were not building."""
+
+  def setUp(self):
+    fd, self.path = tempfile.mkstemp(suffix='.json')
+    os.close(fd)
+    self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+    lock = self.path + '.lock'
+    self.addCleanup(lambda: os.path.exists(lock) and os.remove(lock))
+    RC.save_queue(self.path, [_entry('p', power='v7-32', archs=('v7',))])
+
+  def _run(self, prov, xid='961'):
+    sub = _FakeSubmitter(xid=xid)
+    outcome, log, _ = RC.run_worker_once(self.path, prov, sub, now=100.0,
+                                         worker_id='w')
+    row = {e.job_id: e for e in RC.load_queue(self.path)}['p']
+    return outcome, log, sub, row
+
+  def test_requeue_names_the_real_reason(self):
+    prov = _FakeProvider({'x|v7': _avail('x', 'v7', 320, oversold=True)},
+                         arch_price={'v7': 20.0}, arch_pool={'v7': 0})
+    outcome, log, sub, row = self._run(prov)
+    self.assertEqual(outcome, 'requeued')
+    self.assertEqual(sub.calls, [])
+    self.assertEqual(row.state, R.JobState.QUEUED)
+    self.assertEqual(row.last_reason, 'waiting: v7-32: no free slice')
+    self.assertTrue(any('v7-32: no free slice; released slot' in l
+                        for l in log), log)
+
+  def test_requeue_names_the_limit_order_cap(self):
+    prov = _FakeProvider({'x|v7': _avail('x', 'v7', 320, price=25.0)},
+                         arch_price={'v7': 25.0}, arch_pool={'v7': 320})
+    outcome, _, sub, row = self._run(prov)
+    self.assertEqual(outcome, 'requeued')
+    self.assertEqual(sub.calls, [])
+    self.assertEqual(row.last_reason,
+                     'waiting: v7-32: 1 cell(s) over limit-order cap 20')
+
+  def test_fetch_failure_reason_survives_the_requeue(self):
+
+    class _Boom:
+
+      def fetch(self):
+        raise RuntimeError('rpc down')
+
+    outcome, _, _, row = self._run(_Boom())
+    self.assertEqual(outcome, 'requeued')
+    self.assertEqual(row.last_reason,
+                     'waiting: availability fetch failed: rpc down')
+
+  def test_negative_control_placeable_job_still_submits(self):
+    prov = _FakeProvider({'x|v7': _avail('x', 'v7', 320)},
+                         arch_price={'v7': 20.0}, arch_pool={'v7': 320})
+    outcome, _, sub, row = self._run(prov, xid='962')
+    self.assertEqual(outcome, 'submitted')
+    self.assertEqual(len(sub.calls), 1)
+    self.assertEqual(row.state, R.JobState.SUBMITTED)
+
+  def test_reason_is_fresh_not_a_stale_gate_note(self):
+    # Pass 1: the only v7 cell is over the limit-order cap.
+    over = _FakeProvider({'x|v7': _avail('x', 'v7', 320, price=25.0)},
+                         arch_price={'v7': 25.0}, arch_pool={'v7': 320})
+    self.assertEqual(self._run(over)[0], 'requeued')
+    # Pass 2: back under the cap but the cell is full. The recorded reason
+    # must describe THIS pass, not repeat pass 1's cap verdict.
+    full = _FakeProvider({'x|v7': _avail('x', 'v7', 0, price=8.0)},
+                         arch_price={'v7': 8.0}, arch_pool={'v7': 0})
+    outcome, _, _, row = self._run(full)
+    self.assertEqual(outcome, 'requeued')
+    self.assertEqual(row.last_reason, 'waiting: v7-32: no free slice')
 
 
 if __name__ == '__main__':

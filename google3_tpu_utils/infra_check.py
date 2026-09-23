@@ -163,7 +163,7 @@ def _clear_jobs(job_ids, mapping_dir):
 
 
 
-def derive_failure_reason(exp_id, failed_wu, tpu_info):
+def derive_failure_reason(exp_id, failed_wu, tpu_info, log_tail=''):
     """Human-readable reason for a work unit that is not making progress.
 
     Ordering matters. The rules run most-specific first, because several xborg
@@ -176,6 +176,9 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info):
     go/xborg-why-descheduled.
     """
     if not failed_wu:
+        age = _experiment_age_minutes(None, tpu_info)
+        if age is not None and age > _WORK_UNIT_GRACE_MINUTES:
+            return 'XManager experiment gone (0 work units)'
         return 'No WorkUnits'
 
     msg = ''
@@ -185,6 +188,15 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info):
         msg = (getattr(failed_wu, 'status_message', '') or
                getattr(failed_wu, 'error_message', '') or
                getattr(failed_wu, 'failure_reason', '') or '')
+    # XManager's _ClientWorkUnit sometimes leaves status.message empty while the
+    # underlying proto (_work_unit.status) carries BORG_STATE_FAILURE or a
+    # detailed message.
+    raw_proto_state = ''
+    raw_wu = getattr(failed_wu, '_work_unit', None)
+    if raw_wu is not None and hasattr(raw_wu, 'status'):
+        if not msg:
+            msg = getattr(raw_wu.status, 'message', '') or ''
+        raw_proto_state = str(getattr(raw_wu.status, 'state', '') or '')
 
     msg_upper = msg.upper()
 
@@ -214,13 +226,6 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info):
     #   * a RESOURCE DEFICIT is the auction not clearing enough chips this
     #     cycle. No cap is involved; the fix is another cell, another tier, or
     #     waiting. Raising a cap does nothing at all.
-    #
-    # Collapsing them cost real debugging time: a v6p-64 probe whose work unit
-    # said `GQM_RESOURCE_DEFICIT_INFO ... deficit GHOSTFISH=19 in cell yucbfiv`
-    # was reported as "price over limit order" while its group had NO row in the
-    # cap table at all and the market cleared at 17.75 against a 180 cap. The
-    # rest of this file already separates the two (see _WHY_HINTS and the
-    # pending-reason table below); only this verdict did not.
     #
     # Order matters: check the cap first, because a limit-order message can also
     # carry the word "deficit", but a deficit message never names a cap.
@@ -259,51 +264,54 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info):
     if 'CAPACITY' in msg_upper or 'EXHAUSTED' in msg_upper or 'EXCEEDED' in msg_upper:
         return 'Pool Capacity Limit'
 
+    # Rule 5b: Borg / TPU hardware / XM dispatch failure checks.
+    if 'AFFINITY_GROUP_IN_USE' in msg_upper or ('AFFINITY' in msg_upper and 'IN USE' in msg_upper):
+        return 'Borg AffinityGroup in use (transient conflict; retry/reroute)'
+
+    if 'TASK_ACTION_FISH_' in msg_upper or 'ICI_SECURITY_SETUP' in msg_upper:
+        return 'TPU ICI setup failure (hardware/bad node; reroute)'
+
+    if 'ZERO WORK UNITS' in msg_upper or 'NO WORK UNITS' in msg_upper or 'EXPERIMENT IS GONE' in msg_upper:
+        return 'XManager experiment gone (0 work units)'
+
     # Rule 6: APPLICATION errors -- the job's own code broke, not the infra.
-    #
-    # This whole table exists to answer "is it me or is it Borg", and until now
-    # it could only say the latter. Every rule above is an infra verdict, so an
-    # application crash fell through to Rule 7, which printed the raw status
-    # message -- and Borg prefixes those with the job name, so the WHY column
-    # read `qiaos_group_275707651`, i.e. the job's own name as its cause. Four
-    # consecutive EqR-jax code bugs (a missing wandb attribute, os.makedirs on
-    # /cns, and two segfaults) were reported that way and each one needed
-    # why_probe to find out what the table already knew.
-    #
-    # These are deliberately checked AFTER the infra rules: a preemption during
-    # a crash loop is still a preemption, and infra causes are actionable in a
-    # different way (retry, move cell, raise a limit order) from code bugs
-    # (read the traceback, fix, resubmit).
-    #
-    # Marked "CODE BUG" so the verdict is unambiguous, with the concrete signal
-    # in parentheses, because the next action differs per signal: OOM means
-    # shrink the batch or ask for more RAM, SIGSEGV means read the stack.
-    app_error = _application_error(msg_upper)
+    # Also inspect the CNS rank-log tail (`log_tail`) when XManager's
+    # status.message is empty or merely says "Job terminated in state FAILURE".
+    app_error = _application_error(msg_upper, raw_text=msg)
+    if not app_error and log_tail:
+        app_error = _application_error(log_tail.upper(), raw_text=log_tail, is_log=True)
     if app_error:
-        # A resumed experiment accumulates every attempt's text in
-        # status.message, so an old traceback outlives the bug that caused it.
-        # XID 275793223 kept reporting `CODE BUG: ValueError` from attempt 1
-        # while attempts 4 and 5 were training fine and merely being preempted.
-        # Picking the newest work unit was not enough -- the message itself is
-        # the concatenation.
-        #
-        # Progress is the tie-breaker Borg cannot fake: if the job checkpointed
-        # PAST the step it was at when that traceback was written, the crash is
-        # historical. Say so instead of pinning a stale cause that sends the
-        # reader to debug already-fixed code.
         if _resumed_past_error(tpu_info):
             return f'{app_error} (STALE: earlier attempt; job has since progressed)'
         return app_error
 
-    # Rule 7: nothing recognised. Do NOT invent a cause: XManager genuinely
-    # returns an empty status message for some allocator rejections, and the
-    # old code turned that silence into a confident-sounding
-    # "Rejected by Allocator/Borg" for every PROD failure. Say so instead, and
-    # point at the tool that can dig further.
-    if msg and msg.strip() and msg.strip() != 'Failed' and 'Rejected' not in msg:
-        return _humanize(_strip_job_prefix(msg.strip()))
-
+    # Rule 6b: Borg task died in state FAILURE ("Job terminated in state FAILURE"
+    # or BORG_STATE_FAILURE with empty message) and wrote NO CNS rank log at all.
+    # This happens when Python crashes BEFORE `app.run(main)` / `InitGoogle()`
+    # (e.g. top-level module ImportError/AttributeError or missing config file),
+    # so `bucket_cp_path` is never created on CNS and Borg only sees exit code 1.
+    stripped_msg = _strip_job_prefix(msg.strip()) if msg else ''
+    is_generic_borg_failure = (
+        'JOB TERMINATED IN STATE FAILURE' in msg_upper
+        or 'BORG_STATE_FAILURE' in raw_proto_state.upper()
+    )
     state = str(getattr(failed_wu, 'status_name', '') or '').lower()
+    if ('fail' in state or is_generic_borg_failure) and not log_tail:
+        bucket = (tpu_info or {}).get('bucket_cp_path') or ''
+        if bucket and not _resumed_past_error(tpu_info):
+            return ('CODE BUG (pre-InitGoogle crash): task exited in state '
+                    'FAILURE at step 0 with 0 CNS logs (check module imports / '
+                    'config flags; run why_probe)')
+        if is_generic_borg_failure:
+            return ('CODE BUG: task exited in state FAILURE before logging '
+                    '(check imports/configs or run why_probe)')
+
+    # Rule 7: nothing recognised. Do NOT invent a cause.
+    if (stripped_msg and stripped_msg != 'Failed'
+            and 'Rejected' not in stripped_msg
+            and 'JOB TERMINATED IN STATE FAILURE' not in stripped_msg.upper()):
+        return _humanize(stripped_msg)
+
     if 'fail' in state:
         return 'Failed, no reason reported (try why_probe)'
     return 'Queued, no reason reported (try why_probe)'
@@ -353,11 +361,27 @@ _APPLICATION_ERROR_SIGNATURES = (
     ('XLARUNTIMEERROR', 'CODE BUG: XLA runtime error'),
     ('JAXRUNTIMEERROR', 'CODE BUG: JAX runtime error'),
     ('TRACEBACK (MOST RECENT CALL LAST)', 'CODE BUG: unhandled Python exception'),
-    # Borg's own phrasing for "your binary died on its own".
     ('APPLICATION LEVEL ERROR', 'CODE BUG: application-level failure'),
     ('UNRECOVERABLE FAILURE', 'CODE BUG: unrecoverable application failure'),
     ('EXITED WITH NON-ZERO', 'CODE BUG: non-zero exit'),
     ('NON-ZERO EXIT', 'CODE BUG: non-zero exit'),
+)
+
+
+def _compile_app_error_matcher(needle: str) -> re.Pattern[str]:
+    """Match needle with word boundaries on alnum edges.
+
+    Prevents substring collisions such as 'SIGSEGV' matching 'SIGSEGVs' in
+    startup banner advisories, while allowing punctuation-terminated tokens.
+    """
+    left = r'(?<![A-Z0-9_])' if needle[:1].isalnum() else ''
+    right = r'(?![A-Z0-9_])' if needle[-1:].isalnum() else ''
+    return re.compile(left + re.escape(needle) + right)
+
+
+_APP_ERROR_MATCHERS = tuple(
+    (_compile_app_error_matcher(needle), verdict)
+    for needle, verdict in _APPLICATION_ERROR_SIGNATURES
 )
 
 
@@ -553,6 +577,13 @@ def _fetch_work_units(exp):
   return list(exp.get_work_units())
 
 
+# Borg preempts a job by tearing down its gang; the restart writes a NEW rank
+# log named `rank_<R>_attempt<N>.log`. This captures <N>; a name with no attempt
+# suffix (EqR/orbax write a single `rank_0.json`) yields no match -> None. See
+# _read_log_tail for why the LATEST attempt, not the largest file, is the tail
+# that reflects current progress.
+_ATTEMPT_RE = re.compile(r'attempt(\d+)')
+
 def _read_log_tail(bucket: str, nbytes: int = 16384) -> tuple[str, str]:
   """Classify and read the most active rank log under `bucket`.
 
@@ -609,7 +640,28 @@ def _read_log_tail(bucket: str, nbytes: int = 16384) -> tuple[str, str]:
         return -1
 
     sizes = list(_STAT_POOL.map(_size, entries))
-    best = max(zip(sizes, range(len(entries))), key=lambda t: t[0])
+    # PREEMPTION: a Borg-restarted job writes one rank log PER ATTEMPT
+    # (`rank_<R>_attempt<N>.log`). The LATEST attempt holds current progress,
+    # but an EARLIER one can be far LARGER -- it ran a long stretch before being
+    # preempted -- while its highest step is stale. Picking the largest then
+    # read step 11502 off a dead attempt5 for a parcae run that had actually
+    # reached 21361 in attempt18 (both the board's tail AND _progress_step's
+    # log-derived step were wrong, since the step is parsed from this tail). So
+    # among the NON-EMPTY logs, keep only the highest attempt index before the
+    # largest-rank tie-break. A name with no attempt suffix (EqR/orbax
+    # `rank_0.json`) has attempt None and is left exactly as before. Gating on
+    # non-empty stops a just-restarted attempt, still 0 bytes, from blanking a
+    # tail the previous attempt already has.
+    live = [(s, i) for i, s in enumerate(sizes) if s > 0]
+    if live:
+      tagged = [(_ATTEMPT_RE.search(entries[i].name), s, i) for s, i in live]
+      tagged = [(int(m.group(1)) if m else None, s, i) for m, s, i in tagged]
+      latest = max((a for a, _, _ in tagged if a is not None), default=None)
+      if latest is not None:
+        live = [(s, i) for a, s, i in tagged if a == latest]
+      best = max(live, key=lambda t: t[0])
+    else:
+      best = max(zip(sizes, range(len(entries))), key=lambda t: t[0])
     if best[0] < 0:
       return ('error', '')  # every stat() failed -> cold channel, not absence
     if best[0] == 0:
@@ -877,14 +929,61 @@ def _resumed_past_error(tpu_info):
         return False
 
 
-def _application_error(msg_upper):
+_EXCEPTION_DETAIL_RE = re.compile(
+    r'\b(AttributeError|ValueError|TypeError|KeyError|FileNotFoundError|'
+    r'RuntimeError|ModuleNotFoundError|ImportError|AssertionError|'
+    r'PermissionError|XlaRuntimeError|JaxRuntimeError):\s*([^\r\n]+)',
+    re.IGNORECASE,
+)
+
+_PYTHON_EXCEPTION_VERDICTS = {
+    'CODE BUG: PermissionError',
+    'CODE BUG: missing module (packaging)',
+    'CODE BUG: ImportError (packaging)',
+    'CODE BUG: AttributeError',
+    'CODE BUG: TypeError',
+    'CODE BUG: ValueError',
+    'CODE BUG: KeyError',
+    'CODE BUG: FileNotFoundError',
+    'CODE BUG: AssertionError',
+    'CODE BUG: RuntimeError',
+    'CODE BUG: XLA runtime error',
+    'CODE BUG: JAX runtime error',
+    'CODE BUG: unhandled Python exception',
+}
+
+
+def _clean_log_for_analysis(text: str) -> str:
+    lines = []
+    for line in text.splitlines():
+        # Drop benign startup banners and advisories:
+        # e.g., minloglevel READ-BACK unavailable (ModuleNotFoundError: No module named 'base')
+        # e.g., If rank 0 SIGSEGVs in its first collective, THIS is why
+        if 'minloglevel' in line or 'cpp_flag' in line:
+            continue
+        lines.append(line)
+    return '\n'.join(lines)
+
+
+def _application_error(msg_upper, raw_text='', is_log=False):
     """Classify an application (not infra) failure, or return None.
 
     Kept separate from `classify_failure_reason` so the signature table stays
-    readable and can be unit-tested directly.
+    readable and can be unit-tested directly. When `raw_text` is provided and
+    carries a concrete `ExceptionType: detail` line, appends the detail so the
+    board shows the exact crash cause instead of just the exception class name.
     """
-    for needle, verdict in _APPLICATION_ERROR_SIGNATURES:
-        if needle in msg_upper:
+    if is_log and raw_text:
+        raw_text = _clean_log_for_analysis(raw_text)
+        msg_upper = raw_text.upper()
+    for matcher, verdict in _APP_ERROR_MATCHERS:
+        if matcher.search(msg_upper):
+            if raw_text and verdict in _PYTHON_EXCEPTION_VERDICTS:
+                matches = list(_EXCEPTION_DETAIL_RE.finditer(raw_text))
+                if matches:
+                    detail = matches[-1].group(2).strip()
+                    if detail and detail.lower() not in verdict.lower():
+                        return f'{verdict} ({detail[:90]})'
             return verdict
     return None
 
@@ -1632,14 +1731,13 @@ def main(argv):
                     "", "",
                     Text(f"  │ {line}", style="dim", no_wrap=True, overflow="ellipsis"),
                     "", "", "", "")
-        elif is_error:
-            failed_wu = _latest_failed_wu(work_units)
-            state_str = failed_wu.status_name.lower()
-            color = "red" if "cancel" not in state_str else "yellow"
-            message = derive_failure_reason(exp_id, failed_wu, job_info)
-            table_error.add_row(str(exp_id), f"[{color}]{state_str}[/{color}]", name[:50],
-                                resume_str, step_str, message[:160])
         elif is_pending:
+            # A LIVE work unit wins over a stale failed one. A --resume_xid job
+            # keeps its original XID and appends a fresh WU2, so it carries BOTH
+            # a FAILED WU1 and a PENDING WU2 -- is_error and is_pending are both
+            # true. is_pending MUST precede is_error here, or every resumed job
+            # renders as `failed` (with the dead WU1's stale step and reason)
+            # even though a new WU is really queued for capacity.
             failed_wu = _latest_failed_wu(work_units)
             reason = derive_failure_reason(exp_id, failed_wu, job_info)
             # A queued job usually has nothing to explain: XManager leaves
@@ -1656,6 +1754,15 @@ def main(argv):
                 reason = f"{reason} (was preempted)".strip()
             table_pending.add_row(str(exp_id), "[yellow]PENDING[/yellow]", name[:50],
                                   resume_str, step_str, reason)
+        elif is_error:
+            # Reached only when NO WU is running or pending -- i.e. the job is
+            # genuinely terminal (failed/cancelled with nothing re-queued).
+            failed_wu = _latest_failed_wu(work_units)
+            state_str = failed_wu.status_name.lower()
+            color = "red" if "cancel" not in state_str else "yellow"
+            message = derive_failure_reason(exp_id, failed_wu, job_info, log_tail=_raw_tail)
+            table_error.add_row(str(exp_id), f"[{color}]{state_str}[/{color}]", name[:50],
+                                resume_str, step_str, message[:160])
         else:
             state_str = work_units[0].status_name.lower() if hasattr(work_units[0], 'status_name') else "completed"
             if "unknown" in state_str:

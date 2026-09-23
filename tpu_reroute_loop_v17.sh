@@ -23,9 +23,27 @@
 # its cancelled experiment -- xid_recon reads prior_xids to tell a known car
 # from a ghost, so re-routing WAS a ghost-car factory.
 # 2026-09-06: verified clip_probe build includes queue snapshot conflict protection.
-BIN='/usr/local/google/_blaze_qiaos/bb5e05891304127daf0b480f4298d971_buildrabbit/execroot/google3/blaze-out/k8-fastbuild/bin/experimental/users/qiaos/tpu_utils/route_check'
+BIN='/google/src/cloud/qiaos/run_amply_workspace/google3/blaze-bin/experimental/users/qiaos/tpu_utils/route_check'
+if [[ ! -x "$BIN" ]]; then
+  BIN='/usr/local/google/_blaze_qiaos/bb5e05891304127daf0b480f4298d971_buildrabbit/execroot/google3/blaze-out/k8-fastbuild/bin/experimental/users/qiaos/tpu_utils/route_check'
+fi
 QUEUE="$HOME/.tpu_local_queue.json"
 LOG="$HOME/work/.monitor_watch/tpu_reroute_loop_v17.log"
+
+# ★2026-09-18: RECOVER the systemd user-bus env on every (re)spawn. The
+# interlock restarts this script via `setsid nohup bash`, and the interlock's
+# OWN env carries no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS (measured: the
+# watchdog it respawned at 20:15:47Z had only $HOME in /proc/<pid>/environ).
+# Without them `systemd-run --user --scope` below cannot reach the user bus: it
+# fails every 30s with "Failed to connect to user scope bus", the worker never
+# starts, and reconcile goes dark (measured 19:43->20:38Z, ~55min). The
+# interlock cannot catch this -- it only checks that the flock is HELD, and this
+# broken loop holds it while spinning. Re-derive both from the uid so ANY
+# respawn (interlock, login shell, or manual) self-heals. Uses := default so a
+# already-good value from a real login session is left untouched.
+_uid="$(id -u)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${_uid}}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/${_uid}/bus}"
 
 exec 9>/tmp/tpu-reroute-loop.lock
 flock -n 9 || { echo "[reroute-loop] another instance holds the lock; exiting."; exit 0; }

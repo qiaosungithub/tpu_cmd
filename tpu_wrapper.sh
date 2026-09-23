@@ -1007,13 +1007,14 @@ print(d['group'], d['tpu_type'], d['status'],
     # (found 2026-08-26: file was -rw-r-----, launch budget gate was being
     # bypassed entirely; running-job enforcer was the only thing catching it).
     if [ -f "$budget_script" ]; then
-      if ! python3 "$budget_script" "$tpu_type" "${tier:-PROD}"; then
+      local budget_g="${group%%,*}"
+      if ! python3 "$budget_script" "$tpu_type" "${tier:-PROD}" --group="$budget_g"; then
         return 1
       fi
     fi
 
     # ============ PREFLIGHT CHECK (before the ~5 min bazel packaging) ============
-    if [ "$skip_preflight" != "1" ] && [ -x "$_PREFLIGHT_CLI_BIN" ]; then
+    if [ "$skip_preflight" != "1" ] && [ "${TPU_SKIP_PREFLIGHT:-0}" != "1" ] && [ -x "$_PREFLIGHT_CLI_BIN" ]; then
       local pf_tier="${tier:-PROD}"
       # Auto-apply the tier-inference rule (mirrors what happens later).
       local first_g="${group%%,*}"
@@ -1091,10 +1092,29 @@ print(d['group'], d['tpu_type'], d['status'],
     # 700000)" -> code 104, snapshot stuck at 13956. It cannot be repaired in
     # place (deletes also count toward the limit; create_keyframe needs
     # citc-impersonators), so it is RETAINED (365d) with its staging dirs and
-    # RETIRED as the default. run_amply_workspace (qiaos/15202) is healthy
-    # (dropped_resources.ascii at the 49-byte header, and the live build-workers
-    # already stage there). Keep explicit STAGE_WS_ROOT overrides intact.
-    local STAGE_WS_ROOT="${STAGE_WS_ROOT:-/google/src/cloud/qiaos/run_amply_workspace/google3}"
+    # RETIRED as the default.
+    #
+    # run_amply_workspace (qiaos/15202) has now ALSO been rotated out
+    # (2026-09-21): it accumulated ~200,000 live resources (98% under
+    # eqr_jax_final_stages), crossing CitC's ~100,000 auto-keyframe
+    # live-resource limit. Past that limit auto-keyframing stops and every
+    # CreateSnapshot replays an ever-growing revision log, so staging
+    # snapshots crept from ~0.4s to ~4-5s and inflated the source_snapshot
+    # phase of every build (build= tail p99 105s, max 183s on 0921 vs
+    # median<30 on 0919/0920). Controlled interleaved A/B confirmed the
+    # fresh ws is ~10x faster at CreateSnapshot. 15202 is RETAINED (365d)
+    # with all its archived stage dirs -- nothing deleted -- and RETIRED.
+    # tpu_staging_20260921 (qiaos/18002) is the new dedicated staging ws.
+    # Keep explicit STAGE_WS_ROOT overrides intact.
+    local _default_ws="/google/src/cloud/qiaos/tpu_staging_20260921/google3"
+    local STAGE_WS_ROOT="${STAGE_WS_ROOT:-$_default_ws}"
+    if [ "${TPU_OPERATOR:-}" = "lyy" ] || [ "${TPU_JOB_NAME_PREFIX:-}" = "lyy-" ]; then
+      if [ -z "${NPU_STAGE_WS_ROOT:-}" ] && [ "$STAGE_WS_ROOT" = "$_default_ws" ] && [ -d "/google/src/cloud/qiaos/lyyprobe_upload/google3/experimental/qiaos/eqr_jax_final_stages" ]; then
+        STAGE_WS_ROOT="/google/src/cloud/qiaos/lyyprobe_upload/google3"
+      elif [ -n "${NPU_STAGE_WS_ROOT:-}" ]; then
+        STAGE_WS_ROOT="$NPU_STAGE_WS_ROOT"
+      fi
+    fi
 
     # STAGE-SOURCE GUARD, CALL 1 OF 2 -- the EARLIEST point at which both ends
     # of the copy are known, and deliberately BEFORE the claim loop below: fail
@@ -1589,16 +1609,19 @@ print(d.get('$resume_xid',{}).get('stagedir',''))" 2>/dev/null)
     # philosophy as the stage lock). fd 201 (stage lock used 200).
     local _build_locked=0
     if [ "${TPU_SERIAL_BUILD:-1}" = "1" ]; then
-      local _build_lock="/tmp/tpu_build.host.lock"
+      local _ws_lock_key
+      _ws_lock_key=$(printf '%s' "$STAGE_WS_ROOT" | md5sum 2>/dev/null | cut -c1-8)
+      [ -n "$_ws_lock_key" ] || _ws_lock_key="host"
+      local _build_lock="/tmp/tpu_build.${_ws_lock_key}.lock"
       local _build_wait="${TPU_SERIAL_BUILD_WAIT:-1800}"
       { exec 201>"$_build_lock"; } 2>/dev/null
-      echo -e "\033[2m[$TPU_CMD_NAME queue] waiting for host build lock ($_build_lock; serial build is default, TPU_SERIAL_BUILD=0 to opt out)...\033[0m"
+      echo -e "\033[2m[$TPU_CMD_NAME queue] waiting for workspace build lock ($_build_lock for $STAGE_WS_ROOT; TPU_SERIAL_BUILD=0 to opt out)...\033[0m"
       if flock -w "$_build_wait" 201 2>/dev/null; then
         _build_locked=1
-        echo -e "\033[2m[$TPU_CMD_NAME queue] host build lock acquired; this build runs alone (serial).\033[0m"
+        echo -e "\033[2m[$TPU_CMD_NAME queue] workspace build lock acquired ($_build_lock); this workspace's build runs alone (serial).\033[0m"
       else
         _build_locked=0
-        echo -e "\033[33m[$TPU_CMD_NAME queue] host build lock busy >${_build_wait}s; proceeding in PARALLEL (degraded). Host may be under a build storm.\033[0m"
+        echo -e "\033[33m[$TPU_CMD_NAME queue] workspace build lock busy >${_build_wait}s; proceeding in PARALLEL (degraded).\033[0m"
       fi
     fi
 
@@ -2020,17 +2043,23 @@ def main():
                         if xid.isdigit():
                             # Layout differs per section (infra_check builds one
                             # table per state):
-                            #   running: XID|STATUS|NAME|RESUME|STEP|REGION|DETAILS  (7 cols)
-                            #   pending/done: XID|STATUS|NAME|RESUME|STEP|WHY        (6 cols)
-                            # Index the tail for WHY (always last); REGION only
-                            # exists on the 7-col running rows (index 5), so gate
-                            # it on the column count and leave it "" elsewhere.
+                            #   running:      XID|STATUS|NAME|RESUME|STEP|REGION|DETAILS  (7 cols)
+                            #   pending/done: XID|STATUS|NAME|RESUME|STEP|WHY            (6 cols)
+                            #   completed:    XID|STATUS|NAME|RESUME|STEP                (5 cols, no WHY)
+                            # RESUME/STEP exist in EVERY section (idx 3/4), so
+                            # gate them at >=5 -- the completed table has no WHY
+                            # column and is only 5 wide. Gating STEP at >=6 (the
+                            # old value) dropped it for every completed row and
+                            # let parts[-1] (the step) leak into WHY, so a
+                            # finished job rendered STEP='-' with its step in the
+                            # WHY slot. WHY is 6/7-col only; REGION is 7-col
+                            # (running) only.
                             status = parts[1]
                             name = parts[2]
-                            resume = parts[3] if len(parts) >= 6 else ""
-                            step = parts[4] if len(parts) >= 6 else ""
+                            resume = parts[3] if len(parts) >= 5 else ""
+                            step = parts[4] if len(parts) >= 5 else ""
                             region = parts[5] if len(parts) >= 7 else ""
-                            why = parts[-1] if len(parts) >= 4 else ""
+                            why = parts[-1] if len(parts) >= 6 else ""
                             cached_status[xid] = {"status": status, "name": name,
                                                   "why": why, "resume": resume,
                                                   "step": step, "region": region,
@@ -2349,32 +2378,47 @@ entries = raw.get('entries', raw) if isinstance(raw, dict) else raw
 if not entries:
     sys.exit(0)
 from collections import Counter
-c = Counter(e.get('state', '?') for e in entries)
+def _dstate(e):
+    # A FAILED row whose newest submission is CANCELLED was stopped on purpose
+    # with `tpu cancel` (route_lib.mark_cancelled), not a crash: show it as
+    # CANCELLED, like the board does. v1 rows have no `submissions`.
+    st = e.get('state', '?')
+    if st == 'FAILED':
+        subs = e.get('submissions') or []
+        last = subs[-1] if isinstance(subs, list) and subs else None
+        if isinstance(last, dict) and last.get('state') == 'CANCELLED':
+            return 'CANCELLED'
+    return st
+c = Counter(_dstate(e) for e in entries)
 COL = {'QUEUED': '\033[33m', 'BUILD_REQUESTED': '\033[95m', 'BUILDING': '\033[1;35m',
        'HELD': '\033[1;31m', 'BUDGET_DEFERRED': '\033[2;33m',
        'SUBMITTED': '\033[36m', 'RUNNING': '\033[32m', 'FAILED': '\033[31m',
-       'DONE': '\033[35m'}
+       'DONE': '\033[35m', 'CANCELLED': '\033[2m'}
 summary = '  '.join(f"{COL.get(k,'')}{k}:{v}\033[0m" for k, v in sorted(c.items()))
 print(f"\n\033[1;36m━━ Local Queue ━━\033[0m   {summary}")
 # Render every NON-terminal state so each count in the summary has a matching
 # row (BUILDING, BUILD_REQUESTED, HELD, BUDGET_DEFERRED, QUEUED, SUBMITTED);
 # terminal states (RUNNING/DONE/FAILED) stay collapsed into the count summary.
 _order = {'BUILDING': 0, 'BUILD_REQUESTED': 1, 'HELD': 2, 'BUDGET_DEFERRED': 3,
-          'QUEUED': 4, 'SUBMITTED': 5}
+          'QUEUED': 4, 'SUBMITTED': 5, 'FAILED': 6, 'CANCELLED': 7}
 _render_states = ('QUEUED', 'BUILD_REQUESTED', 'BUILDING', 'HELD',
-                  'BUDGET_DEFERRED', 'SUBMITTED')
-rows = [e for e in entries if e.get('state') in _render_states]
+                  'BUDGET_DEFERRED', 'SUBMITTED', 'FAILED', 'CANCELLED')
+rows = [e for e in entries if _dstate(e) in _render_states]
 # Status column auto-widens to the longest state present (BUILD_REQUESTED /
 # BUDGET_DEFERRED are 15 chars) so every row stays aligned.
-_stw = max([9] + [len(str(e.get('state', ''))) for e in rows])
-for e in sorted(rows, key=lambda e: (_order.get(e.get('state'), 9), -e.get('priority', 0))):
-    st = e.get('state', '?')
+_stw = max([9] + [len(str(_dstate(e))) for e in rows])
+# Archs column also auto-widens and is NEVER truncated: a [:10] cut once hid the
+# trailing v5p/v4 and made jobs look like they excluded v4 when they did not.
+_archs = lambda e: ','.join(e.get('allowed_archs', []) or [])
+_aw = max([10] + [len(_archs(e)) for e in rows])
+for e in sorted(rows, key=lambda e: (_order.get(_dstate(e), 9), -e.get('priority', 0))):
+    st = _dstate(e)
     disp = f"{COL.get(st,'')}{st:{_stw}s}\033[0m"
     # Show the experiment NAME (from launch_kwargs) as the primary id -- the
     # job_id is a random short hash that says nothing about which run this is.
     lk = e.get('launch_kwargs', {}) or {}
     name = (lk.get('exp_name') or lk.get('config') or str(e.get('job_id', '?')))[:30]
-    archs = ','.join(e.get('allowed_archs', []))[:10]
+    archs = _archs(e)
     why = e.get('last_reason', '') or ''
     if st == 'SUBMITTED':
         why = f"xid={e.get('xid')} {e.get('cell') or '?'} {e.get('arch') or ''}-{e.get('chips') or ''}".strip()
@@ -2388,7 +2432,7 @@ for e in sorted(rows, key=lambda e: (_order.get(e.get('state'), 9), -e.get('prio
     rr_txt = f"rr:{rr}"
     rr_col = '\033[31m' if rr >= 6 else ('\033[33m' if rr >= 3 else '\033[2m')
     rr_disp = f"{rr_col}{rr_txt}\033[0m" + ' ' * max(0, 6 - len(rr_txt))
-    print(f"  {name:30s} {disp} {str(e.get('power','')):9s} {archs:10s} {rr_disp} {why}{lock}")
+    print(f"  {name:30s} {disp} {str(e.get('power','')):9s} {archs:{_aw}s} {rr_disp} {why}{lock}")
 print("\033[2m  Full live view: tpu queue-status\033[0m")
 
 # BUILD SPEED (cache-only, same rows): the build in flight with LIVE elapsed
@@ -2411,21 +2455,15 @@ def _bbar(sec, unit=3.0, cap=40):
 _bldg = [e for e in entries if e.get('state') == 'BUILDING' and e.get('build_started_at')]
 _bdone = [e for e in entries if e.get('last_build_duration') is not None and e.get('submitted_at')]
 _bdone.sort(key=lambda e: e.get('submitted_at', 0), reverse=True)
-_brecent = _bdone[:6]
+_brecent = _bdone[:2]
 if _bldg or _brecent:
     print("\n\033[1;36m== Build speed ==\033[0m")
     for e in _bldg:
         _el = _now - e['build_started_at']
-        print(f"  \033[1;35mbuilding now\033[0m  {_bname(e):30s} {_el:5.0f}s \033[1;35m{_bbar(_el)}\033[0m")
-    if _brecent:
-        _durs = [e['last_build_duration'] for e in _brecent]
-        print(f"  \033[2mlast {len(_brecent)} build(s), newest first:\033[0m")
-        for e in _brecent:
-            _d = e['last_build_duration']
-            print(f"    {_bname(e):30s} {_d:5.0f}s \033[32m{_bbar(_d)}\033[0m")
-        _med = sorted(_durs)[len(_durs) // 2]
-        print(f"  \033[2mmedian {_med:.0f}s  range {min(_durs):.0f}-{max(_durs):.0f}s  "
-              f"(blaze floor ~40s; end-to-end incl. staging+submit is longer)\033[0m")
+        print(f"  \033[1;35mbuilding now\033[0m  \033[2m{_bname(e):30s} {_el:5.0f}s\033[0m \033[1;35m{_bbar(_el)}\033[0m")
+    for e in _brecent:
+        _d = e['last_build_duration']
+        print(f"    \033[2m{_bname(e):30s} {_d:5.0f}s\033[0m \033[32m{_bbar(_d)}\033[0m")
 LQEOF
     fi
 
@@ -2864,5 +2902,6 @@ npu() {
   # kill sqa's worker. A distinct name gives lyy an independent worker draining
   # lyy's own queue.
   local -x TPU_BUILD_WORKER_SESSION="${NPU_BUILD_WORKER_SESSION:-npu-build-worker}"
+  local -x STAGE_WS_ROOT="${NPU_STAGE_WS_ROOT:-/google/src/cloud/qiaos/lyyprobe_upload/google3}"
   tpu "$@"
 }

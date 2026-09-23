@@ -306,6 +306,13 @@ def publish(source: str, parent: str, rel_prefix: str,
   if not os.path.isdir(source):
     raise StageError('[[STAGE_SRC_MISSING]]', f'source not a dir: {source}')
   if not os.path.isdir(parent):
+    g3_root = parent.split('/experimental/')[0] if '/experimental/' in parent else ''
+    if g3_root and os.path.isdir(g3_root):
+      try:
+        os.makedirs(parent, exist_ok=True)
+      except OSError:
+        pass
+  if not os.path.isdir(parent):
     raise StageError('[[STAGE_PARENT_MISSING]]', f'parent not a dir: {parent}')
 
   rnd = _rand or (lambda: '%06x' % random.randrange(16**6))

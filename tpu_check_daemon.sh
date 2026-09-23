@@ -532,7 +532,22 @@ if os.path.exists(mapping_file):
                         info['status'] = 'FAILED'
                         info['error'] = 'Resource Exhausted (Topology/Quota)'
                         changed = True
-                    elif 'FAILED' in content and 'Preempted' not in content:
+                    elif 'Preempted' not in content and any(
+                            'FAILED' in ln and 'Census view failed to add' not in ln
+                            for ln in content.splitlines()):
+                        # DO NOT match 'FAILED' against the whole launch log:
+                        # every job's log carries one benign line --
+                        #   rpc-stats.cc] ... Census view failed to add
+                        #   FAILED_PRECONDITION: Census is not enabled.
+                        # -- which made this branch fire on EVERY job, healthy
+                        # or dead (a job confirmed running at step 37000 was
+                        # flagged FAILED by it). Real launch-time failures
+                        # (RESOURCE_EXHAUSTED, SLICE_DEFRAGMENTATION) are caught
+                        # by the branches above; a runtime death lands in CNS
+                        # logs, not here, and is reconciled by the board
+                        # write-back below. So scan line by line and ignore the
+                        # one known-benign Census line, keeping the ability to
+                        # catch any other genuine FAILED line.
                         info['status'] = 'FAILED'
                         info['error'] = 'Unknown failure in XManager logs'
                         changed = True
@@ -548,6 +563,22 @@ if os.path.exists(mapping_file):
             c_status = c_info.get('status', '').lower()
             if 'failed' in c_status and info.get('status') != 'FAILED':
                 info['status'] = 'FAILED'
+                changed = True
+            # SUCCESS WRITE-BACK (symmetric to the FAILED branch above). The
+            # board's `completed` verdict is XM-truth: infra_check emits it only
+            # when every work unit is terminal with NO running/pending/failed WU
+            # (see infra_check.py table_completed). Without this branch a job
+            # that RAN TO COMPLETION was never advanced past whatever status the
+            # log-parse heuristic last wrote -- typically SUBMITTED, since
+            # `All work units started` had not yet appeared when it was polled
+            # -- so the registry (and google-job-info's `store` block, which
+            # mirrors it) showed SUBMITTED forever while the board said done.
+            # Match ONLY `completed`, never `stopped` (manual/ambiguous halt),
+            # and let it override a stale heuristic FAILED (real XM WU state
+            # wins over a launch-log substring), but never a deliberate CANCELLED.
+            elif 'completed' in c_status and info.get('status') not in ('COMPLETED', 'CANCELLED'):
+                info['status'] = 'COMPLETED'
+                info['error'] = ''
                 changed = True
                 
             why = c_info.get('why') or info.get('error') or ''

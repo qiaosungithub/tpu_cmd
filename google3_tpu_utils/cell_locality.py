@@ -124,6 +124,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'el-d':        ('grq', 'eu', 'grq'),
     'en':          ('grq', 'eu', 'grq'),
     'eq':          ('grq', 'eu', 'grq'),
+    'er':          ('grq', 'eu', 'grq'),
     'lclhrb':      ('lhr', 'eu', 'mrd'),
     'sv':          ('lhr', 'eu', 'srl'),
     'yulhrp':      ('lhr', 'eu', 'wxt'),
