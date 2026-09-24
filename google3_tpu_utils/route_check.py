@@ -246,11 +246,11 @@ _REROUTE_AFTER_S = flags.DEFINE_float(
     'reroute_after_s', 300.0, 'A SUBMITTED job still PENDING this many seconds '
     'after submit is cancelled and re-routed (operator default: 5 min).')
 _COOLDOWN_S = flags.DEFINE_float(
-    'cooldown_s', 7200.0, 'After a re-route, cool the stuck cell AND the arch '
+    'cooldown_s', 7200.0, 'After a re-route, cool the stuck (cell, arch) pair '
     'for this long (operator 2026-09-10: 30min -> 2h). The old 30min window '
     'expired before the backlogged serial build-worker re-dispatched the job, '
     'so the penalty read as gone at the moment it should have applied. Feeds '
-    'both cooldown_cells (decaying) and cooldown_archs (flat, stacking).')
+    'cooldown_pairs (operator 2026-09-23).')
 _CONFIRM_GAP_S = flags.DEFINE_float(
     'reroute_confirm_gap_s', 15.0, 'Before cancelling a PENDING job, wait this '
     'long and re-probe; only cancel if STILL pending. Clears BATCH shadow-WU '
@@ -2404,7 +2404,7 @@ def run_reroute(
           restart_evidence=restart_evidence, auto_resume_max=auto_resume_max,
           record_evict=False,
           dry_reason=f'{tag}: PENDING x2, no fresh output',
-          ok_reason=(f'[reroute] cancelled + re-queued {tag}; cell cooled '
+          ok_reason=(f'[reroute] cancelled + re-queued {tag}; cell|arch cooled '
                      f'{int(cooldown_s)}s'),
           fail_prefix=f'[reroute] cancel FAILED for {tag}, left SUBMITTED.',
           persist_fn=persist_fn)
@@ -2472,7 +2472,7 @@ def run_reroute(
               auto_resume_max=auto_resume_max,
               record_evict=True,  # thrash: blame the cell that evicted it
               dry_reason=f'{tag}: {why}',
-              ok_reason=(f'[reroute] cancelled + re-queued {tag}: {why}; cell '
+              ok_reason=(f'[reroute] cancelled + re-queued {tag}: {why}; cell|arch '
                          f'cooled {int(cooldown_s)}s, eviction strike recorded'),
               fail_prefix=(f'[reroute] cancel FAILED for thrashing {tag}, left '
                            f'as-is.'),
@@ -2527,7 +2527,7 @@ def run_reroute(
           record_evict=False,
           dry_reason=f'{tag}: {stuck_why}',
           ok_reason=(f'[reroute] cancelled + re-queued {tag}: nominally RUNNING '
-                     f'({stuck_why}); cell cooled {int(cooldown_s)}s'),
+                     f'({stuck_why}); cell|arch cooled {int(cooldown_s)}s'),
           fail_prefix=(f'[reroute] cancel FAILED for nominally-RUNNING {tag}, '
                        f'left as-is.'),
           persist_fn=persist_fn)

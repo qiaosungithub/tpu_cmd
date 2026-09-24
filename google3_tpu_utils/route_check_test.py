@@ -552,7 +552,7 @@ class RunRerouteTest(unittest.TestCase):
     self.assertEqual(sub.cancels, ['111'])               # cancelled
     self.assertEqual(e.state, R.JobState.QUEUED)         # back to queue
     self.assertIsNone(e.xid)
-    self.assertGreater(e.cooldown_cells.get('yulpptr', 0), 700.0)  # cell cooled
+    self.assertGreater(e.cooldown_pairs.get('yulpptr|v7', {}).get('until', 0), 700.0)  # cell cooled
 
   def test_dry_run_does_not_cancel(self):
     e = _submitted('j1', '111', 'yulpptr', submitted_at=0.0)
@@ -782,8 +782,8 @@ class InplaceRerouteTest(unittest.TestCase):
     self.assertEqual(sub.cancels, ['111'])               # cancelled
     self.assertEqual(e.state, R.JobState.QUEUED)         # back to the auction
     self.assertIsNone(e.xid)
-    self.assertEqual(e.evictions['ej']['strikes'], 1)    # cell blamed
-    self.assertGreater(e.cooldown_cells.get('ej', 0), 4000.0)
+    self.assertEqual(e.evictions['ej|v7']['strikes'], 1)    # cell blamed
+    self.assertGreater(e.cooldown_pairs.get('ej|v7', {}).get('until', 0), 4000.0)
     self.assertTrue(any('in-place preemption thrash' in l for l in log))
     self.assertTrue(any('eviction strike recorded' in l for l in log))
 
@@ -2233,7 +2233,7 @@ class NominalRunningRerouteTest(unittest.TestCase):
     self.assertEqual(sub.cancels, ['111'])              # the 12-hour case acts
     self.assertEqual(e.state, R.JobState.QUEUED)
     self.assertIsNone(e.xid)
-    self.assertGreater(e.cooldown_cells.get('sj', 0), 7200.0)
+    self.assertGreater(e.cooldown_pairs.get('sj|v7', {}).get('until', 0), 7200.0)
     self.assertTrue(any('nominally RUNNING' in l for l in log))
     self.assertEqual(borg.calls, ['j1'])                # Borg was consulted
 
@@ -2844,7 +2844,7 @@ class RerouteWarmRestartTest(unittest.TestCase):
     self.assertIsNone(e.xid)                             # dead xid superseded
     self.assertEqual(e.launch_kwargs['load_from'], self._TORCH_CKPT)
     self.assertEqual(e.auto_resumes, 1)                 # budget consumed
-    self.assertGreater(e.cooldown_cells.get('yutulpz', 0), 700.0)  # cell cooled
+    self.assertGreater(e.cooldown_pairs.get('yutulpz|v7', {}).get('until', 0), 700.0)  # cell cooled
 
   def test_pending_no_checkpoint_cold_starts(self):
     e, sub, log = self._run_pending(_FakeRestartEvidence({'111': (None, None)}))
@@ -2852,7 +2852,7 @@ class RerouteWarmRestartTest(unittest.TestCase):
     self.assertEqual(e.state, R.JobState.QUEUED)
     self.assertNotIn('load_from', e.launch_kwargs)      # cold: nothing to resume
     self.assertEqual(e.auto_resumes, 0)
-    self.assertGreater(e.cooldown_cells.get('yutulpz', 0), 700.0)
+    self.assertGreater(e.cooldown_pairs.get('yutulpz|v7', {}).get('until', 0), 700.0)
 
   # ===== site (a): in-place thrash =====
   def test_thrash_with_checkpoint_warm_restarts_and_keeps_eviction_strike(self):
@@ -2864,8 +2864,8 @@ class RerouteWarmRestartTest(unittest.TestCase):
     # THE STRIKE + COOLDOWN MUST SURVIVE the warm restart (spec item #3): the
     # whole point of pulling a thrashing job off a cell is that the next
     # placement avoids it.
-    self.assertEqual(e.evictions['ej']['strikes'], 1)
-    self.assertGreater(e.cooldown_cells.get('ej', 0), 4000.0)
+    self.assertEqual(e.evictions['ej|v7']['strikes'], 1)
+    self.assertGreater(e.cooldown_pairs.get('ej|v7', {}).get('until', 0), 4000.0)
     self.assertTrue(any('eviction strike recorded' in l for l in log))
     self.assertTrue(any('WARM-restart from' in l for l in log))
 
@@ -2874,7 +2874,7 @@ class RerouteWarmRestartTest(unittest.TestCase):
     self.assertEqual(sub.cancels, ['111'])
     self.assertEqual(e.state, R.JobState.QUEUED)
     self.assertNotIn('load_from', e.launch_kwargs)
-    self.assertEqual(e.evictions['ej']['strikes'], 1)   # strike still recorded
+    self.assertEqual(e.evictions['ej|v7']['strikes'], 1)   # strike still recorded
 
   # ===== site (c): nominally RUNNING =====
   def test_nominal_running_with_checkpoint_warm_restarts(self):
@@ -3102,6 +3102,404 @@ class RequeueReasonTest(unittest.TestCase):
     outcome, _, _, row = self._run(full)
     self.assertEqual(outcome, 'requeued')
     self.assertEqual(row.last_reason, 'waiting: v7-32: no free slice')
+
+
+# ---------------------------------------------------------------------------
+# The group gates (operator 2026-09-23: "和对tpu type / cell做冷却时一样的逻辑，再次
+# 之外加一个'g5能不能用'的判断，如果不能就不route到g5"): the checker-cache parsers
+# behind "can this pool hold the job", the dispatch gate itself, and the
+# reconcile guard that stops a mid-build row from being auto-resumed twice.
+
+_BOX = '\u2502'
+
+
+def _quota_row(tier: str, label: str, quota: str, used: str) -> str:
+  """One data row of a quota_check table, ANSI-coloured like the real cache."""
+  cells = [f' \x1b[1m{tier}\x1b[0m ' if tier else '      ', f' {label} ',
+           f' {quota} ', f' {used} ', ' \x1b[31m0\x1b[0m ',
+           ' \x1b[32m1,000\x1b[0m ']
+  return _BOX + _BOX.join(cells) + _BOX
+
+
+def _money_row(group: str, income: str, balance: str) -> str:
+  """One row of money_check's groups table, ANSI-coloured like the real cache."""
+  cells = [f'\x1b[1;33m {group}  \x1b[0m', ' 0.0 ', ' 0.0 ',
+           f' \x1b[1;32m{income}\x1b[0m ', f' {balance} ']
+  return _BOX + _BOX.join(cells) + _BOX
+
+
+_G5_QUOTA_TXT = '\n'.join([
+    '\x1b[3m   [G5] group:deepmind-dynamic/vqfree-xm   \x1b[0m',
+    '\u250f\u2501\u2501\u2533\u2501\u2501\u2513',
+    '\u2503 Tier \u2503 TPU Type \u2503 Quota \u2503 Used \u2503 Available \u2503',
+    _quota_row('PROD', 'GPU A100-40G', '0', '0'),
+    _quota_row('', 'GPU B200', '8 ~', '32'),
+    _quota_row('', 'GPU H100', '48', '48'),
+    _quota_row('', 'TPU v5e Pod', '0', '0'),
+    _quota_row('', 'TPU v7', '0', '0'),
+    _quota_row('BATCH', 'TPU v6e', '0', '64'),
+    _quota_row('', 'TPU v4', '0', '16'),
+    '\u2514\u2500\u2500\u2534\u2500\u2500\u2518',
+    "Quota = your alloc's guaranteed floor (chips).",
+])
+
+_G3_QUOTA_TXT = '\n'.join([
+    _quota_row('PROD', 'GPU H100', '0', '0'),
+    _quota_row('', 'TPU v7', '0', '0'),
+])
+
+_MONEY_TXT = '\n'.join([
+    'MDB Groups Money (Bidding Power)',
+    _money_row('G1', '20.0 Credits/hr', '\x1b[2mn/a (static pool)\x1b[0m'),
+    _money_row('G2', '0.0 (Static Pool)', 'n/a (static pool)'),
+    _money_row('G3', '166.0 Credits/hr', '55,996'),
+    _money_row('G5', '47.0 Credits/hr', '\x1b[32m24\x1b[0m'),
+    _money_row('G9', '37194.0 Credits/hr', '2,811,843'),
+    # A row of the market table further down the same file: never a group.
+    _BOX + _BOX.join([' TPU v7 ', ' PROD ', ' 31.05 Credits/hr ', ' 45 ',
+                      ' dear x ']) + _BOX,
+])
+
+_MARKET_CACHE = {
+    'prices': {
+        'deepmind-dynamic-pool|70|PROD': {'global': 0.5},
+        'deepmind-dynamic-pool|87|PROD': {'global': 2.0},
+        'deepmind-dynamic-pool|101|PROD': {'global': 30.0},
+    },
+    'limit_orders': {
+        'deepmind-dynamic-pool|vqfree-xm|76|PROD': {'cap': 10.0, 'user': 'x'},
+        'deepmind-dynamic-pool|vqfree-xm|101|PROD': {'cap': 45.0, 'user': 'x'},
+        'deepmind-dynamic-pool|vqfree-xm|60|PROD': {'cap': 4.4, 'user': 'x'},
+        'deepmind-dynamic-pool|vqfree-xm|76|BATCH': {'cap': 1.0, 'user': 'x'},
+        'deepmind-dynamic-pool|fr-dna-grand-challenge-team-resource|76|PROD':
+            {'cap': 22.0, 'user': 'y'},
+    },
+}
+
+
+class GroupCapacityCacheTest(unittest.TestCase):
+  """The checker caches behind the 'can this pool hold the job' gate."""
+
+  def setUp(self):
+    td = tempfile.TemporaryDirectory()
+    self.addCleanup(td.cleanup)
+    self.dir = td.name
+
+  def _write(self, name: str, text: str, mtime: float) -> None:
+    p = os.path.join(self.dir, name)
+    with open(p, 'w') as f:
+      f.write(text)
+    os.utime(p, (mtime, mtime))
+
+  def _seed(self, quota: str = _G5_QUOTA_TXT, group: str = '5') -> None:
+    self._write(f'g{group}.txt', quota, 1000.0)
+    self._write('money.txt', _MONEY_TXT, 1050.0)
+    self._write('market.json', json.dumps(_MARKET_CACHE), 1090.0)
+
+  def test_parse_quota_reads_prod_rows_only(self):
+    floor, used = RC.parse_group_quota(_G5_QUOTA_TXT)
+    # Continuation rows inherit PROD; 'TPU v5e Pod' is no router family; the
+    # BATCH block (and its continuation row) is not a floor.
+    self.assertEqual(floor, {'a100': 0.0, 'b200': 8.0, 'h100': 48.0, 'v7': 0.0})
+    self.assertEqual(used, {'a100': 0.0, 'b200': 32.0, 'h100': 48.0, 'v7': 0.0})
+
+  def test_parse_quota_empty(self):
+    self.assertEqual(RC.parse_group_quota(''), ({}, {}))
+
+  def test_parse_money(self):
+    self.assertEqual(RC.parse_group_money(_MONEY_TXT, '5'), (47.0, 24.0))
+    self.assertEqual(RC.parse_group_money(_MONEY_TXT, '3'), (166.0, 55996.0))
+    self.assertEqual(RC.parse_group_money(_MONEY_TXT, '9'),
+                     (37194.0, 2811843.0))
+
+  def test_parse_money_unreadable_balance_reads_zero(self):
+    # money_check prints 'n/a (static pool)' also for a DYNAMIC pool at 0.
+    self.assertEqual(RC.parse_group_money(_MONEY_TXT, '1'), (20.0, 0.0))
+    self.assertEqual(RC.parse_group_money(_MONEY_TXT, '2'), (None, 0.0))
+    self.assertEqual(RC.parse_group_money(_MONEY_TXT, '7'), (None, 0.0))
+
+  def test_load_group_capacity(self):
+    self._seed()
+    cap = RC.load_group_capacity('5', cache_dir=self.dir, now=1100.0)
+    assert cap is not None
+    self.assertEqual(cap.group, '5')
+    self.assertEqual(cap.floor['h100'], 48.0)
+    self.assertEqual(cap.used['b200'], 32.0)
+    self.assertEqual(cap.balance, 24.0)
+    # Only vqfree-xm's own PROD orders on router families.
+    self.assertEqual(cap.limit_caps, {'v6e': 10.0, 'v7': 45.0})
+    self.assertEqual(cap.prices, {'h100': 0.5, 'b200': 2.0, 'v7': 30.0})
+    self.assertEqual(cap.above_floor_burn, 48.0)   # (32 - 8) b200 x 2.0
+    self.assertEqual(cap.age_s, 100.0)             # the OLDEST file counts
+
+  def test_missing_or_corrupt_cache_is_none(self):
+    self._seed()
+    os.remove(os.path.join(self.dir, 'money.txt'))
+    self.assertIsNone(RC.load_group_capacity('5', cache_dir=self.dir, now=1100.0))
+    self._seed()
+    self._write('market.json', '{not json', 1090.0)
+    self.assertIsNone(RC.load_group_capacity('5', cache_dir=self.dir, now=1100.0))
+
+  def test_quota_table_without_prod_rows_is_none(self):
+    self._seed(quota='[G5] checker degraded\n')
+    self.assertIsNone(RC.load_group_capacity('5', cache_dir=self.dir, now=1100.0))
+
+  def test_the_caches_feed_the_gate(self):
+    # The 2026-09-23 picture: g5 floor full and ~0 balance -> refused; g3 with
+    # no floor but 56k balance -> admitted above floor; stale data -> refused.
+    self._seed()
+    self._seed(quota=_G3_QUOTA_TXT, group='3')
+    g5 = RC.load_group_capacity('5', cache_dir=self.dir, now=1100.0)
+    g3 = RC.load_group_capacity('3', cache_dir=self.dir, now=1100.0)
+    self.assertFalse(R.group_can_hold(g5, 'h100', 8, 0.5).ok)
+    v = R.group_can_hold(g3, 'h100', 8, 0.5)
+    self.assertTrue(v.ok)
+    self.assertTrue(v.above_floor)
+    stale = RC.load_group_capacity('3', cache_dir=self.dir, now=3100.0)
+    self.assertFalse(R.group_can_hold(stale, 'h100', 8, 0.5).ok)
+
+
+def _gate_cap(group: str, floor: Optional[dict] = None,
+              used: Optional[dict] = None, balance: float = 0.0,
+              burn: float = 0.0) -> R.GroupCapacity:
+  return R.GroupCapacity(group=group, floor=dict(floor or {}),
+                         used=dict(used or {}), balance=balance,
+                         above_floor_burn=burn, limit_caps={}, age_s=5.0,
+                         prices={'h100': 0.5, 'v7': 30.0})
+
+
+# g5 as measured 2026-09-23 ~22:15Z: H100 floor full, B200 above floor, ~0 balance.
+_G5_FULL = _gate_cap('5', floor={'h100': 48}, used={'h100': 48}, balance=24.0,
+                     burn=48.0)
+_G5_ROOM16 = _gate_cap('5', floor={'h100': 48}, used={'h100': 32})
+_G3_RICH = _gate_cap('3', balance=55996.0)
+_G3_BROKE = _gate_cap('3', balance=0.0)
+
+
+class DispatchGroupGateTest(unittest.TestCase):
+  """run_dispatch_once's two group gates in front of every NON-FALLBACK pool of
+  the 5,3,9 preference order: this job's group cooldown, then 'can the pool
+  hold it'. The fallback (g9) is never gated, so a gate only moves a job on."""
+
+  def setUp(self):
+    self.path = tempfile.mkstemp(suffix='.json')[1]
+    self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+    lock = self.path + '.lock'
+    self.addCleanup(lambda: os.path.exists(lock) and os.remove(lock))
+    self.cap_calls: list = []
+
+  @staticmethod
+  def _seam(tpu_type, tier='PROD', lo='', group=''):
+    exempt = group in ('3', '5')
+    return {'income': 1000.0, 'bar': 100.0, 'current': 0.0, 'headroom': 1000.0,
+            'new_cost': 0.0 if exempt else 10.0, 'exempt': exempt, 'fits': True}
+
+  def _q(self, jid: str, arch: str = 'h100', chips: int = 8,
+         priority: int = 0) -> R.QueueEntry:
+    e = _entry(jid, power=f'{arch}-{chips}', archs=(arch,))
+    e.state = R.JobState.QUEUED
+    e.arch, e.chips, e.priority = arch, chips, priority
+    return e
+
+  def _run(self, entries, caps: Optional[dict] = None,
+           group_order: Optional[list] = None, now: float = 1000.0,
+           gated: bool = True):
+    RC.save_queue(self.path, entries)
+
+    def cap_fn(g: str) -> Optional[R.GroupCapacity]:
+      self.cap_calls.append(g)
+      c = (caps or {}).get(g)
+      if isinstance(c, Exception):
+        raise c
+      return c
+
+    _, log = RC.run_dispatch_once(
+        self.path, now=now, budget_query_fn=self._seam, dry_run=False,
+        group_order=group_order or ['5', '3', '9'],
+        group_capacity_fn=cap_fn if gated else None)
+    return {e.job_id: e for e in RC.load_queue(self.path)}, log
+
+  def test_full_g5_sends_the_job_to_g3(self):
+    rows, log = self._run([self._q('a')], {'5': _G5_FULL, '3': _G3_RICH})
+    self.assertEqual(rows['a'].state, R.JobState.BUILD_REQUESTED)
+    self.assertEqual(rows['a'].group, '3')
+    line = [l for l in log if 'a -> group g3' in l]
+    self.assertEqual(len(line), 1)
+    self.assertIn('skipped g5: no h100 floor room', line[0])
+
+  def test_g5_with_floor_room_still_wins(self):
+    rows, log = self._run([self._q('a')], {'5': _G5_ROOM16, '3': _G3_RICH})
+    self.assertEqual(rows['a'].group, '5')
+    self.assertTrue(any('floor room 16' in l for l in log
+                        if 'a -> group g5' in l))
+
+  def test_both_preferred_pools_refused_falls_back_to_g9(self):
+    rows, log = self._run([self._q('a')], {'5': _G5_FULL, '3': _G3_BROKE})
+    self.assertEqual(rows['a'].state, R.JobState.BUILD_REQUESTED)
+    self.assertEqual(rows['a'].group, '9')
+    line = [l for l in log if 'a -> group g9' in l]
+    self.assertEqual(len(line), 1)
+    self.assertIn('g5:', line[0])
+    self.assertIn('g3:', line[0])
+
+  def test_the_fallback_is_never_gated(self):
+    rows, _ = self._run([self._q('a')], {}, group_order=['5', '9'])
+    self.assertEqual(rows['a'].state, R.JobState.BUILD_REQUESTED)
+    self.assertEqual(rows['a'].group, '9')
+    self.assertNotIn('9', self.cap_calls)
+
+  def test_no_data_fails_closed(self):
+    rows, log = self._run([self._q('a')], {'5': None, '3': _G3_RICH})
+    self.assertEqual(rows['a'].group, '3')
+    self.assertTrue(any('no capacity data' in l for l in log))
+
+  def test_loader_exception_fails_closed(self):
+    rows, _ = self._run([self._q('a')],
+                        {'5': RuntimeError('cache read blew up'),
+                         '3': _G3_RICH})
+    self.assertEqual(rows['a'].group, '3')
+
+  def test_gate_exception_fails_closed_and_the_round_completes(self):
+    with mock.patch.object(R, 'group_can_hold', side_effect=ValueError('bug')):
+      rows, log = self._run([self._q('a'), self._q('b')],
+                            {'5': _G5_ROOM16, '3': _G3_RICH})
+    self.assertEqual(rows['a'].group, '9')
+    self.assertEqual(rows['b'].group, '9')
+    self.assertEqual(rows['b'].state, R.JobState.BUILD_REQUESTED)
+    self.assertTrue(any('capacity gate error' in l for l in log))
+
+  def test_capacity_is_loaded_once_per_group_per_round(self):
+    self._run([self._q('a'), self._q('b'), self._q('c')],
+              {'5': _G5_FULL, '3': _G3_RICH})
+    self.assertEqual(sorted(self.cap_calls), ['3', '5'])
+
+  def test_a_cooling_group_is_skipped_even_with_room(self):
+    a = self._q('a')
+    a.cooldown_groups = {'5': {'until': 1500.0, 'strikes': 2}}
+    rows, log = self._run([a], {'5': _G5_ROOM16, '3': _G3_RICH}, now=1000.0)
+    self.assertEqual(rows['a'].group, '3')
+    self.assertTrue(any('g5 cooling for this job (500s left, strike 2)' in l
+                        for l in log))
+
+  def test_an_expired_cooldown_no_longer_skips(self):
+    a = self._q('a')
+    a.cooldown_groups = {'5': {'until': 999.0, 'strikes': 3}}
+    rows, _ = self._run([a], {'5': _G5_ROOM16, '3': _G3_RICH}, now=1000.0)
+    self.assertEqual(rows['a'].group, '5')
+
+  def test_the_cooldown_gate_works_without_capacity_data(self):
+    a = self._q('a')
+    a.cooldown_groups = {'5': {'until': 1500.0, 'strikes': 1}}
+    rows, _ = self._run([a, self._q('b')], gated=False, now=1000.0)
+    self.assertEqual(rows['a'].group, '3')
+    self.assertEqual(rows['b'].group, '5')
+    self.assertEqual(self.cap_calls, [])
+
+  def test_a_pin_bypasses_both_gates(self):
+    a = self._q('a')
+    a.pin_group = '5'
+    a.cooldown_groups = {'5': {'until': 1500.0, 'strikes': 1}}
+    rows, log = self._run([a], {'5': _G5_FULL, '3': _G3_RICH}, now=1000.0)
+    self.assertEqual(rows['a'].group, '5')
+    self.assertEqual(self.cap_calls, [])
+    self.assertTrue(any('PINNED by caller' in l for l in log))
+
+  def test_floor_room_is_shared_out_by_priority(self):
+    jobs = [self._q('lo', priority=1), self._q('hi', priority=3),
+            self._q('mid', priority=2)]
+    rows, _ = self._run(jobs, {'5': _G5_ROOM16, '3': _G3_RICH})
+    self.assertEqual(rows['hi'].group, '5')
+    self.assertEqual(rows['mid'].group, '5')
+    self.assertEqual(rows['lo'].group, '3')
+
+  def test_submitted_rows_count_against_floor_room(self):
+    s = self._q('s')
+    s.state = R.JobState.SUBMITTED
+    s.group = '5'
+    rows, _ = self._run([s, self._q('a', priority=2), self._q('b', priority=1)],
+                        {'5': _G5_ROOM16, '3': _G3_RICH})
+    self.assertEqual(rows['a'].group, '5')
+    self.assertEqual(rows['b'].group, '3')
+    self.assertEqual(rows['s'].state, R.JobState.SUBMITTED)
+
+  def test_a_pinned_job_takes_floor_room_too(self):
+    p = self._q('p', priority=9)
+    p.pin_group = '5'
+    rows, _ = self._run([p, self._q('a', priority=2), self._q('b', priority=1)],
+                        {'5': _G5_ROOM16, '3': _G3_RICH})
+    self.assertEqual(rows['p'].group, '5')
+    self.assertEqual(rows['a'].group, '5')
+    self.assertEqual(rows['b'].group, '3')
+
+  def test_the_balance_gate_prices_at_market_when_no_placement(self):
+    # v7-32 with no provider: no cell price, so g3's market v7 price (30) is
+    # used: need = reserve hours x 32 chips x 30.
+    need = R.GROUP_BALANCE_RESERVE_H * 32 * 30.0
+    def job() -> R.QueueEntry:
+      return self._q('a', arch='v7', chips=32)
+    rows, _ = self._run([job()],
+                        {'5': None, '3': _gate_cap('3', balance=need - 1.0)})
+    self.assertEqual(rows['a'].group, '9')
+    rows, _ = self._run([job()],
+                        {'5': None, '3': _gate_cap('3', balance=need)})
+    self.assertEqual(rows['a'].group, '3')
+
+  def test_the_worker_loop_wires_the_real_loader(self):
+    import inspect  # pylint: disable=g-import-not-at-top
+    params = inspect.signature(RC.run_dispatch_worker_loop).parameters
+    self.assertIs(params['group_capacity_fn'].default, RC.load_group_capacity)
+
+
+class ReconcileBuildingGuardTest(unittest.TestCase):
+  """A BUILDING row whose newest submission already ENDED still reports that
+  old attempt's xid. Reconcile must not judge the build in progress by it: on
+  2026-09-23 20260923T003437-cc68d736fe was declared a zombie mid-build (its
+  previous xid was TERMINAL) and auto-resumed as a second copy of the run."""
+
+  @staticmethod
+  def _building(sub_state: str, xid: str = '111') -> R.QueueEntry:
+    e = _entry('b1')
+    e.state = R.JobState.BUILDING
+    e.submissions = [R.Submission(seq=1, xid=xid, state=sub_state,
+                                  cell='yulpptr', arch='v7', chips=32,
+                                  group='5', created_at=0.0)]
+    return e
+
+  def test_an_ended_attempt_is_left_alone_and_never_resumed(self):
+    e = self._building('FAILED')
+    ev = _FakeRestartEvidence({'111': (False, '/cns/x/ckpt/step_1000')})
+    out, log = RC.run_reconcile(
+        [e], now=5000.0, probe=_FakeProbe({'111': RC.STATUS_TERMINAL}),
+        dry_run=False, auto_resume_pruned=True, restart_evidence=ev)
+    self.assertEqual(e.state, R.JobState.BUILDING)
+    self.assertEqual([x.job_id for x in out], ['b1'])   # no restart row added
+    self.assertEqual(ev.calls, [])
+    self.assertTrue(any('left alone until the build binds' in l for l in log))
+    self.assertTrue(any('0 zombie->FAILED' in l for l in log))
+
+  def test_a_completed_old_attempt_does_not_mark_the_build_done(self):
+    e = self._building('DONE')
+    RC.run_reconcile([e], now=5000.0,
+                     probe=_FakeProbe({'111': RC.STATUS_COMPLETED}),
+                     dry_run=False)
+    self.assertEqual(e.state, R.JobState.BUILDING)
+
+  def test_dry_run_proposes_nothing(self):
+    e = self._building('FAILED')
+    _, log = RC.run_reconcile([e], now=5000.0,
+                              probe=_FakeProbe({'111': RC.STATUS_TERMINAL}),
+                              dry_run=True)
+    self.assertFalse(any('would set' in l for l in log))
+    self.assertEqual(e.state, R.JobState.BUILDING)
+
+  def test_negative_control_a_bound_new_attempt_is_still_reconciled(self):
+    # Once the build has bound its NEW experiment (a live CREATING record), the
+    # row is judged by that attempt exactly as before.
+    e = self._building('CREATING', xid='222')
+    RC.run_reconcile([e], now=5000.0,
+                     probe=_FakeProbe({'222': RC.STATUS_TERMINAL}),
+                     dry_run=False)
+    self.assertEqual(e.state, R.JobState.FAILED)
 
 
 if __name__ == '__main__':

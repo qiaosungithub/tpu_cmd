@@ -192,7 +192,7 @@ class PlacementTest(unittest.TestCase):
     Consequence, asserted here: a much better cell still wins WHILE cooling.
     """
     e = _entry()
-    e.cooldown_cells = {'hot': 100.0}
+    e.cooldown_pairs = {'hot|v7': {'until': 100.0, 'strikes': 1}}
     avail = {
         'hot': _avail('hot', 'v7', free=3200),
         'cool': _avail('cool', 'v7', free=64),
@@ -210,7 +210,7 @@ class PlacementTest(unittest.TestCase):
     ignored' and both tests would still pass.
     """
     e = _entry()
-    e.cooldown_cells = {'hot': 100.0}
+    e.cooldown_pairs = {'hot|v7': {'until': 100.0, 'strikes': 1}}
     avail = {
         'hot': _avail('hot', 'v7', free=64),
         'cool': _avail('cool', 'v7', free=64),
@@ -305,7 +305,9 @@ class RerouteTest(unittest.TestCase):
     R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
     self.assertEqual(e.state, R.JobState.QUEUED)
     self.assertIsNone(e.xid)
-    self.assertGreater(e.cooldown_cells['yulpptr'], 700.0)
+    # e.arch was never set, so the cell is blamed under every accepted arch.
+    self.assertEqual(e.cooldown_pairs,
+                     {'yulpptr|v7': {'until': 700.0 + 1800.0, 'strikes': 1}})
     # ★A re-route is NOT a build failure: `attempts` feeds the 3-strikes brake
     # that parks a row HELD, so bumping it here parked healthy jobs that the
     # router had merely moved between oversold cells (infra-v17, measured on
@@ -357,8 +359,9 @@ class RerouteTest(unittest.TestCase):
     e = _entry(power='h100-8', archs=('h100', 'b200'))
     e.state = R.JobState.SUBMITTED
     e.cell = 'sj'
+    e.arch = 'b200'
     e.submitted_at = 0.0
-    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)   # cools sj
+    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)   # cools sj|b200
     # Prices under each family's limit-order cap (h100<=10, b200<=20) so the
     # price-cap gate is not what decides this test -- the cooldown fallthrough is.
     avail = {
@@ -376,9 +379,10 @@ class RerouteTest(unittest.TestCase):
     e = _entry(power='h100-8', archs=('h100', 'b200'))
     e.state = R.JobState.SUBMITTED
     e.cell = 'sj'
+    e.arch = 'b200'
     e.submitted_at = 0.0
-    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)   # cools sj
-    e.cooldown_cells['sh'] = 2500.0                    # sh also cooling
+    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)   # cools sj|b200
+    e.cooldown_pairs['sh|h100'] = {'until': 2500.0, 'strikes': 1}  # h100 too
     avail = {
         'sj': _avail('sj', 'b200', free=1024, price=8.0),
         'sh': _avail('sh', 'h100', free=1024, price=8.0),
@@ -451,20 +455,35 @@ class InplaceRerouteDecisionTest(unittest.TestCase):
     self.assertFalse(R.decide_inplace_reroute('RUNNING', 4, threshold=5))
     self.assertTrue(R.decide_inplace_reroute('RUNNING', 5, threshold=5))
 
-  def test_record_eviction_stamps_current_cell(self):
+  def test_record_eviction_stamps_current_pair(self):
     e = _entry()
     e.cell = 'ej'
+    e.arch = 'v7'
     R.record_eviction(e, now=1000.0)
-    self.assertEqual(e.evictions['ej']['strikes'], 1)
-    self.assertEqual(e.evictions['ej']['last'], 1000.0)
+    self.assertEqual(e.evictions, {'ej|v7': {'strikes': 1, 'last': 1000.0}})
 
   def test_record_eviction_accumulates_strikes(self):
     e = _entry()
     e.cell = 'ej'
+    e.arch = 'v7'
     R.record_eviction(e, now=1000.0)
     R.record_eviction(e, now=2000.0)
-    self.assertEqual(e.evictions['ej']['strikes'], 2)
-    self.assertEqual(e.evictions['ej']['last'], 2000.0)   # most recent wins
+    self.assertEqual(e.evictions['ej|v7']['strikes'], 2)
+    self.assertEqual(e.evictions['ej|v7']['last'], 2000.0)   # most recent wins
+
+  def test_NEGCTL_eviction_does_not_penalise_other_arch_in_that_cell(self):
+    # Evicted off v7 in ej: v6p in ej is a different pair and ranks unpenalised,
+    # so the roomier ej still beats ek for v6p.
+    e = _entry(power='v6p-32', archs=('v6p',))
+    e.cell = 'ej'
+    e.arch = 'v7'
+    R.record_eviction(e, now=1000.0)
+    avail = {'ej|v6p': _avail('ej', 'v6p', free=3200),
+             'ek|v6p': _avail('ek', 'v6p', free=64)}
+    hit = R.best_cell_for_shape('v6p', 32, e, avail, now=1000.0)
+    assert hit is not None
+    got, _ = hit
+    self.assertEqual(got.cell, 'ej')
 
   def test_record_eviction_noop_without_cell(self):
     e = _entry()
@@ -501,115 +520,142 @@ class InplaceRerouteDecisionTest(unittest.TestCase):
     self.assertIn(p.cell, ('yulpptr', 'yukulwh'))  # placed (not excluded)
 
 
-class MetroCooldownTest(unittest.TestCase):
-  """The THIRD cooldown (operator 2026-09-11), SHAPED EXACTLY LIKE the per-cell
-  cooldown: mark_reroute stamps a bare {metro: until-epoch} entry (NON-stacking),
-  and best_cell_for_shape runs it through the SAME decaying `cooldown_penalty` as
-  the cell cooldown, steering the next placement to a DIFFERENT metro. The axis
-  cell/arch cooldown cannot express -- b200 lives only in one metro, and a
-  capacity-starved metro starves every arch in it."""
+class PairCooldownTest(unittest.TestCase):
+  """The (cell, arch) pair cooldown (operator 2026-09-23). A re-route cools the
+  ONE pair the job was stuck on; the same cell under another arch, the same arch
+  in another cell, and the metro are left alone. Strikes stack inside the window
+  and multiply the cell score."""
 
-  # --- read side: cell_score applies metro cooldown via the SAME cooldown_penalty ---
-  def test_metro_cooldown_uses_same_penalty_as_cell(self):
-    # identical timestamps through cell vs metro slot give identical multipliers:
-    # proof the metro penalty IS the cell penalty, just keyed on the metro.
-    now, until = 800.0, 2500.0
-    by_cell = R.cell_score(10.0, 1, cooldown_until=until, now=now)
-    by_metro = R.cell_score(10.0, 1, metro_cooldown_until=until, now=now)
-    self.assertAlmostEqual(by_cell, by_metro)
-    self.assertGreater(by_metro, R.cell_score(10.0, 1, now=now))  # it does penalise
+  # --- the multiplier ---
+  def test_penalty_scales_with_strikes_and_caps(self):
+    self.assertEqual(R.cooldown_penalty(1800.0, 0.0, 1800.0, strikes=1), 2.0)
+    self.assertEqual(R.cooldown_penalty(1800.0, 0.0, 1800.0, strikes=2), 3.0)
+    self.assertEqual(R.cooldown_penalty(1800.0, 0.0, 1800.0, strikes=99),
+                     1.0 + R.PAIR_COOLDOWN_MAX_STRIKES)
 
-  def test_metro_cooldown_none_is_inert(self):
-    base = R.cell_score(10.0, 1, now=100.0)
+  def test_penalty_is_flat_until_the_last_fade_window(self):
+    # A 7200 s cooldown read with the 1800 s fade: full strength at 5400 s left.
+    self.assertEqual(R.cooldown_penalty(7200.0, 1800.0, 1800.0, strikes=1), 2.0)
     self.assertAlmostEqual(
-        R.cell_score(10.0, 1, now=100.0, metro_cooldown_until=None), base)
+        R.cooldown_penalty(7200.0, 6300.0, 1800.0, strikes=1), 1.5)
 
-  def test_metro_cooldown_expired_is_inert(self):
-    base = R.cell_score(10.0, 1, now=100.0)
-    self.assertAlmostEqual(
-        R.cell_score(10.0, 1, now=100.0, metro_cooldown_until=50.0), base)
+  def test_NEGCTL_expired_absent_or_no_strikes_is_neutral(self):
+    self.assertEqual(R.cooldown_penalty(None, 0.0), 1.0)
+    self.assertEqual(R.cooldown_penalty(100.0, 100.0, strikes=3), 1.0)
+    self.assertEqual(R.cooldown_penalty(1800.0, 0.0, 1800.0, strikes=0), 1.0)
 
-  def test_cell_and_metro_cooldown_compound(self):
-    # both are multipliers, so a cell in a cooled metro that is ALSO cell-cooled
-    # sorts dearer than one penalised on only one axis (mirrors cell+evict).
-    now, until = 800.0, 2500.0
-    both = R.cell_score(10.0, 1, cooldown_until=until, now=now,
-                        metro_cooldown_until=until)
-    one = R.cell_score(10.0, 1, cooldown_until=until, now=now)
-    self.assertGreater(both, one)
-
-  # --- write side: mark_reroute (bare timestamp, NON-stacking, like cooldown_cells) ---
-  def test_mark_reroute_stamps_metro_cooldown_bare_timestamp(self):
-    e = _entry()
+  # --- write side ---
+  def test_mark_reroute_cools_exactly_the_stuck_pair(self):
+    e = _entry(power='h100-8', archs=('h100', 'b200'))
     e.state = R.JobState.SUBMITTED
-    e.cell = 'sj'          # metro sin
+    e.cell = 'sj'
     e.arch = 'b200'
     e.submitted_at = 0.0
-    e.xid = '12345'
     R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
-    # bare epoch, EXACTLY like cooldown_cells -- not a {'until','strikes'} dict.
-    self.assertEqual(e.cooldown_metros, {'sin': 700.0 + 1800.0})
+    self.assertEqual(e.cooldown_pairs,
+                     {'sj|b200': {'until': 2500.0, 'strikes': 1}})
+    self.assertFalse(hasattr(e, 'cooldown_cells'))
+    self.assertFalse(hasattr(e, 'cooldown_archs'))
+    self.assertFalse(hasattr(e, 'cooldown_metros'))
 
-  def test_metro_cooldown_is_non_stacking(self):
-    # mirror cooldown_cells: a second re-route out of the same metro OVERWRITES
-    # the timestamp; no strikes accumulate. (sj and sh are both metro sin.)
-    e = _entry()
-    e.state = R.JobState.SUBMITTED
-    e.submitted_at = 0.0
-    e.cell = 'sj'; e.xid = '1'
-    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
-    e.cell = 'sh'; e.xid = '2'
-    R.mark_reroute(e, now=1000.0, cooldown_s=1800.0)
-    self.assertEqual(e.cooldown_metros, {'sin': 1000.0 + 1800.0})  # overwritten
-    self.assertNotIsInstance(e.cooldown_metros['sin'], dict)       # bare, no strikes
-
-  def test_mark_reroute_unresolvable_metro_takes_no_cooldown_but_still_requeues(self):
-    # A synthetic cell whose metro cannot be resolved must not crash and must not
-    # invent a cooldown -- the cell (and arch) cooldowns still land, row requeues.
-    e = _entry()
-    e.state = R.JobState.SUBMITTED
-    e.cell = 'zzznotacell'
-    e.arch = 'v7'
-    e.submitted_at = 0.0
-    e.xid = '9'
-    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
-    self.assertEqual(e.state, R.JobState.QUEUED)
-    self.assertEqual(e.cooldown_metros, {})           # no bogus metro cooldown
-    self.assertIn('zzznotacell', e.cooldown_cells)    # cell cooldown still landed
-
-  # --- read side end-to-end: ranking steers away from the whole cooled metro ---
-  def test_reroute_steers_away_from_whole_metro_not_just_the_cell(self):
-    # THE POINT of the metro cooldown, isolated from the cell cooldown: after
-    # being kicked out of sj (metro sin), a DIFFERENT sin cell (sh) -- which was
-    # never the stuck cell, so carries NO per-cell cooldown -- is still
-    # de-preferred, so the router crosses to another metro (nm=tul). If only the
-    # cell were cooled, sh (same price, same arch, roomier-tie) would win.
+  def test_strikes_stack_inside_the_window_and_reset_after(self):
     e = _entry(power='v7-32', archs=('v7',))
+
+    def reroute(now):
+      e.state = R.JobState.SUBMITTED
+      e.cell, e.arch, e.submitted_at = 'nm', 'v7', now - 1
+      R.mark_reroute(e, now=now, cooldown_s=1000.0)
+      return e.cooldown_pairs['nm|v7']
+
+    self.assertEqual(reroute(0.0), {'until': 1000.0, 'strikes': 1})
+    self.assertEqual(reroute(500.0), {'until': 1500.0, 'strikes': 2})
+    self.assertEqual(reroute(3000.0), {'until': 4000.0, 'strikes': 1})
+
+  def test_NEGCTL_other_pairs_do_not_stack(self):
+    e = _entry(power='v7-32', archs=('v7', 'v6p'))
+    for cell, arch in (('nm', 'v7'), ('nf', 'v7'), ('nm', 'v6p')):
+      e.state = R.JobState.SUBMITTED
+      e.cell, e.arch, e.submitted_at = cell, arch, 0.0
+      R.mark_reroute(e, now=100.0, cooldown_s=1000.0)
+    self.assertEqual({k: v['strikes'] for k, v in e.cooldown_pairs.items()},
+                     {'nm|v7': 1, 'nf|v7': 1, 'nm|v6p': 1})
+
+  def test_unknown_arch_blames_the_cell_under_every_accepted_arch(self):
+    e = _entry(power='h100-8', archs=('h100', 'b200'))
     e.state = R.JobState.SUBMITTED
     e.cell = 'sj'
     e.submitted_at = 0.0
-    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)   # cools cell sj AND metro sin
+    R.mark_reroute(e, now=0.0, cooldown_s=100.0)
+    self.assertEqual(sorted(e.cooldown_pairs), ['sj|b200', 'sj|h100'])
+
+  def test_NEGCTL_no_cell_cools_nothing(self):
+    e = _entry()
+    e.state = R.JobState.SUBMITTED
+    e.submitted_at = 0.0
+    R.mark_reroute(e, now=0.0, cooldown_s=100.0)
+    self.assertEqual(e.cooldown_pairs, {})
+    self.assertEqual(e.state, R.JobState.QUEUED)
+
+  # --- read side, end to end ---
+  def test_same_cell_other_arch_is_not_penalised(self):
+    # Stuck on b200 in sj. h100 in sj is a different pair: it keeps its full
+    # standing and, being roomier, beats h100 in sh. The old per-cell and
+    # per-metro cooldowns penalised sj for h100 too and sent the job to sh.
+    e = _entry(power='h100-8', archs=('h100', 'b200'))
+    e.state = R.JobState.SUBMITTED
+    e.cell, e.arch, e.submitted_at = 'sj', 'b200', 0.0
+    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
     avail = {
-        'sh': _avail('sh', 'v7', free=3200, price=8.0, metro='sin'),  # sin, NOT cell-cooled
-        'nm': _avail('nm', 'v7', free=3200, price=8.0, metro='tul'),  # clean metro
+        'sj|b200': _avail('sj', 'b200', free=1024, metro='sjc'),
+        'sj|h100': _avail('sj', 'h100', free=1024, metro='sjc'),
+        'sh|h100': _avail('sh', 'h100', free=16, metro='shx'),
     }
     p = _ok(R.plan_one(e, avail, now=800.0))
-    self.assertEqual(p.cell, 'nm')     # metro cooldown alone crossed metros
+    self.assertEqual((p.arch, p.cell), ('h100', 'sj'))
 
-  def test_metro_cooldown_decays_so_it_is_not_a_permanent_ban(self):
-    # Past the window the metro is fair game again: with sin no longer penalised
-    # and sj the roomier cell, the job may return.
-    e = _entry(power='v7-32', archs=('v7',))
+  def test_same_arch_other_cell_is_not_penalised(self):
+    # Stuck on v7 in nm. v7 in nf is untouched, so the job stays on its
+    # preferred arch in another cell. The old arch cooldown demoted v7
+    # everywhere and pushed the job onto v6p.
+    e = _entry(power='v7-32', archs=('v7', 'v6p'))
     e.state = R.JobState.SUBMITTED
-    e.cell = 'sj'
-    e.submitted_at = 0.0
+    e.cell, e.arch, e.submitted_at = 'nm', 'v7', 0.0
     R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
     avail = {
-        'sj': _avail('sj', 'v7', free=6400, price=8.0, metro='sin'),  # roomier
-        'nm': _avail('nm', 'v7', free=3200, price=8.0, metro='tul'),
+        'nm|v7': _avail('nm', 'v7', free=3200),
+        'nf|v7': _avail('nf', 'v7', free=3200),
+        'x|v6p': _avail('x', 'v6p', free=3200),
     }
-    p = _ok(R.plan_one(e, avail, now=700.0 + 1800.0 + 100))  # window elapsed
-    self.assertEqual(p.cell, 'sj')     # not banned -- roomier cell wins again
+    p = _ok(R.plan_one(e, avail, now=800.0))
+    self.assertEqual((p.arch, p.cell), ('v7', 'nf'))
+
+  def test_stacked_strikes_push_a_pair_below_a_dearer_rival(self):
+    e = _entry(power='v7-32', archs=('v7',))
+    avail = {'nm|v7': _avail('nm', 'v7', free=64, price=8.0),
+             'nf|v7': _avail('nf', 'v7', free=64, price=20.0)}
+    e.cooldown_pairs = {'nm|v7': {'until': 1e9, 'strikes': 1}}
+    hit = R.best_cell_for_shape('v7', 32, e, avail, now=0.0)
+    assert hit is not None
+    got, _ = hit
+    self.assertEqual(got.cell, 'nm')            # 8 * 2 = 16 < 20
+    e.cooldown_pairs = {'nm|v7': {'until': 1e9, 'strikes': 3}}
+    hit = R.best_cell_for_shape('v7', 32, e, avail, now=0.0)
+    assert hit is not None
+    got, _ = hit
+    self.assertEqual(got.cell, 'nf')            # 8 * 4 = 32 > 20
+
+  def test_pair_cooldown_expires(self):
+    e = _entry(power='v7-32', archs=('v7',))
+    e.state = R.JobState.SUBMITTED
+    e.cell, e.arch, e.submitted_at = 'sj', 'v7', 0.0
+    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
+    avail = {'sj|v7': _avail('sj', 'v7', free=6400),   # roomier
+             'nm|v7': _avail('nm', 'v7', free=3200)}
+    p = _ok(R.plan_one(e, avail, now=700.0 + 1800.0 + 100))
+    self.assertEqual(p.cell, 'sj')     # not banned: the roomier cell wins again
+
+  def test_global_brake_is_120_per_hour(self):
+    self.assertEqual(R.REROUTE_GLOBAL_MAX_PER_HOUR, 120)
 
 
 class SerdeTest(unittest.TestCase):
@@ -618,16 +664,24 @@ class SerdeTest(unittest.TestCase):
     e = _entry(priority=3, allowed_metros=['cbf', 'tul'],
                launch_kwargs={'config': 'remote_run', 'exp_name': 'x'})
     e.state = R.JobState.SUBMITTED
-    e.cooldown_cells = {'c': 5.0}
-    e.cooldown_metros = {'sin': {'until': 9.0, 'strikes': 2}}
+    e.cooldown_pairs = {'c|v7': {'until': 9.0, 'strikes': 2}}
     d = e.to_dict()
     self.assertEqual(d['state'], 'SUBMITTED')
     e2 = R.QueueEntry.from_dict(d)
     self.assertEqual(e2.priority, 3)
     self.assertEqual(e2.state, R.JobState.SUBMITTED)
     self.assertEqual(e2.launch_kwargs['config'], 'remote_run')
-    self.assertEqual(e2.cooldown_cells, {'c': 5.0})
-    self.assertEqual(e2.cooldown_metros, {'sin': {'until': 9.0, 'strikes': 2}})
+    self.assertEqual(e2.cooldown_pairs, {'c|v7': {'until': 9.0, 'strikes': 2}})
+
+  def test_old_row_with_single_axis_cooldowns_loads_clean(self):
+    d = _entry().to_dict()
+    d.pop('cooldown_pairs')
+    d['cooldown_cells'] = {'nm': 5.0}
+    d['cooldown_archs'] = {'v7': {'until': 5.0, 'strikes': 2}}
+    d['cooldown_metros'] = {'tul': 5.0}
+    e = R.QueueEntry.from_dict(d)
+    self.assertEqual(e.cooldown_pairs, {})
+    self.assertNotIn('cooldown_cells', e.to_dict())
 
   def test_last_build_duration_roundtrips_and_defaults_none(self):
     # New diagnostic field: defaults None (a row built by an older binary), and
@@ -2351,7 +2405,7 @@ class PlanOneWhyNotTest(unittest.TestCase):
 
   def test_cooldown_fallback_placement_leaves_no_reason(self):
     e = _entry(power='v7-32', archs=('v7', 'v6p'))
-    e.cooldown_cells = {'c7': 1e12}
+    e.cooldown_pairs = {'c7|v7': {'until': 1e12, 'strikes': 1}}
     p = _ok(R.plan_one(e, {'c7': _avail('c7', 'v7', free=320)}, now=0.0))
     self.assertEqual(p.cell, 'c7')
     self.assertEqual(e.last_filter_reason, '')
@@ -2373,6 +2427,237 @@ class PlanOneWhyNotTest(unittest.TestCase):
         self.assertEqual(e.last_filter_reason, '')
       else:
         self.assertEqual(e.last_filter_reason, 'v7-32: no free slice')
+
+
+# ---------------------------------------------------------------------------
+# Group cooldown + "can this pool hold the job" (operator 2026-09-23: "和对tpu
+# type / cell做冷却时一样的逻辑，再次之外加一个'g5能不能用'的判断，如果不能就不route到g5").
+
+
+def _gcap(floor=None, used=None, balance=0.0, burn=0.0, caps=None, age=10.0,
+          prices=None, group='5'):
+  return R.GroupCapacity(group=group, floor=dict(floor or {}),
+                         used=dict(used or {}), balance=balance,
+                         above_floor_burn=burn, limit_caps=dict(caps or {}),
+                         age_s=age, prices=dict(prices or {}))
+
+
+class GroupCooldownTest(unittest.TestCase):
+  """The group cooldown is recorded EXACTLY like the arch cooldown:
+  {'until', 'strikes'}, strikes stacking while the window is open and resetting
+  once it has fully elapsed."""
+
+  def test_stamp_first_strike(self):
+    e = _entry()
+    R.stamp_group_cooldown(e, '5', now=100.0, cooldown_s=60.0)
+    self.assertEqual(e.cooldown_groups, {'5': {'until': 160.0, 'strikes': 1}})
+
+  def test_strikes_stack_while_the_window_is_open(self):
+    e = _entry()
+    R.stamp_group_cooldown(e, '5', now=100.0, cooldown_s=60.0)
+    R.stamp_group_cooldown(e, '5', now=150.0, cooldown_s=60.0)
+    self.assertEqual(e.cooldown_groups['5'], {'until': 210.0, 'strikes': 2})
+
+  def test_strikes_reset_once_the_window_has_elapsed(self):
+    e = _entry()
+    R.stamp_group_cooldown(e, '5', now=100.0, cooldown_s=60.0)
+    R.stamp_group_cooldown(e, '5', now=161.0, cooldown_s=60.0)
+    self.assertEqual(e.cooldown_groups['5'], {'until': 221.0, 'strikes': 1})
+
+  def test_no_group_is_a_noop(self):
+    e = _entry()
+    R.stamp_group_cooldown(e, None, now=100.0, cooldown_s=60.0)
+    R.stamp_group_cooldown(e, '  ', now=100.0, cooldown_s=60.0)
+    self.assertEqual(e.cooldown_groups, {})
+
+  def test_group_cooling_live_expired_other_group(self):
+    e = _entry()
+    R.stamp_group_cooldown(e, '5', now=100.0, cooldown_s=60.0)
+    self.assertIsNotNone(R.group_cooling(e, '5', now=159.0))
+    self.assertIsNone(R.group_cooling(e, '5', now=160.0))
+    self.assertIsNone(R.group_cooling(e, '3', now=120.0))
+
+  def test_group_cooling_tolerates_unreadable_records(self):
+    e = _entry()
+    e.cooldown_groups = {'9': 12345.0, '7': {'until': 'soon'}, '6': {}}
+    for g in ('9', '7', '6'):
+      self.assertIsNone(R.group_cooling(e, g, now=1.0))
+
+  def test_old_row_without_the_field_is_not_cooling(self):
+    e = R.QueueEntry.from_dict(
+        {'job_id': 'old', 'power': 'v7-32', 'allowed_archs': ['v7']})
+    self.assertEqual(e.cooldown_groups, {})
+    self.assertIsNone(R.group_cooling(e, '5', now=1.0))
+
+  def test_serde_roundtrip_keeps_cooldown_groups(self):
+    e = _entry()
+    R.stamp_group_cooldown(e, '5', now=100.0, cooldown_s=60.0)
+    back = R.QueueEntry.from_dict(e.to_dict())
+    self.assertEqual(back.cooldown_groups, {'5': {'until': 160.0, 'strikes': 1}})
+
+  def test_mark_reroute_cools_the_group_the_submission_ran_under(self):
+    e = _entry()
+    e.state = R.JobState.SUBMITTED
+    e.group = '9'
+    e.open_creating('111', cell='yulpptr', arch='v7', chips=32, group='5',
+                    now=0.0)
+    e.cell, e.arch, e.chips, e.submitted_at = 'yulpptr', 'v7', 32, 0.0
+    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    # The submission's own group wins over the row's.
+    self.assertEqual(e.cooldown_groups, {'5': {'until': 2500.0, 'strikes': 1}})
+
+  def test_mark_reroute_falls_back_to_the_row_group(self):
+    e = _entry()
+    e.state = R.JobState.SUBMITTED
+    e.cell, e.submitted_at = 'yulpptr', 0.0
+    e.xid = '12345'          # v1-style submission: carries no group
+    e.group = '5'
+    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
+    self.assertEqual(e.cooldown_groups, {'5': {'until': 2500.0, 'strikes': 1}})
+
+  def test_repeated_reroutes_off_the_same_group_stack(self):
+    e = _entry()
+    e.group = '5'
+    for i, t in enumerate((700.0, 800.0, 900.0)):
+      e.state = R.JobState.SUBMITTED
+      e.cell, e.submitted_at = f'cell{i}', t - 100.0
+      e.xid = str(1000 + i)
+      R.mark_reroute(e, now=t, cooldown_s=1800.0)
+    self.assertEqual(e.cooldown_groups['5'], {'until': 2700.0, 'strikes': 3})
+
+  def test_mark_reroute_without_any_group_stamps_nothing(self):
+    e = _entry()
+    e.state = R.JobState.SUBMITTED
+    e.cell, e.submitted_at = 'yulpptr', 0.0
+    e.xid = '1'
+    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
+    self.assertEqual(e.cooldown_groups, {})
+
+
+class GroupCanHoldTest(unittest.TestCase):
+  """group_can_hold: can a NON-fallback pool actually hold the job? Fails
+  closed at every unknown."""
+
+  def test_no_data_is_no(self):
+    v = R.group_can_hold(None, 'h100', 8, 1.0)
+    self.assertFalse(v.ok)
+    self.assertIn('no capacity data', v.reason)
+
+  def test_stale_data_is_no(self):
+    cap = _gcap(floor={'h100': 64}, age=R.GROUP_CAPACITY_MAX_AGE_S + 1.0)
+    v = R.group_can_hold(cap, 'h100', 8, 1.0)
+    self.assertFalse(v.ok)
+    self.assertIn('old', v.reason)
+
+  def test_unknown_shape_is_no(self):
+    cap = _gcap(floor={'h100': 64})
+    self.assertFalse(R.group_can_hold(cap, None, 8, 1.0).ok)
+    self.assertFalse(R.group_can_hold(cap, 'h100', None, 1.0).ok)
+    self.assertFalse(R.group_can_hold(cap, 'h100', 0, 1.0).ok)
+
+  def test_floor_room_admits_with_zero_balance_and_no_price(self):
+    cap = _gcap(floor={'h100': 48}, used={'h100': 40}, balance=0.0)
+    v = R.group_can_hold(cap, 'h100', 8, None)
+    self.assertTrue(v.ok)
+    self.assertFalse(v.above_floor)
+
+  def test_the_2026_09_23_g5_shape_is_refused(self):
+    # g5 at ~22:15Z: H100 floor 48/48 used, B200 24 chips above its floor
+    # (~48 cr/hr burn), balance ~24.
+    cap = _gcap(floor={'h100': 48}, used={'h100': 48}, balance=24.0,
+                burn=48.0, prices={'h100': 0.531})
+    v = R.group_can_hold(cap, 'h100', 8, 0.531)
+    self.assertFalse(v.ok)
+    self.assertIn('no h100 floor room', v.reason)
+    self.assertIn('balance 24', v.reason)
+
+  def test_pending_chips_eat_floor_room(self):
+    cap = _gcap(floor={'h100': 48}, used={'h100': 32})
+    self.assertTrue(R.group_can_hold(cap, 'h100', 16, None).ok)
+    self.assertFalse(
+        R.group_can_hold(cap, 'h100', 16, None, pending={'h100': 8}).ok)
+    self.assertTrue(      # pending chips of ANOTHER family leave h100 alone
+        R.group_can_hold(cap, 'h100', 16, None, pending={'v7': 8}).ok)
+
+  def test_balance_buys_above_floor(self):
+    # g3: no floors, 56k balance; v6e-16 at 20/chip-hr = 320 cr/hr per hour held.
+    cap = _gcap(group='3', balance=55996.0)
+    v = R.group_can_hold(cap, 'v6e', 16, 20.0)
+    self.assertTrue(v.ok)
+    self.assertTrue(v.above_floor)
+
+  def test_balance_threshold_is_reserve_hours_of_total_burn(self):
+    # need = reserve hours x (existing burn 100 + this job 8 x 10)
+    need = R.GROUP_BALANCE_RESERVE_H * (100.0 + 8 * 10.0)
+    self.assertFalse(R.group_can_hold(
+        _gcap(balance=need - 1.0, burn=100.0), 'v4', 8, 10.0).ok)
+    self.assertTrue(R.group_can_hold(
+        _gcap(balance=need, burn=100.0), 'v4', 8, 10.0).ok)
+
+  def test_default_reserve_is_one_hour(self):
+    # Operator 2026-09-24 01:09Z: "1改成一个小时吧" (was 6h).
+    self.assertEqual(R.GROUP_BALANCE_RESERVE_H, 1.0)
+
+  def test_reserve_hours_can_be_passed_explicitly(self):
+    # need = 6h x 180 = 1080 > 1079; 5h x 180 = 900 <= 1079.
+    cap = _gcap(balance=1079.0, burn=100.0)
+    self.assertFalse(R.group_can_hold(cap, 'v4', 8, 10.0, reserve_h=6.0).ok)
+    self.assertTrue(R.group_can_hold(cap, 'v4', 8, 10.0, reserve_h=5.0).ok)
+
+  def test_only_the_chips_over_the_floor_are_costed(self):
+    # floor 16, used 8: 8 of a 16-chip job fit the floor, 8 go above.
+    # Costing all 16 chips would need twice as much.
+    need = R.GROUP_BALANCE_RESERVE_H * 8 * 10.0
+    lo = _gcap(floor={'v4': 16}, used={'v4': 8}, balance=need - 1.0)
+    hi = _gcap(floor={'v4': 16}, used={'v4': 8}, balance=need)
+    self.assertFalse(R.group_can_hold(lo, 'v4', 16, 10.0).ok)
+    self.assertTrue(R.group_can_hold(hi, 'v4', 16, 10.0).ok)
+
+  def test_pending_above_floor_is_costed_at_the_market_price(self):
+    # 16 pending v7 chips, no v7 floor: 16 x 30 = 480 cr/hr on top of this job.
+    prices = {'v7': 30.0, 'h100': 1.0}
+    need = R.GROUP_BALANCE_RESERVE_H * (480.0 + 8 * 1.0)
+    lo = _gcap(balance=need - 1.0, prices=prices)
+    hi = _gcap(balance=need, prices=prices)
+    self.assertFalse(
+        R.group_can_hold(lo, 'h100', 8, 1.0, pending={'v7': 16}).ok)
+    self.assertTrue(
+        R.group_can_hold(hi, 'h100', 8, 1.0, pending={'v7': 16}).ok)
+
+  def test_pending_above_floor_without_a_price_fails_closed(self):
+    cap = _gcap(balance=1e9, prices={'h100': 1.0})
+    self.assertFalse(
+        R.group_can_hold(cap, 'h100', 8, 1.0, pending={'v7': 16}).ok)
+
+  def test_group_limit_order_below_the_price_is_no_even_with_room(self):
+    # g5 carries its own v6e order (~10): GQM refuses a dearer job outright.
+    cap = _gcap(floor={'v6e': 64}, balance=1e9, caps={'v6e': 10.0})
+    v = R.group_can_hold(cap, 'v6e', 16, 20.1)
+    self.assertFalse(v.ok)
+    self.assertIn('limit order', v.reason)
+    self.assertTrue(R.group_can_hold(cap, 'v6e', 16, 9.9).ok)
+
+  def test_limit_order_uses_the_market_price_when_no_cell_price(self):
+    cap = _gcap(floor={'v6e': 64}, caps={'v6e': 10.0}, prices={'v6e': 20.1})
+    self.assertFalse(R.group_can_hold(cap, 'v6e', 16, None).ok)
+
+  def test_limit_order_with_no_price_at_all_fails_closed(self):
+    cap = _gcap(floor={'v6e': 64}, caps={'v6e': 10.0})
+    v = R.group_can_hold(cap, 'v6e', 16, None)
+    self.assertFalse(v.ok)
+    self.assertIn('limit order', v.reason)
+
+  def test_no_floor_room_and_no_price_fails_closed(self):
+    v = R.group_can_hold(_gcap(balance=1e9), 'b300', 8, None)
+    self.assertFalse(v.ok)
+    self.assertIn('no price', v.reason)
+
+  def test_family_is_case_insensitive(self):
+    cap = _gcap(floor={'h100': 16})
+    self.assertTrue(R.group_can_hold(cap, 'H100', 8, None).ok)
+    self.assertFalse(
+        R.group_can_hold(cap, 'h100', 16, None, pending={'H100': 8}).ok)
 
 
 if __name__ == '__main__':

@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import os
 import random
 import re
 import time
@@ -450,142 +449,101 @@ COOLDOWN_WEIGHT = 1.0
 
 
 def cooldown_penalty(until: Optional[float], now: float,
-                     cooldown_s: float = 1800.0) -> float:
-  """Multiplier (>=1.0) for a cell this job was recently re-routed out of.
+                     cooldown_s: float = 1800.0, strikes: int = 1) -> float:
+  """Multiplier (>=1.0) for a (cell, arch) pair this job was recently
+  re-routed off.
 
-  `until` is the epoch the cooldown expires (what mark_reroute stores). Returns
-  1.0 once expired or absent, so a cell with no history is never penalised.
-  The penalty is strongest right after the re-route and fades to nothing as the
-  window closes -- so a cell can win again the moment it is genuinely better,
-  which the old hard gate made impossible.
+  `until` is the epoch the cooldown expires and `strikes` how many re-routes
+  stacked inside the window (what mark_reroute stores in `cooldown_pairs`),
+  capped at PAIR_COOLDOWN_MAX_STRIKES. Returns 1.0 once expired, absent, or
+  with no strikes, so a pair with no history is never penalised. The penalty
+  holds at full strength until the last `cooldown_s` of the window, then fades
+  to nothing as it closes -- so a pair can win again the moment it is
+  genuinely better, which the old hard gate made impossible.
   """
-  if not until or now >= until:
+  if not until or now >= until or strikes <= 0:
     return 1.0
   remaining = min(max(until - now, 0.0), cooldown_s)
-  return 1.0 + COOLDOWN_WEIGHT * (remaining / cooldown_s)
+  eff = min(strikes, PAIR_COOLDOWN_MAX_STRIKES)
+  return 1.0 + COOLDOWN_WEIGHT * eff * (remaining / cooldown_s)
 
 
 # ---------------------------------------------------------------------------
-# ARCH-LEVEL cooldown -- the SECOND, coarser cooldown (operator 2026-09-10).
+# (cell, arch) PAIR COOLDOWN (operator 2026-09-23: the cooldown weighting must be
+# keyed on the (cell, tpu_type) pair, not on cell and type separately).
 #
-# WHY IT EXISTS, on top of the per-cell one above. `cooldown_cells` penalises
-# the ONE borg cell a job was just re-routed out of. But an arch has many cells
-# (v4 in tul: nm, nf, oe, oa...), so cooling `nm` just sends the router to `nf`,
-# and the v4 GENERATION is never penalised -- the job keeps fake-landing on v4
-# and bouncing, never trying v5p/v7. This penalises the whole arch instead, so a
-# job that keeps being knocked off v4 is de-preferred UP the type ladder.
+# ONE cooldown, keyed on the pair the job was actually stuck on, e.g. 'sj|b200'.
+# It replaces three single-axis cooldowns (per cell, per arch, per metro), each
+# of which punished the wrong neighbours: stuck on b200 in sj cooled h100 in sj
+# (cell), b200 in every cell (arch), and every arch in the metro (metro). Re-
+# routes then compounded into a fleet-wide penalty (measured 2026-09-23: one
+# ELT row carried live penalties on v4, v6e, v6p and v7 at the same time).
+# Availability is already keyed `cell|arch` because a cell can host two
+# generations; the penalty now uses the same key.
 #
-# IT IS AN ADDITIVE SURCHARGE ON THE SORT PRICE, KEYED TO THE ARCH'S LIMIT-ORDER
-# CAP (operator 2026-09-10). Per strike it adds `pct * cap(arch)` to the price
-# the type-ranking sees. Three reasons for this exact shape, each a correction
-# of the first (multiplicative) cut:
-#   * ADDITIVE, not a multiplier: a job feels a bounded nudge, not a runaway
-#     factor -- the operator found the 2x..7x multiplier too harsh.
-#   * KEYED TO THE CAP, not to the live price: a multiplier `k*price` collapses
-#     to ZERO when the pool cleared free that cycle (price 0), so the free-but-
-#     unusable arch that MOST needs pushing off gets no penalty at all. The cap
-#     is a fixed non-zero constant per family (cap_policy.CAP_POLICY), so the
-#     surcharge is well-defined even at price 0.
-#   * SORT-ONLY: the surcharge is added to the ranking key in candidate_shapes,
-#     NEVER to `ca.price`. The real-price limit-order gate in best_cell_for_shape
-#     keeps seeing the true price, so a penalised arch is DE-PREFERRED, never
-#     price-capped out. The cap policy is borrowed only as a stable UNIT of
-#     surcharge here -- it does not become a second gate. (operator red line:
-#     the limit order caps the REAL price only.)
-#
-# STACKS across re-routes (strikes) and is FLAT across the window then off at
-# `until` -- a decaying window expired before the backlogged serial build-worker
-# re-dispatched the job, so it read as un-penalised at the one moment it
-# mattered. Capped at ARCH_COOLDOWN_MAX_STRIKES strikes (the operator's penalty
-# ceiling).
-#
-# SIZING at the default 15% (real arch-global PROD prices 2026-09-10, caps in
-# parens): v4 4.29 (cap 5), v6p 13.94 (cap 20), v7 35.74 (cap 20). Each v4 strike
-# adds 0.15*5 = 0.75, so v4 reads 4.29 -> 5.04 -> 5.79 -> 6.54 -> 7.29 (capped).
-# That is a deliberate GENTLE nudge: at 15% a stuck v4 is de-ranked but does not
-# overtake v6p, because v4's own cap (5) is small. To make a stuck arch actually
-# cross to the next generation, raise the percentage via the env knob below
-# (~0.50 makes v4 cross v6p by the 4th strike); it is env-tunable precisely so
-# the aggressiveness can be retuned with a worker restart, no rebuild.
-ARCH_COOLDOWN_STRIKE_PCT_DEFAULT = 0.15
-# Strikes past this add nothing -- the operator's ceiling on the surcharge.
-ARCH_COOLDOWN_MAX_STRIKES = 4
-# Env override for the per-strike percentage, so the knob is retunable without a
-# rebuild (just restart the workers). Unset/blank/garbage/negative -> default.
-ARCH_COOLDOWN_PCT_ENV = 'TPU_ARCH_COOLDOWN_PCT'
+# SHAPE -- all soft, a multiplier inside cell_score, never a gate:
+#   * strikes STACK while the pair's window is still open and reset to 1 once a
+#     full window passes with no re-route (the pair recovered);
+#   * multiplier = 1 + COOLDOWN_WEIGHT * min(strikes, PAIR_COOLDOWN_MAX_STRIKES)
+#     * fade, where fade is 1 until the last 1800 s of the window, then -> 0;
+#   * plan_one also treats a shape whose best cell is a COOLING pair as a
+#     fallback and keeps scanning later shapes (the b200 -> h100 fallthrough),
+#     using the fallback only when every shape resolves to a cooling pair.
+# Written by `mark_reroute` (cooldown_pairs) and `record_eviction` (evictions,
+# same key); read by `best_cell_for_shape` and `plan_one`. Rows written before
+# this change carry cooldown_cells / cooldown_archs / cooldown_metros, which
+# from_dict drops, so their cooldown state restarts empty.
+PAIR_COOLDOWN_MAX_STRIKES = 4
 
 
-def _arch_cooldown_pct() -> float:
-  """Per-strike surcharge as a fraction of the arch's limit-order cap.
-
-  Reads `TPU_ARCH_COOLDOWN_PCT` so the aggressiveness is retunable by restarting
-  the workers, not rebuilding. Never raises: an unset, blank, non-numeric, or
-  negative value falls back to ARCH_COOLDOWN_STRIKE_PCT_DEFAULT.
-  """
-  raw = os.environ.get(ARCH_COOLDOWN_PCT_ENV)
-  if raw is None or not str(raw).strip():
-    return ARCH_COOLDOWN_STRIKE_PCT_DEFAULT
-  try:
-    v = float(raw)
-  except (TypeError, ValueError):
-    return ARCH_COOLDOWN_STRIKE_PCT_DEFAULT
-  return v if v >= 0.0 else ARCH_COOLDOWN_STRIKE_PCT_DEFAULT
+def pair_key(cell: str, arch: str) -> str:
+  """'sj|b200' -- the same `cell|arch` key avail_provider uses."""
+  return f'{str(cell).strip().lower()}|{str(arch).strip().lower()}'
 
 
-def arch_cooldown_surcharge(strikes: int, until: Optional[float], now: float,
-                            cap: Optional[float]) -> float:
-  """ADDITIVE penalty (>=0.0) ON THE SORT PRICE for an ARCH this job keeps being
-  re-routed off. Added to the arch's effective price when ranking types; it is
-  NOT a multiplier and NOT a price cap.
+def _blame_keys(entry: 'QueueEntry') -> list[str]:
+  """Pair keys a re-route or eviction of `entry` blames. Must be read while
+  `entry.cell` / `entry.arch` still name the stuck placement.
 
-  = min(strikes, MAX) * pct * cap, where `cap` is the arch's limit-order cap (a
-  stable, non-zero constant per family) and `pct` comes from `_arch_cooldown_pct`.
-  Returns 0.0 when expired, absent, no strikes, or the arch has no cap policy --
-  in every one of those the arch is simply un-penalised.
-
-  FLAT across the window (full value until `until`, then 0.0), because a decaying
-  penalty expired before the backlogged serial build-worker re-dispatched the
-  job. Keyed to the CAP not the price so it survives a price-0 clearing cycle.
-  """
-  if not until or now >= until or strikes <= 0 or not cap or cap <= 0:
-    return 0.0
-  eff = min(strikes, ARCH_COOLDOWN_MAX_STRIKES)
-  return eff * _arch_cooldown_pct() * cap
+  Normally exactly one, (cell, arch). A row whose arch was never recorded (a
+  recovered binding) blames its cell under EVERY arch it accepts, which is the
+  old per-cell behaviour: we cannot tell which generation it was on. No cell:
+  nothing to blame."""
+  cell = (entry.cell or '').strip()
+  if not cell:
+    return []
+  arch = (entry.arch or '').strip()
+  archs = [arch] if arch else list(entry.allowed_archs or [])
+  return [pair_key(cell, a) for a in archs]
 
 
-def arch_cooldown_surcharge_for(entry: 'QueueEntry', arch: str,
-                                now: float) -> float:
-  """Additive arch-cooldown surcharge for `arch` on `entry` at `now`.
-
-  Reads the `{arch: {'until', 'strikes'}}` record `mark_reroute` writes and the
-  arch's limit-order cap (`_family_price_cap`, i.e. cap_policy). Returns 0.0 for
-  any arch with no live record (the common case) or no cap policy, so it is
-  inert for a job that has never been re-routed. Tolerant of an absent/old-schema
-  field.
-  """
-  rec = (getattr(entry, 'cooldown_archs', None) or {}).get(arch.lower())
-  if not rec:
-    return 0.0
-  return arch_cooldown_surcharge(int(rec.get('strikes', 0) or 0),
-                                 rec.get('until'), now,
-                                 _family_price_cap(arch))
+def pair_cooldown_record(entry: 'QueueEntry', cell: str, arch: str) -> dict:
+  """This job's {'until', 'strikes'} record for (cell, arch), or {}."""
+  rec = (getattr(entry, 'cooldown_pairs', None) or {}).get(pair_key(cell, arch))
+  return rec if isinstance(rec, dict) else {}
 
 
-# ---------------------------------------------------------------------------
-# METRO-LEVEL cooldown -- the THIRD cooldown (operator 2026-09-11), MODELLED
-# EXACTLY ON THE PER-CELL COOLDOWN (operator 2026-09-11: keep it consistent with
-# the existing cell penalty). Where `cooldown_cells` cools the ONE borg cell a
-# re-route left, `cooldown_metros` cools the whole METRO -- the axis that matters
-# when an arch lives in only one metro (b200 -> sj) or a metro is chronically
-# capacity-starved, where hopping to the next cell of the SAME metro changes
-# nothing.
-#
-# SAME SHAPE AS cooldown_cells in every respect, so there is nothing new to tune:
-# a bare `{metro: until-epoch}` map (NOT stacking strikes), read through the SAME
-# `cooldown_penalty` decaying multiplier inside cell_score. Strongest right after
-# the re-route, fading to 1.0 as the window closes, so a metro can win again the
-# moment it is genuinely best -- a soft de-preference, never a ban. Written by
-# `mark_reroute`, read by `best_cell_for_shape`.
+def pair_is_cooling(entry: 'QueueEntry', cell: str, arch: str,
+                    now: float) -> bool:
+  """True while (cell, arch) is inside this job's cooldown window."""
+  until = pair_cooldown_record(entry, cell, arch).get('until')
+  return until is not None and float(until) > now
+
+
+def stamp_pair_cooldown(entry: 'QueueEntry', key: str, now: float,
+                        cooldown_s: float) -> None:
+  """Cool pair `key` for `cooldown_s`. Strikes stack while the previous window
+  is still open and reset to 1 once it has fully elapsed."""
+  if not entry.cooldown_pairs:
+    entry.cooldown_pairs = {}
+  prev = entry.cooldown_pairs.get(key)
+  prev = prev if isinstance(prev, dict) else {}
+  prev_until = prev.get('until')
+  if prev_until and now < float(prev_until):
+    strikes = int(prev.get('strikes', 0) or 0) + 1
+  else:
+    strikes = 1
+  entry.cooldown_pairs[key] = {'until': now + cooldown_s, 'strikes': strikes}
 
 
 def cell_score(price: Optional[float], n_slices: int,
@@ -593,33 +551,25 @@ def cell_score(price: Optional[float], n_slices: int,
                cooldown_until: Optional[float] = None,
                now: Optional[float] = None,
                cooldown_s: float = 1800.0,
-               metro_cooldown_until: Optional[float] = None) -> float:
+               cooldown_strikes: int = 1) -> float:
   """The cell-selection score. LOWER IS BETTER.
 
-      price / slice_weight(n) * evict_penalty(...) * cooldown_penalty(cell)
-                              * cooldown_penalty(metro)
+      price / slice_weight(n) * evict_penalty(...) * cooldown_penalty(pair)
 
   An unknown price sorts LAST (inf), never first: a cell we cannot cost is not
   a bargain, and treating a missing number as zero is exactly how the
   cheapest-looking option becomes the one nobody could put a price on.
 
-  `metro_cooldown_until` is the epoch the metro-cooldown for THIS cell's metro
-  expires (what mark_reroute stores in `cooldown_metros`), applied through the
-  VERY SAME `cooldown_penalty` as the per-cell cooldown -- so a re-routed metro
-  is de-preferred exactly like a re-routed cell, decaying to 1.0 over the window.
-  None = no metro penalty. The caller (best_cell_for_shape) owns the cell->metro
-  resolution and passes the resolved timestamp in.
+  `cooldown_until` / `cooldown_strikes` are this job's pair-cooldown record for
+  THIS cell under the arch being placed (`cooldown_pairs`); None = no cooldown.
+  `strikes` / `since_s` are the eviction record for the same pair.
   """
   if price is None:
     return float('inf')
   cd = 1.0
   if cooldown_until is not None and now is not None:
-    cd = cooldown_penalty(cooldown_until, now, cooldown_s)
-  mcd = 1.0
-  if metro_cooldown_until is not None and now is not None:
-    mcd = cooldown_penalty(metro_cooldown_until, now, cooldown_s)
-  return ((price / slice_weight(n_slices))
-          * evict_penalty(strikes, since_s) * cd * mcd)
+    cd = cooldown_penalty(cooldown_until, now, cooldown_s, cooldown_strikes)
+  return (price / slice_weight(n_slices)) * evict_penalty(strikes, since_s) * cd
 
 
 class JobState(str, enum.Enum):
@@ -894,28 +844,13 @@ class QueueEntry:
   # need to stop it. A row with attempts>0 and an empty prior_xids is itself a
   # signal: the history predates this field.
   prior_xids: list[str] = dataclasses.field(default_factory=list)
-  cooldown_cells: dict = dataclasses.field(default_factory=dict)  # cell -> until-epoch
-  # ARCH-LEVEL cooldown: {arch: {'until': epoch, 'strikes': int}} -- the coarser
-  # sibling of `cooldown_cells`. Where cooldown_cells penalises the ONE cell a
-  # re-route left, this penalises the whole ARCH (v4, v6p...), so a job that
-  # keeps fake-landing on a cheap-but-unusable generation is pushed UP the type
-  # ladder instead of just hopping to the next cell of the same arch. Written by
-  # `mark_reroute` (strikes STACK within the window, reset once expired), read
-  # by `candidate_shapes` via `arch_cooldown_surcharge_for`. Backward
-  # compatible: a row from before this field defaults to {} and the penalty is
-  # inert.
-  cooldown_archs: dict = dataclasses.field(default_factory=dict)
-  # METRO-LEVEL cooldown: {metro: until-epoch} -- the THIRD cooldown (operator
-  # 2026-09-11), MODELLED EXACTLY ON cooldown_cells (same bare-timestamp shape,
-  # NOT the stacking {'until','strikes'} of cooldown_archs). Where cooldown_cells
-  # penalises the ONE cell a re-route left, this penalises the METRO, so the
-  # router prefers a different metro next pass -- the axis that matters when an
-  # arch lives in only one metro (b200 -> sj) or a metro is chronically
-  # capacity-starved. Written by `mark_reroute`, read by `best_cell_for_shape`
-  # through the SAME decaying `cooldown_penalty` as the per-cell cooldown.
-  # Backward compatible: a row from before this field defaults to {} and the
-  # penalty is inert.
-  cooldown_metros: dict = dataclasses.field(default_factory=dict)
+  # (cell, arch) PAIR cooldown: {'<cell>|<arch>': {'until': epoch, 'strikes':
+  # int}} -- the ONE re-route cooldown (operator 2026-09-23; see PAIR COOLDOWN
+  # near cooldown_penalty). Written by `mark_reroute`, read by
+  # `best_cell_for_shape` (soft multiplier) and `plan_one` (cross-arch
+  # fallthrough). Rows from before it carried cooldown_cells / cooldown_archs /
+  # cooldown_metros; from_dict drops those keys and this defaults to {}.
+  cooldown_pairs: dict = dataclasses.field(default_factory=dict)
   # GROUP-LEVEL cooldown: {group: {'until': epoch, 'strikes': int}} -- the
   # FOURTH cooldown (operator 2026-09-23: "和对tpu type / cell做冷却时一样的逻辑"),
   # recorded EXACTLY like cooldown_archs (strikes stack inside the window and
@@ -925,24 +860,12 @@ class QueueEntry:
   # by `mark_reroute`, read by route_check's `_pick_group` via `group_cooling`.
   # Backward compatible: a row from before this field defaults to {}.
   cooldown_groups: dict = dataclasses.field(default_factory=dict)
-  # PER-CELL EVICTION HISTORY: {cell: {'strikes': int, 'last': epoch}} -- how
-  # often THIS job has been preempted out of THAT cell, and when last. Read by
-  # `cell_score` via `evict_penalty`, which decays a strike to nothing over
-  # half an hour, so the record is a fading hint and never a permanent verdict.
-  #
-  # RELATED TO `cooldown_cells`, which the reroute path sets on the ONE cell a
-  # job was stuck in. Both are now SOFT multipliers on cell_score (cooldown was
-  # a hard gate until 2026-09-01). This one is cumulative and per-cell:
-  # a cell that threw the job out twice sorts worse than one that did it once,
-  # which a boolean cooldown cannot express -- and when every candidate has
-  # struck, a soft penalty still yields a choice where the gate yields none.
-  #
-  # NOTHING WRITES THIS YET. Preemption detection is a separate change; until
-  # it lands every lookup misses and `evict_penalty` returns 1.0, leaving
-  # placement decided by price and roominess exactly as this CL ships it. The
-  # field exists so the ranking can be reviewed and tested before the detector
-  # starts feeding it -- but do not read "the penalty is implemented" as "the
-  # penalty is happening".
+  # PER-PAIR EVICTION HISTORY: {'<cell>|<arch>': {'strikes': int, 'last':
+  # epoch}} -- how often THIS job was preempted off THAT arch in THAT cell, and
+  # when last. Written by `record_eviction` (in-place preemption thrash), read
+  # by `cell_score` via `evict_penalty`, which decays a strike to nothing over
+  # EVICT_DECAY_S, so the record is a fading hint and never a verdict. Same key
+  # as `cooldown_pairs`; per-cell keys from older rows simply never match.
   evictions: dict = dataclasses.field(default_factory=dict)
   last_reason: str = ''             # why it is where it is (for status view)
   # ★Why the router found NO cell this pass, when the cause was a hard gate
@@ -1257,7 +1180,6 @@ def candidate_shapes(entry: QueueEntry,
                      legal_sizes: Optional[dict[str, list[int]]] = None,
                      arch_price: Optional[dict[str, float]] = None,
                      arch_pool: Optional[dict[str, float]] = None,
-                     now: Optional[float] = None,
                      ) -> list[tuple[str, int]]:
   """(arch, chips) options this job accepts, best-first.
 
@@ -1275,14 +1197,9 @@ def candidate_shapes(entry: QueueEntry,
     * Without market data (tests, offline): fall back to ARCH_PREF (newer first)
       then fewer chips -- the original deterministic order.
 
-  ARCH COOLDOWN: whichever mode is in force, an arch this job keeps being
-  re-routed off (`cooldown_archs`, written by mark_reroute) adds an ADDITIVE
-  surcharge (`arch_cooldown_surcharge_for`) to its sort price, so it sorts BELOW
-  an arch it has not been knocked off. In the priced mode the surcharge is added
-  to the effective price; in the fallback it is the leading key. Inert (0.0)
-  when `now` is None or the job has no live arch-cooldown record, so it never
-  perturbs an un-re-routed job. SORT-ONLY: never added to ca.price, so the
-  real-price limit-order gate is untouched.
+  COOLDOWN is not applied here: a (cell, arch) pair this job was re-routed off
+  is de-preferred per cell in best_cell_for_shape and skipped by plan_one's
+  cross-arch fallthrough, never by demoting the arch as a whole.
 
   TOPOLOGY LOCK: if the job is topology_locked, shapes are additionally filtered
   to those whose mesh geometry matches. If `locked_geometry` is already pinned
@@ -1339,23 +1256,14 @@ def candidate_shapes(entry: QueueEntry,
             continue
         out.append((arch, chips))
 
-  # Arch-level cooldown SURCHARGE (>=0.0), 0.0 when now is None or no live
-  # record. A generation this job keeps being knocked off reads as dearer by an
-  # ADDITIVE `strikes * pct * cap(arch)`, de-preferring it DOWN the type ladder
-  # toward v5p/v7. Added ONLY to the sort key here -- never to ca.price -- so the
-  # real-price limit-order gate in best_cell_for_shape is untouched. See
-  # arch_cooldown_surcharge for the shape (additive, cap-keyed, stacking, capped).
-  def _acd(arch: str) -> float:
-    return arch_cooldown_surcharge_for(entry, arch, now) if now is not None else 0.0
-
   if gpu_req is not None:
     # ★GPU CARD CHOICE IS BY PREFERENCE, NOT PRICE: the biggest card that clears
-    # its cap wins (b200 before h100 via ARCH_PREF), with the arch-cooldown
-    # surcharge able to push a repeatedly-knocked-off card DOWN the order. Never
-    # rank GPU options by market price -- "biggest that fits" is the operator's
-    # rule, and the limit-order cap gate downstream (not a price compare here)
-    # is what makes a too-dear or blocked b200 yield to h100.
-    out.sort(key=lambda ac: (_acd(ac[0]), ARCH_PREF.get(ac[0], 99), ac[1]))
+    # its cap wins (b200 before h100 via ARCH_PREF). Never rank GPU options by
+    # market price -- "biggest that fits" is the operator's rule, and the
+    # limit-order cap gate downstream (not a price compare here) is what makes a
+    # too-dear or blocked b200 yield to h100. A b200 this job was just re-routed
+    # off yields through the (cell, arch) pair cooldown in plan_one.
+    out.sort(key=lambda ac: (ARCH_PREF.get(ac[0], 99), ac[1]))
   elif arch_price:
     def eff(ac):
       arch, chips = ac
@@ -1363,11 +1271,10 @@ def candidate_shapes(entry: QueueEntry,
       if raw is None:
         return (float('inf'), ARCH_PREF.get(arch, 99), chips)
       pool = (arch_pool or {}).get(arch, 0.0)
-      return (effective_price(raw, pool) + _acd(arch),
-              ARCH_PREF.get(arch, 99), chips)
+      return (effective_price(raw, pool), ARCH_PREF.get(arch, 99), chips)
     out.sort(key=eff)
   else:
-    out.sort(key=lambda ac: (_acd(ac[0]), ARCH_PREF.get(ac[0], 99), ac[1]))
+    out.sort(key=lambda ac: (ARCH_PREF.get(ac[0], 99), ac[1]))
   return out
 
 
@@ -2047,7 +1954,7 @@ def apply_warm_restart_in_place(entry: 'QueueEntry',
   APPENDING a fresh build_warm_restart_entry row: it has no row to keep (the
   dead one goes FAILED), and a new row needs its whole spec cloned. run_reroute
   is MOVING a row it KEEPS -- same job_id, same reroute backoff counter, and
-  (crucially) the cell cooldown + eviction strike mark_reroute/record_eviction
+  (crucially) the pair cooldown + eviction strike mark_reroute/record_eviction
   just stamped ON THIS ROW so the next placement avoids the cell it was pulled
   off. build_warm_restart_entry carries NONE of those forward, so substituting a
   fresh row would re-land the job on the hot cell it was evicted from. So the
@@ -2244,21 +2151,17 @@ def best_cell_for_shape(
     n = slices_for(ca.free_chips, chips)
     if n < 1:
       continue
-    ev = entry.evictions.get(ca.cell) if entry.evictions else None
+    ev = (entry.evictions or {}).get(pair_key(ca.cell, arch))
     strikes = int((ev or {}).get('strikes', 0) or 0)
     last = (ev or {}).get('last')
     since = (now - float(last)) if last is not None else None
-    # METRO-cooldown soft penalty, resolved EXACTLY like the per-cell one below
-    # it: look up this cell's metro in `cooldown_metros` (a bare {metro: until}
-    # map, keyed lowercase by mark_reroute) and hand the timestamp to cell_score,
-    # which runs it through the SAME decaying `cooldown_penalty`. A re-route
-    # cooled the metro the job was stuck in, so a cell in that metro sorts
-    # proportionally dearer and the router prefers a DIFFERENT metro until the
-    # window decays. ca.metro is what the availability layer already resolved.
-    metro_cd = (entry.cooldown_metros or {}).get((ca.metro or '').lower())
+    # (cell, arch) PAIR cooldown: a soft multiplier keyed on THIS cell under
+    # THIS arch, so being stuck on b200 in sj says nothing about h100 in sj or
+    # about b200 elsewhere (see PAIR COOLDOWN).
+    cd = pair_cooldown_record(entry, ca.cell, arch)
     score = cell_score(ca.price, n, strikes, since,
-                       cooldown_until=entry.cooldown_cells.get(ca.cell),
-                       now=now, metro_cooldown_until=metro_cd)
+                       cooldown_until=cd.get('until'), now=now,
+                       cooldown_strikes=int(cd.get('strikes', 1) or 1))
     ranked.append((score, -n, ca))
   if not ranked:
     # ★SAY WHY THE SHAPE WAS DROPPED. A silent filter is how the previous
@@ -2349,7 +2252,7 @@ def plan_one(entry: QueueEntry,
   each shape in that order, the first cell that can actually place it wins.
 
   ★CROSS-ARCH COOLDOWN FALLTHROUGH. `best_cell_for_shape` treats a cell this
-  job was just re-routed OFF (`cooldown_cells`) as a SOFT `cell_score` penalty,
+  job was just re-routed OFF (its `cooldown_pairs` record) as a SOFT `cell_score` penalty,
   not a gate -- correct when the arch has several cells, so the penalty can
   reorder them. But when the top-preferred arch has exactly ONE usable cell
   (b200 -> only sj in the allowed metros), the penalty has nothing to reorder,
@@ -2374,8 +2277,7 @@ def plan_one(entry: QueueEntry,
   entry.last_filter_reason = ''
   why_not: dict[str, str] = {}   # arch -> why its preferred shape found no cell
   fallback: Optional[tuple[str, int, CellAvail, int]] = None
-  for arch, chips in candidate_shapes(entry, legal_sizes, arch_price, arch_pool,
-                                      now=now):
+  for arch, chips in candidate_shapes(entry, legal_sizes, arch_price, arch_pool):
     hit = best_cell_for_shape(arch, chips, entry, avail_by_cell, now)
     if hit is None:
       a = arch.lower()
@@ -2385,9 +2287,9 @@ def plan_one(entry: QueueEntry,
       entry.last_filter_reason = ''
       continue
     ca, n = hit
-    cooling = entry.cooldown_cells.get(ca.cell)
-    if cooling is not None and cooling > now:
-      # This shape only resolves to a cell the job is cooling off. Remember the
+    if pair_is_cooling(entry, ca.cell, arch, now):
+      # This shape only resolves to a (cell, arch) pair the job is cooling off.
+      # Remember the
       # best (first, i.e. cheapest/preferred) such option and keep looking for
       # an arch/cell that is not cooling.
       if fallback is None:
@@ -2503,7 +2405,7 @@ def apply_placement(entry: QueueEntry, placement: Placement, xid: str,
 # ★Re-route backoff disabled (2026-09-21, operator directive): exponential
 # backoff (2^min(reroutes, 4)) multiplied a 600s deadline into 9600s (160 min)
 # and trapped jobs stuck behind TRIGGERED_LIMIT_ORDER or capacity deficits for
-# 2.7 hours. Churn is already bounded by cell/arch/metro cooldowns and the
+# 2.7 hours. Churn is already bounded by the (cell, arch) pair cooldown and the
 # global rate cap (REROUTE_GLOBAL_MAX_PER_HOUR).
 REROUTE_BACKOFF_MAX_DOUBLINGS = 0   # 0 = fixed deadline (base_s), no backoff
 
@@ -2517,7 +2419,11 @@ REROUTE_BACKOFF_MAX_DOUBLINGS = 0   # 0 = fixed deadline (base_s), no backoff
 # 22 rows, 22 names), nor can load_from (9 unrelated rows shared one ckpt).
 # So the brake is keyed on NOTHING: it counts what the re-router itself did in
 # the last hour. A fleet-wide churn rate survives any renaming of the cars.
-REROUTE_GLOBAL_MAX_PER_HOUR = 8
+# Operator 2026-09-23: 8 -> 120. At 8 the brake was engaged on nearly every
+# pass, so a few churning rows used up the hour and every other stuck job
+# (e.g. never-rerouted b200 rows) was starved of re-routes. 120 is a runaway
+# fuse, not a budget.
+REROUTE_GLOBAL_MAX_PER_HOUR = 120
 
 
 def global_reroute_brake(recent_reroute_times: Sequence[float], now: float,
@@ -2530,8 +2436,7 @@ def global_reroute_brake(recent_reroute_times: Sequence[float], now: float,
   the re-router's side, not the car's, so the caller alerts and does nothing --
   cancelling more cars cannot fix a re-router that is cancelling too much.
 
-  Threshold 8/hour is set one notch above the measured peak of 6/hour
-  (2026-09-01 10Z, the worst hour of a day whose other hours ran 2-3)."""
+  Threshold 120/hour (operator 2026-09-23, raised from 8): a runaway fuse."""
   cutoff = now - window_s
   return sum(1 for t in recent_reroute_times if t >= cutoff) >= max_per_hour
 
@@ -2687,8 +2592,8 @@ def decide_inplace_reroute(
 
 
 def record_eviction(entry: QueueEntry, now: float) -> QueueEntry:
-  """Stamp ONE eviction strike on the entry's CURRENT cell, in place, and return
-  it. This is the WRITE side of `evictions` that has been 'wired, not yet fed'
+  """Stamp ONE eviction strike on the entry's CURRENT (cell, arch) pair, in
+  place, and return it. This is the WRITE side of `evictions` that has been 'wired, not yet fed'
   since the field was added -- `cell_score`/`best_cell_for_shape` already read it
   through `evict_penalty`.
 
@@ -2699,15 +2604,16 @@ def record_eviction(entry: QueueEntry, now: float) -> QueueEntry:
   cell -- `mark_reroute` clears it -- so the caller records first, then re-routes.
   A no-op if the row has no cell (there is nothing to blame).
   """
-  cell = (entry.cell or '').strip()
-  if not cell:
+  keys = _blame_keys(entry)
+  if not keys:
     return entry
   if not entry.evictions:
     entry.evictions = {}
-  rec = dict(entry.evictions.get(cell) or {})
-  rec['strikes'] = int(rec.get('strikes', 0) or 0) + 1
-  rec['last'] = now
-  entry.evictions[cell] = rec
+  for key in keys:
+    rec = dict(entry.evictions.get(key) or {})
+    rec['strikes'] = int(rec.get('strikes', 0) or 0) + 1
+    rec['last'] = now
+    entry.evictions[key] = rec
   return entry
 
 
@@ -2719,11 +2625,12 @@ def record_eviction(entry: QueueEntry, now: float) -> QueueEntry:
 # gated, so neither can strand a job -- they can only send it on to g9.
 
 # Hours of above-floor spend a pool's balance must cover before the router sends
-# it one more above-floor job. Balance buys above-floor DRF weight; a pool whose
-# balance is ~0 gets essentially none, so an above-floor job there queues behind
-# "99% of SCUs in your pool" or is the first reclaimed. Income is not counted:
-# income is what pays for the floor.
-GROUP_BALANCE_RESERVE_H = 6.0
+# it one more above-floor job (operator 2026-09-24 01:09Z: "1改成一个小时吧"; was
+# 6h). Balance buys above-floor DRF weight; a pool whose balance is ~0 gets
+# essentially none, so an above-floor job there queues behind "99% of SCUs in
+# your pool" or is the first reclaimed. Income is not counted: income is what
+# pays for the floor.
+GROUP_BALANCE_RESERVE_H = 1.0
 # Checker caches older than this are "no data" -- and no data answers "no".
 GROUP_CAPACITY_MAX_AGE_S = 900.0
 
@@ -2869,58 +2776,22 @@ def group_can_hold(cap: Optional[GroupCapacity], arch: Optional[str],
 def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry:
   """Return the entry reset to QUEUED after a failed placement.
 
-  Four cooldowns are stamped, all for `cooldown_s` seconds:
-    * the CELL it was stuck in (`cooldown_cells`) -- a decaying soft penalty on
-      re-picking that exact cell;
-    * the ARCH it was on (`cooldown_archs`) -- a flat, STACKING penalty on the
-      whole generation, so a job that keeps being knocked off a cheap-but-
-      unusable arch (v4's many cells defeat the per-cell cooldown) is pushed up
-      the type ladder. Strikes stack while the arch is still cooling and reset
-      once a full window has passed with no re-route (the arch recovered).
-    * the METRO it was in (`cooldown_metros`) -- a decaying soft penalty on the
-      whole metro (operator 2026-09-11), SHAPED EXACTLY LIKE the per-cell one
-      (bare timestamp, non-stacking, same `cooldown_penalty`), so a job wedged in
-      a metro whose capacity is tight, or on an arch that lives in only one metro
-      (b200->sj), is steered to a DIFFERENT metro rather than just the next cell
-      of the same one. Read by best_cell_for_shape.
+  Cools the (cell, arch) PAIR it was stuck on (`cooldown_pairs`) for
+  `cooldown_s` seconds, strikes stacking while that pair's previous window is
+  still open (see PAIR COOLDOWN). Nothing wider is cooled: not the other archs
+  of that cell, not the same arch in other cells, not the metro (operator
+  2026-09-23).
+
+  Also cools the alloc GROUP it ran under (`cooldown_groups`), a separate
+  axis:
     * the alloc GROUP it ran under (`cooldown_groups`) -- recorded exactly like
       the arch cooldown (operator 2026-09-23), so the 5,3,9 preference order
       does not hand a job straight back to the pool it was just re-routed off.
       Read by route_check's `_pick_group` via `group_cooling`."""
-  if entry.cell:
-    entry.cooldown_cells[entry.cell] = now + cooldown_s
-  # METRO-LEVEL cooldown (operator 2026-09-11), written EXACTLY like the per-cell
-  # cooldown one line up: a bare `{metro: until-epoch}` entry, NO stacking. The
-  # metro is resolved from the cell while `entry.cell` is still set (cleared
-  # below). Import is local + fail-open, exactly like `_metro_has_group_storage`:
-  # a cell whose metro cannot be resolved simply takes no metro cooldown (the
-  # cell and arch cooldowns still land), never a crash.
-  if entry.cell:
-    try:
-      from google3.experimental.users.qiaos.tpu_utils import cell_locality
-      m = cell_locality.metro_of(entry.cell)
-      metro = str(m).lower() if m is not cell_locality.UNKNOWN else None
-    except Exception:  # pylint: disable=broad-except
-      metro = None
-    if metro:
-      entry.cooldown_metros[metro] = now + cooldown_s
-  # ARCH-LEVEL cooldown (operator 2026-09-10). Cool the whole ARCH too, not just
-  # its cell -- cooling one v4 cell just sends the router to the next v4 cell.
-  # `entry.arch` is still set here (cleared below). Strikes STACK while the arch
-  # is still cooling (knocked off the same generation again before its window
-  # closes => bites harder), and RESET to 1 once the previous window has fully
-  # elapsed (a full cooldown with no re-route is evidence the arch recovered).
-  if entry.arch:
-    a = entry.arch.lower()
-    prev = (entry.cooldown_archs or {}).get(a) or {}
-    prev_until = prev.get('until')
-    if prev_until and now < prev_until:
-      strikes = int(prev.get('strikes', 0) or 0) + 1
-    else:
-      strikes = 1
-    if not entry.cooldown_archs:
-      entry.cooldown_archs = {}
-    entry.cooldown_archs[a] = {'until': now + cooldown_s, 'strikes': strikes}
+  # Read while entry.cell / entry.arch still name the stuck placement (both are
+  # cleared below).
+  for key in _blame_keys(entry):
+    stamp_pair_cooldown(entry, key, now, cooldown_s)
   # GROUP-LEVEL cooldown (operator 2026-09-23). The pool is the one the stuck
   # submission was built under: its own record first (apply_placement copies the
   # row's group onto it), else the row's `group`. Neither is cleared below.
