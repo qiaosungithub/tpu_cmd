@@ -490,168 +490,107 @@ while true; do
   
   # Parse xm launch logs for ERROR MODES
   python3 - << 'EOF'
-import json, os, fcntl, time, re, sys, subprocess, traceback
+import copy, os, re, sys, time, traceback
+sys.path.append(os.path.expanduser('~/work/tpu_cmd/google3_tpu_utils'))
+try:
+    import registry_store as rs
+except Exception as e:  # pylint: disable=broad-except
+    print(f'{time.ctime()}: registry_store unavailable; status pass skipped: {e}')
+    sys.exit(0)
 
-mapping_file = os.environ.get('TPU_JOBS_FILE') or os.path.expanduser('~/.tpu_jobs.json')
-if os.path.exists(mapping_file):
-    try:
-        with open(mapping_file, 'r') as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            data = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
-        
-        changed = False
+# REGISTRY STATUS PASS. Reads the registry once, works out status changes on a
+# private copy, and writes them back as compare-and-set FIELD patches through
+# registry_store: a field someone else changed meanwhile (a `tpu cancel`, a new
+# registration) is left alone instead of being overwritten from this snapshot.
+#
+# This pass never submits anything. It used to re-run a FAILED PROD job's
+# launch command itself and swap the registry key to the new XID -- a second
+# submitter behind the router's back. Relaunching belongs to the router alone.
+mapping_file = rs.jobs_path()
+if not os.path.exists(mapping_file):
+    sys.exit(0)
+try:
+    snap = rs.read(mapping_file)
+except rs.RegistryUnreadable as e:
+    print(f'{time.ctime()}: registry unreadable; status pass skipped, nothing written: {e}')
+    sys.exit(0)
+data = copy.deepcopy(snap)
 
-        # Parse cache for why
-        cache_file = os.environ.get('TPU_CHECK_CACHE_FILE') or os.path.expanduser('~/.tpu_check_cache.txt')
-        cached_status = {}
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r') as f:
-                    for line in f:
-                        line = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', line).strip()
-                        if line.startswith('│') and line.endswith('│'):
-                            parts = [p.strip() for p in line.split('│')[1:-1]]
-                            if len(parts) >= 3 and parts[0].isdigit():
-                                cached_status[parts[0]] = {'status': parts[1], 'why': parts[-1] if len(parts) >= 4 else ''}
-            except Exception:
-                pass
+# A deliberate stop is a fact about intent that no heuristic may overwrite.
+NO_OVERWRITE = {'CANCELLED'}
+# Verdicts the launch-log heuristic must not revisit.
+LOG_PARSE_DONE = {'FAILED', 'DONE', 'COMPLETED', 'CANCELLED'}
 
-        for xid, info in data.items():
-            if info.get('status') not in ['FAILED', 'DONE']:
-                log_file = info.get('launch_log', '')
-                if log_file and os.path.exists(log_file):
-                    with open(log_file, 'r') as log_f:
-                        content = log_f.read()
-                    
-                    if 'SLICE_DEFRAGMENTATION' in content:
-                        info['status'] = 'FAILED'
-                        info['error'] = 'Preempted by Defag'
-                        changed = True
-                    elif 'RESOURCE_EXHAUSTED' in content or 'RESOURCES_EXCEEDED' in content:
-                        info['status'] = 'FAILED'
-                        info['error'] = 'Resource Exhausted (Topology/Quota)'
-                        changed = True
-                    elif 'Preempted' not in content and any(
-                            'FAILED' in ln and 'Census view failed to add' not in ln
-                            for ln in content.splitlines()):
-                        # DO NOT match 'FAILED' against the whole launch log:
-                        # every job's log carries one benign line --
-                        #   rpc-stats.cc] ... Census view failed to add
-                        #   FAILED_PRECONDITION: Census is not enabled.
-                        # -- which made this branch fire on EVERY job, healthy
-                        # or dead (a job confirmed running at step 37000 was
-                        # flagged FAILED by it). Real launch-time failures
-                        # (RESOURCE_EXHAUSTED, SLICE_DEFRAGMENTATION) are caught
-                        # by the branches above; a runtime death lands in CNS
-                        # logs, not here, and is reconciled by the board
-                        # write-back below. So scan line by line and ignore the
-                        # one known-benign Census line, keeping the ability to
-                        # catch any other genuine FAILED line.
-                        info['status'] = 'FAILED'
-                        info['error'] = 'Unknown failure in XManager logs'
-                        changed = True
-                    elif 'All work units started' in content:
-                        if info['status'] != 'RUNNING':
-                            info['status'] = 'RUNNING'
-                            changed = True
+try:
+    cache_file = os.environ.get('TPU_CHECK_CACHE_FILE') or os.path.expanduser('~/.tpu_check_cache.txt')
+    cached_status = {}
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r') as f:
+                for line in f:
+                    line = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', line).strip()
+                    if line.startswith('│') and line.endswith('│'):
+                        parts = [p.strip() for p in line.split('│')[1:-1]]
+                        if len(parts) >= 3 and parts[0].isdigit():
+                            cached_status[parts[0]] = {'status': parts[1], 'why': parts[-1] if len(parts) >= 4 else ''}
+        except Exception:
+            pass
 
-        cmds_to_run = []
-        now = time.time()
-        for xid, info in list(data.items()):
-            c_info = cached_status.get(xid, {})
-            c_status = c_info.get('status', '').lower()
-            if 'failed' in c_status and info.get('status') != 'FAILED':
-                info['status'] = 'FAILED'
-                changed = True
-            # SUCCESS WRITE-BACK (symmetric to the FAILED branch above). The
-            # board's `completed` verdict is XM-truth: infra_check emits it only
-            # when every work unit is terminal with NO running/pending/failed WU
-            # (see infra_check.py table_completed). Without this branch a job
-            # that RAN TO COMPLETION was never advanced past whatever status the
-            # log-parse heuristic last wrote -- typically SUBMITTED, since
-            # `All work units started` had not yet appeared when it was polled
-            # -- so the registry (and google-job-info's `store` block, which
-            # mirrors it) showed SUBMITTED forever while the board said done.
-            # Match ONLY `completed`, never `stopped` (manual/ambiguous halt),
-            # and let it override a stale heuristic FAILED (real XM WU state
-            # wins over a launch-log substring), but never a deliberate CANCELLED.
-            elif 'completed' in c_status and info.get('status') not in ('COMPLETED', 'CANCELLED'):
-                info['status'] = 'COMPLETED'
-                info['error'] = ''
-                changed = True
-                
-            why = c_info.get('why') or info.get('error') or ''
-            if not why or why == 'unknown reason':
-                if 'failed' in c_status or info.get('status') == 'FAILED':
-                    why = 'Rejected by Allocator/Borg'
-                    
-            status = info.get('status')
-            retry_count = info.get('retry_count', 5)
-            tier = info.get('tier', '-')
-            
-            if status == 'FAILED' and tier == 'PROD' and 'Rejected by Allocator/Borg' in why:
-                if retry_count < 5:
-                    last_time = info.get('retry_timer_start', now)
-                    if 'retry_timer_start' not in info:
-                        info['retry_timer_start'] = now
-                        changed = True
-                        last_time = now
-                        
-                    if now - last_time >= 300:
-                        info['retry_count'] = retry_count + 1
-                        info['retry_timer_start'] = now
-                        changed = True
-                        
-                        stagedir_abs = info.get('stagedir')
-                        if stagedir_abs and not stagedir_abs.startswith('/'):
-                            stagedir_abs = f'/google/src/cloud/qiaos/EqR-jax/google3/{stagedir_abs}'
-                            
-                        launch_log = info.get('launch_log', '')
-                        cmd = None
-                        if os.path.exists(launch_log):
-                            with open(launch_log, 'r') as log_f:
-                                for line in log_f:
-                                    if line.startswith('Running:'):
-                                        cmd = line[len('Running:'):].strip()
-                                        break
-                                        
-                        if cmd and stagedir_abs:
-                            cmds_to_run.append((xid, f'cd "{stagedir_abs}" && {cmd} 2>&1 | tee "{launch_log}"'))
-                            
-        if changed:
-            with open(mapping_file, 'w') as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                json.dump(data, f, indent=2)
-                fcntl.flock(f, fcntl.LOCK_UN)
-            print(f"Successfully updated {mapping_file}")
-            
-        for xid, cmd in cmds_to_run:
-            print(f"RETRYING JOB {xid}: {cmd}")
-            p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            log_c = p.stdout
-            m = re.search(r"Launched experiment (\d+)", log_c)
-            if m:
-                new_xid = m.group(1)
-                with open(mapping_file, 'r') as f:
-                    fcntl.flock(f, fcntl.LOCK_SH)
-                    d = json.load(f)
-                    fcntl.flock(f, fcntl.LOCK_UN)
-                
-                if xid in d:
-                    old_info = d.pop(xid)
-                    d[new_xid] = old_info
-                    d[new_xid]['status'] = 'SUBMITTED'
-                    d[new_xid]['error'] = ''
-                    
-                    with open(mapping_file, 'w') as f:
-                        fcntl.flock(f, fcntl.LOCK_EX)
-                        json.dump(d, f, indent=2)
-                        fcntl.flock(f, fcntl.LOCK_UN)
-                    print(f'{time.ctime()}: Replaced old XID {xid} with new XID {new_xid}')
-    except Exception as e:
-        print(f'{time.ctime()}: Error parsing logs: {e}')
-        traceback.print_exc()
+    for xid, info in data.items():
+        if not isinstance(info, dict) or info.get('status') in LOG_PARSE_DONE:
+            continue
+        log_file = info.get('launch_log', '')
+        if not (log_file and os.path.exists(log_file)):
+            continue
+        with open(log_file, 'r', errors='replace') as log_f:
+            content = log_f.read()
+        if 'SLICE_DEFRAGMENTATION' in content:
+            info['status'] = 'FAILED'
+            info['error'] = 'Preempted by Defag'
+        elif 'RESOURCE_EXHAUSTED' in content or 'RESOURCES_EXCEEDED' in content:
+            info['status'] = 'FAILED'
+            info['error'] = 'Resource Exhausted (Topology/Quota)'
+        elif 'Preempted' not in content and any(
+                'FAILED' in ln and 'Census view failed to add' not in ln
+                for ln in content.splitlines()):
+            # Line by line, ignoring the one benign line every launch log
+            # carries (`Census view failed to add FAILED_PRECONDITION`), which
+            # otherwise flagged every job, healthy or dead, as FAILED.
+            info['status'] = 'FAILED'
+            info['error'] = 'Unknown failure in XManager logs'
+        elif 'All work units started' in content:
+            info['status'] = 'RUNNING'
+
+    for xid, info in data.items():
+        if not isinstance(info, dict) or info.get('status') in NO_OVERWRITE:
+            continue
+        c_status = cached_status.get(xid, {}).get('status', '').lower()
+        if 'failed' in c_status and info.get('status') != 'FAILED':
+            info['status'] = 'FAILED'
+        # The board's `completed` is XM truth (every work unit terminal, none
+        # failed): it overrides a stale heuristic FAILED. Never `stopped`.
+        elif 'completed' in c_status and info.get('status') != 'COMPLETED':
+            info['status'] = 'COMPLETED'
+            info['error'] = ''
+
+    patches = {}
+    for xid, info in data.items():
+        old = snap.get(xid)
+        if not isinstance(info, dict) or not isinstance(old, dict):
+            continue
+        fields = {k: (old.get(k, rs.ABSENT), v) for k, v in info.items()
+                  if old.get(k, rs.ABSENT) != v}
+        if fields:
+            patches[xid] = fields
+    if patches:
+        out = rs.patch_fields(patches, who='tpu_check_daemon (status pass)', path=mapping_file)
+        msg = f'{time.ctime()}: registry status pass: {out["applied"]} field(s) updated'
+        if out['conflicts']:
+            msg += f', {len(out["conflicts"])} skipped (changed meanwhile by another writer)'
+        print(msg)
+except Exception as e:  # pylint: disable=broad-except
+    print(f'{time.ctime()}: registry status pass failed (nothing half-written): {e}')
+    traceback.print_exc()
 EOF
 
   # Poll cadence between fast-lane rounds. money/quota only need ~2-minute

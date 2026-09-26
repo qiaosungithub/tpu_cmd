@@ -1786,55 +1786,45 @@ def main(argv) -> None:
         folder_name = f"xid_{xid}_{time_str}_{safe_exp_name}"
 
         import json
-        import fcntl
+        import fcntl  # still used below (CA mpm cache lock); not for the registry
+        # The registry has ONE write path: registry_store (strict read, lock held
+        # across read-modify-write, journal). Stdlib only, so it imports under
+        # the xmanager interpreter too.
+        sys.path.append(os.path.expanduser("~/work/tpu_cmd/google3_tpu_utils"))
+        try:
+            import registry_store as _rs
+        except Exception as _e:  # noqa: BLE001
+            _rs = None
+            print(f"Warning: registry_store unavailable ({_e}); registry will not be updated")
         mapping_file = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
 
         def read_mapping():
-            if not os.path.exists(mapping_file):
+            # Read-only (resume lookup). An unreadable registry reads as "not
+            # found", which makes resume stop with a clear message -- it never
+            # causes a write.
+            if _rs is None:
                 return {}
             try:
-                with open(mapping_file, "r") as f:
-                    fcntl.flock(f, fcntl.LOCK_SH)
-                    data = json.load(f)
-                    fcntl.flock(f, fcntl.LOCK_UN)
-                    return data
-            except Exception:
+                return _rs.read(mapping_file)
+            except Exception:  # noqa: BLE001
                 return {}
 
         def update_mapping(xid, info):
-            # MERGE (do not overwrite): xm_launcher runs before tpu_wrapper.sh's
-            # own registration snippet, so we must preserve any pre-existing
-            # tier/alloc/retry_count fields that another writer might set.
+            # FILL-ONLY merge: a field is written only where the entry has no
+            # value yet (missing, None, "", 0, {} or []), so tier/alloc/
+            # retry_count set by the wrapper's registration are preserved, and a
+            # stub wandb={} is upgraded to a real identity.
+            if _rs is None:
+                print(f"Warning: XID {xid} launched but NOT registered (registry_store missing)")
+                return
             try:
-                with open(mapping_file, "a+") as f:
-                    fcntl.flock(f, fcntl.LOCK_EX)
-                    f.seek(0)
-                    content = f.read()
-                    data = {}
-                    if content:
-                        try:
-                            data = json.loads(content)
-                        except ValueError:
-                            data = {}
-                    key = str(xid)
-                    existing = data.get(key, {})
-                    # Only fill in fields that are missing / empty in the existing entry,
-                    # so a later writer with fresher tier/alloc info wins gracefully too.
-                    merged = dict(existing)
-                    for k, v in info.items():
-                        # Overwrite empty / missing values; keep non-empty existing.
-                        # `{}` / `[]` count as empty too, so a pre-fix wandb={}
-                        # entry (or one another writer stubbed) is upgraded to a
-                        # real identity on a re-launch instead of being frozen
-                        # empty -- `{}` is not in the scalar-empty tuple below.
-                        if merged.get(k) in (None, "", 0, {}, []) or k not in merged:
-                            merged[k] = v
-                    data[key] = merged
-                    f.seek(0)
-                    f.truncate()
-                    json.dump(data, f, indent=2)
-                    fcntl.flock(f, fcntl.LOCK_UN)
-            except Exception as e:
+                _rs.register(str(xid), who="xm_launcher", fill=info, path=mapping_file)
+            except _rs.RegistryUnreadable as e:
+                where = _rs.stash_unwritten({"op": "register", "xid": str(xid), "fill": info},
+                                            who="xm_launcher", path=mapping_file)
+                print(f"Warning: XID {xid} launched but NOT registered: {e}\n"
+                      f"  metadata stashed in {where}")
+            except Exception as e:  # noqa: BLE001 -- a registry hiccup must not fail a launch
                 print(f"Warning: could not write mapping file: {e}")
 
         print("[trace] D/before-resume-block", flush=True)   # TEMP probe 2026-08-31 chipwatch; remove after resume_xid diagnosed

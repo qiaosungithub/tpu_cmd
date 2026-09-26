@@ -41,6 +41,12 @@ from absl import flags
 from google3.experimental.users.qiaos.tpu_utils import avail_provider
 from google3.experimental.users.qiaos.tpu_utils import cell_locality
 from google3.experimental.users.qiaos.tpu_utils import route_lib
+try:
+  from google3.experimental.users.qiaos.tpu_utils import registry_store
+except ImportError:  # binary built before the dep existed: load it from source
+  import sys as _sys  # pylint: disable=g-import-not-at-top
+  _sys.path.append(os.path.dirname(os.path.realpath(__file__)))
+  import registry_store  # type: ignore  # pylint: disable=g-import-not-at-top
 
 
 class _Provider(Protocol):
@@ -2117,43 +2123,16 @@ def _archive_rerouted_xid(xid: Optional[str], log: list[str]) -> None:
         os.environ.get('TPU_JOBS_LEGACY_FILE') or '~/.tpu_jobs_legacy.json')
     if not os.path.exists(jobs_file):
       return
-    # One exclusive lock over the read-modify-write, the same lock discipline the
-    # check daemon uses on this file, so a concurrent registry writer never
-    # interleaves with us.
-    with open(jobs_file, 'r+') as f:
-      fcntl.flock(f, fcntl.LOCK_EX)
-      try:
-        try:
-          live = json.load(f)
-        except ValueError:
-          return  # a half-written registry: leave it for the daemon, do no harm
-        entry = live.pop(xid, None)
-        if entry is None:
-          return  # already archived / never on the board -> idempotent no-op
-        entry['archived_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-        entry['archived_by'] = 'reroute'
-        # Merge into legacy first (best-effort; never lose the provenance), then
-        # rewrite the live file in place under the held lock.
-        try:
-          if os.path.exists(legacy_file):
-            with open(legacy_file) as lf:
-              legacy = json.load(lf)
-          else:
-            legacy = {}
-        except ValueError:
-          legacy = {}
-        legacy[xid] = entry
-        tmp = f'{legacy_file}.tmp.{os.getpid()}'
-        with open(tmp, 'w') as lf:
-          json.dump(legacy, lf, indent=2, sort_keys=True)
-        os.replace(tmp, legacy_file)
-        f.seek(0)
-        f.truncate()
-        json.dump(live, f, indent=2, sort_keys=True)
-      finally:
-        fcntl.flock(f, fcntl.LOCK_UN)
-    log.append(f'[reroute] archived superseded xid {xid} off the board '
-               f'-> {legacy_file}')
+    # Through registry_store, the registry's one write path: the lock is held
+    # across the whole move, the archive is written first, and an unreadable
+    # registry or archive raises (caught below) instead of reading as empty --
+    # the old copy of this code read a half-written archive as {} and would
+    # have written back a one-entry archive.
+    out = registry_store.archive([xid], who='reroute loop', archived_by='reroute',
+                                 path=jobs_file, legacy=legacy_file)
+    if out['moved']:
+      log.append(f'[reroute] archived superseded xid {xid} off the board '
+                 f'-> {legacy_file}')
   except Exception as exc:  # pylint: disable=broad-except
     # Guards must never kill the loop: a failed archive just leaves the CANCELLED
     # shell on the board (the pre-change behaviour), never interrupts reroute.

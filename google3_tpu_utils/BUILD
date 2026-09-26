@@ -58,6 +58,7 @@ pytype_strict_binary(
     srcs = ["infra_check.py"],
     deps = [
         ":group_utils",
+        ":registry_store",
         # `tpu clear` cascades the archive into the local queue: route_check
         # owns the locked queue I/O, route_lib the state schema + partition.
         ":route_check_lib",
@@ -283,11 +284,26 @@ pytype_strict_contrib_test(
 # seam so the whole tick unit-tests with a fake submitter (no shell, no RPC).
 # Logic lives in a LIBRARY so both the route_check binary AND queue_cli can
 # depend on it (a py-strict binary/test may not depend on another binary).
+# The ONE write path for the XID registry (~/.tpu_jobs.json) and its archive.
+# Stdlib only: also imported from bash-embedded python, xm_launcher and
+# budget_enforcer by path.
+pytype_strict_library(
+    name = "registry_store",
+    srcs = ["registry_store.py"],
+)
+
+pytype_strict_contrib_test(
+    name = "registry_store_test",
+    srcs = ["registry_store_test.py"],
+    deps = [":registry_store"],
+)
+
 pytype_strict_library(
     name = "route_check_lib",
     srcs = ["route_check.py"],
     deps = [
         ":avail_provider",
+        ":registry_store",
         # The disk-liveness probe resolves a job's write location the way the
         # launcher does -- explicit --bucket first, else the landing cell
         # through the measured locality table -- so it needs the same table.

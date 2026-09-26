@@ -1762,27 +1762,15 @@ m = re.search(r'https?://xids?/(\d+)|experiment_id[\'":= ]+(\d+)', text)
 xid = next((g for g in (m.groups() if m else ()) if g), None)
 if not xid:
     sys.exit(0)
-path = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
-if not os.path.exists(path):
-    sys.exit(0)
-with open(path, "r") as f:
-    fcntl.flock(f, fcntl.LOCK_SH)
-    try:
-        data = json.load(f)
-    except Exception:
-        sys.exit(0)
-    finally:
-        fcntl.flock(f, fcntl.LOCK_UN)
-entry = data.get(xid)
+sys.path.append(os.path.expanduser("~/work/tpu_cmd/google3_tpu_utils"))
+import registry_store as rs  # the ONE registry write path (see its docstring)
 # Only remove a CORPSE: an entry with no tier/alloc/status is one the launcher
-# pre-registered and never finished. Never touch a healthy entry.
-if entry is not None and not any(k in entry for k in ("tier", "alloc", "status")):
-    data.pop(xid, None)
-    with open(path, "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        json.dump(data, f, indent=2)
-        fcntl.flock(f, fcntl.LOCK_UN)
-    print(f"  [launch] removed the orphaned registry entry for XID {xid}")
+# pre-registered and never finished. registry_store never touches a healthy one.
+try:
+    if rs.remove_corpse(xid, who="tpu queue (corpse cleanup)"):
+        print(f"  [launch] removed the orphaned registry entry for XID {xid}")
+except rs.RegistryUnreadable as e:
+    print(f"  [launch] registry unreadable; corpse cleanup skipped: {e}")
 PYEOF
         if [ "${_TPU_LAUNCH_RETRIED:-0}" != "1" ]; then
           echo -e "\033[33m[launch] Retrying once (a fresh process re-mmaps /google/bin).\033[0m"
@@ -1811,21 +1799,13 @@ PYEOF
 import json, os, re, sys, fcntl
 
 xid, tpu_type, tier, alloc, logdir, stagedir, log_file = sys.argv[1:8]
+sys.path.append(os.path.expanduser("~/work/tpu_cmd/google3_tpu_utils"))
+import registry_store as rs  # the ONE registry write path (see its docstring)
 
-mapping_file = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
-data = {}
-if os.path.exists(mapping_file):
-    try:
-        with open(mapping_file, "r") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            data = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
-    except Exception:
-        pass
-
-entry = data.get(xid, {})
-exp_name = entry.get("exp_name", "")
-if not exp_name and os.path.exists(log_file):
+# The name is parsed from the launch log OUTSIDE the lock and only FILLED in:
+# a name the launcher already registered is never replaced.
+exp_name = ""
+if os.path.exists(log_file):
     try:
         with open(log_file, "r") as lf:
             log_content = lf.read()
@@ -1847,26 +1827,23 @@ if not exp_name and os.path.exists(log_file):
     except Exception:
         pass
 
-entry.update({
-    "tpu_type": tpu_type,
-    "tier": tier,
-    "alloc": alloc,
-    "logdir": logdir,
-    "stagedir": stagedir,
-    "launch_log": log_file,
-    "exp_name": exp_name or entry.get("exp_name", "-"),
-    "status": entry.get("status", "SUBMITTED"),
-    "error": entry.get("error", ""),
-    "retry_count": entry.get("retry_count", 0)
-})
-data[xid] = entry
-
-with open(mapping_file, "w") as f:
-    fcntl.flock(f, fcntl.LOCK_EX)
-    json.dump(data, f, indent=2)
-    fcntl.flock(f, fcntl.LOCK_UN)
+overwrite = {"tpu_type": tpu_type, "tier": tier, "alloc": alloc,
+             "logdir": logdir, "stagedir": stagedir, "launch_log": log_file}
+fill = {"exp_name": exp_name or "-", "status": "SUBMITTED", "error": "",
+        "retry_count": 0}
+try:
+    rs.register(xid, who="tpu queue (register)", overwrite=overwrite, fill=fill)
+except rs.RegistryUnreadable as e:
+    # The job IS launched. Never drop its metadata: stash it for a replay and
+    # say so loudly instead of writing a registry we could not read.
+    where = rs.stash_unwritten({"op": "register", "xid": xid,
+                                "overwrite": overwrite, "fill": fill},
+                               who="tpu queue (register)")
+    print(f"\033[31m[register] XID {xid} is LAUNCHED but NOT registered: {e}\033[0m")
+    print(f"  metadata stashed in {where}; repair the registry, then re-register.")
+    sys.exit(3)
+print(f"Successfully registered XID {xid} in {rs.jobs_path()}")
 EOF
-          echo "Successfully registered XID $xid in $TPU_JOBS_FILE"
 
           # Cap this XID's price. Per-XID scope: does not affect teammates and
           # survives the periodic group-wide push (SCU > XID > MDB).
@@ -2012,14 +1989,13 @@ def main():
 
     tpu_jobs = {}
     mapping_file = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
-    if os.path.exists(mapping_file):
-        try:
-            with open(mapping_file, "r") as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
-                tpu_jobs = json.load(f)
-                fcntl.flock(f, fcntl.LOCK_UN)
-        except Exception:
-            pass
+    try:
+        sys.path.append(os.path.expanduser("~/work/tpu_cmd/google3_tpu_utils"))
+        import registry_store as rs
+        tpu_jobs = rs.read(mapping_file, attempts=10, retry_s=0.2)
+    except Exception as e:  # a render must degrade, never die
+        print(f"\033[31m[check] registry unreadable, showing the board cache only: {e}\033[0m",
+              file=sys.stderr)
 
     cached_status = {}
     cache_file = os.environ.get("TPU_CHECK_CACHE_FILE") or os.path.expanduser("~/.tpu_check_cache.txt")
@@ -2109,7 +2085,6 @@ def main():
     # row index in active_rows -> its log-tail continuation lines
     active_tails = {}
 
-    dirty_jobs = False
     for xid in all_xids:
         job_info = tpu_jobs.get(xid, {})
         cache_info = cached_status.get(xid, {})
@@ -2143,9 +2118,6 @@ def main():
         name = re.split(r"[\r\n]", name)[0].strip()
         if not name:
             name = "-"
-        elif xid in tpu_jobs and not tpu_jobs[xid].get("exp_name"):
-            tpu_jobs[xid]["exp_name"] = name
-            dirty_jobs = True
 
         tpu_type = job_info.get("tpu_type") or "-"
         tier = job_info.get("tier") or "-"
@@ -2176,19 +2148,6 @@ def main():
             else:
                 why = "-"
 
-        retry_count = job_info.get("retry_count", 5)
-        retry_timer_start = job_info.get("retry_timer_start", 0)
-        
-        if retry_count > 0 and retry_count < 5:
-            name = f"{name} (Retry {retry_count})"
-            
-        if "failed" in status.lower() and tier == "PROD" and "Rejected by Allocator/Borg" in why and retry_count < 5:
-            import time
-            rem = 300 - int(time.time() - retry_timer_start)
-            if rem < 0: rem = 0
-            why = f"Retrying in {rem//60}m{rem%60}s ({retry_count}/5)"
-            status = "PENDING"
-
         st_lower = status.lower()
         why_lower = why.lower()
 
@@ -2212,7 +2171,7 @@ def main():
         #   active  -> "is it progressing?"  WU replaces WHY, whose only value
         #              for a live job was the work-unit count it already carries.
         #   pending -> "why is it not running yet?"  WHY is the whole point here
-        #              (GQM_RESOURCE_DEFICIT_INFO, "Retrying in 3m20s (2/5)"),
+        #              (GQM_RESOURCE_DEFICIT_INFO, ...),
         #              while RESUME/STEP are always "-" before a job starts.
         #   done    -> "how did it end?"  WHY again, but RESUME is meaningless
         #              once terminal.
@@ -2237,14 +2196,9 @@ def main():
             done_rows.append([xid, status, name, tpu_type, tier, group_str,
                               step_s, why])
 
-    if dirty_jobs:
-        try:
-            with open(mapping_file, "w") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                json.dump(tpu_jobs, f, indent=2)
-                fcntl.flock(f, fcntl.LOCK_UN)
-        except Exception:
-            pass
+    # `tpu check` is a READ-ONLY view: it never writes the registry. (It used
+    # to back-fill exp_name and write the whole file back from its snapshot,
+    # erasing anything registered while it rendered.)
 
     # Name the board after the tool that drew it and the operator it belongs
     # to, not the Unix account: `npu check` on a shared account must not look
@@ -2574,39 +2528,15 @@ EOF
       return 0
     fi
     python3 - "${xids[@]}" << 'EOF'
-import json, os, sys, fcntl, time
-
-xids = sys.argv[1:]
-mapping_file = os.environ.get("TPU_JOBS_FILE") or os.path.expanduser("~/.tpu_jobs.json")
-if not os.path.exists(mapping_file):
-    sys.exit(0)
+import os, sys
+sys.path.append(os.path.expanduser("~/work/tpu_cmd/google3_tpu_utils"))
 try:
-    with open(mapping_file, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            data = json.load(f)
-        except ValueError:
-            data = {}
-        changed = False
-        for xid in xids:
-            entry = data.get(xid)
-            if entry is None:
-                continue
-            entry["status"] = "CANCELLED"
-            entry["error"] = ""
-            entry["cancelled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            # The daemon resubmits PROD jobs whose status is FAILED with
-            # retry_count < 5; pinning the counter makes a cancelled job
-            # unresurrectable even if its cached status later reads failed.
-            entry["retry_count"] = 5
-            changed = True
-        if changed:
-            f.seek(0)
-            f.truncate()
-            json.dump(data, f, indent=2)
-        fcntl.flock(f, fcntl.LOCK_UN)
-except Exception as e:  # never fail the cancel over bookkeeping
-    print(f"Warning: could not update {mapping_file}: {e}")
+    import registry_store as rs
+    # status=CANCELLED + cancelled_at + retry_count pinned, under the registry
+    # lock, through the one write path. Never fails the cancel itself.
+    rs.mark_cancelled(sys.argv[1:], who="tpu cancel")
+except Exception as e:  # pylint: disable=broad-except
+    print(f"Warning: could not record the cancel in the registry: {e}")
 EOF
     echo -e "\033[32m[$TPU_CMD_NAME cancel] Done. Marked ${ids} CANCELLED in $TPU_JOBS_FILE.\033[0m"
     echo -e "\033[2m  'tpu check' shows the live XManager state after the next daemon cycle (~60s).\033[0m"

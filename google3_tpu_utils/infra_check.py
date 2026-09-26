@@ -11,6 +11,11 @@ import time
 from absl import app
 from absl import flags
 from google3.experimental.users.qiaos.tpu_utils import group_utils
+try:
+  from google3.experimental.users.qiaos.tpu_utils import registry_store as rs
+except ImportError:  # binary built before the dep existed: load it from source
+  sys.path.append(os.path.dirname(os.path.realpath(__file__)))
+  import registry_store as rs  # type: ignore  # pylint: disable=g-import-not-at-top
 from google3.learning.deepmind.xmanager2.client import xmanager_api
 from rich.console import Console
 from rich.table import Table
@@ -79,24 +84,29 @@ def _clear_jobs(job_ids, mapping_dir):
 
     requested = [str(x) for x in job_ids]
     want = set(requested)
-    live = _load_json(_JOBS_FILE)
-    legacy = _load_json(_LEGACY_FILE)
     now_iso = datetime.datetime.now().isoformat(timespec='seconds')
+    # Both files go through registry_store (the registry's one write path):
+    # strict reads, the registry lock held across the whole move, archive
+    # written first. Refuse up front -- before the queue half removes anything
+    # -- if either file cannot be read, instead of treating it as empty.
+    try:
+        live = rs.read(_JOBS_FILE)
+        rs.read_legacy(_LEGACY_FILE, _JOBS_FILE)
+    except rs.RegistryUnreadable as exc:
+        print(f'Refusing to clear: {exc}')
+        return
 
-    # --- board half: archive the named board entries (+ legacy mapping dir) ---
+    # --- board half: which named XIDs are on the board (+ legacy mapping dir) ---
     board_hit = set()
+    mapping_files = {}
+    defaults = {}
     for xid in requested:
-        found = False
-        if xid in live:
-            entry = dict(live.pop(xid))
-            entry['archived_at'] = now_iso
-            legacy[xid] = entry
-            found = True
+        found = xid in live
         target_file = os.path.join(mapping_dir, xid)
         if os.path.exists(target_file):
-            legacy.setdefault(xid, {}).setdefault(
-                'bucket_cp_path', open(target_file).read().strip())
-            os.remove(target_file)
+            with open(target_file) as tf:
+                defaults[xid] = {'bucket_cp_path': tf.read().strip()}
+            mapping_files[xid] = target_file
             found = True
         if found:
             board_hit.add(xid)
@@ -108,6 +118,7 @@ def _clear_jobs(job_ids, mapping_dir):
     # dep), reported distinctly from a runtime queue error so a missing dep is
     # never mistaken for "no queue rows".
     queue_archived, queue_refused, queue_matched = [], [], set()
+    extra = {}
     route_check = route_lib = None
     try:
         from google3.experimental.users.qiaos.tpu_utils import route_check  # pylint: disable=g-import-not-at-top
@@ -126,23 +137,31 @@ def _clear_jobs(job_ids, mapping_dir):
             for e in queue_archived:
                 row = e.to_dict()
                 for xid in (route_lib.entry_xids(e) & want):
-                    rec = legacy.setdefault(xid, {})
-                    rec.setdefault('archived_at', now_iso)
-                    rec['queue_row'] = row
-                    rec['queue_archived_at'] = now_iso
+                    extra.setdefault(xid, {}).update(
+                        {'queue_row': row, 'queue_archived_at': now_iso})
         except Exception as exc:  # pylint: disable=broad-except
             print(f'  [queue] local queue not reachable ({exc}); board handled, '
                   f'queue left unchanged.')
 
-    # --- persist once (board + merged legacy) ---
+    # --- persist once, through registry_store (archive first, board second) ---
     if board_hit or queue_archived:
-        with open(_LEGACY_FILE, 'w') as f:
-            json.dump(legacy, f, indent=2, sort_keys=True)
-        with open(_JOBS_FILE, 'w') as f:
-            json.dump(live, f, indent=2, sort_keys=True)
+        try:
+            rs.archive(sorted(board_hit), who='tpu clear', archived_by='tpu clear',
+                       extra=extra, defaults=defaults, path=_JOBS_FILE,
+                       legacy=_LEGACY_FILE, create=True)
+        except rs.RegistryUnreadable as exc:
+            # The queue rows are already out of the queue: keep them somewhere.
+            where = rs.stash_unwritten({'op': 'tpu clear', 'xids': sorted(board_hit),
+                                        'extra': extra, 'defaults': defaults},
+                                       who='tpu clear', path=_JOBS_FILE)
+            print(f'Archive FAILED ({exc}); board left as-is. Removed queue rows '
+                  f'are preserved in {where}.')
+            return
+        for target_file in mapping_files.values():
+            os.remove(target_file)
         print(f'Archived {len(board_hit)} board entr(y/ies) and '
               f'{len(queue_archived)} local-queue row(s) to {_LEGACY_FILE}')
-        print(f'  {len(live)} still tracked on the board')
+        print(f'  {len(rs.read(_JOBS_FILE))} still tracked on the board')
 
     if queue_refused:
         print('  \u2605NOT archived -- these local-queue rows are still LIVE:')

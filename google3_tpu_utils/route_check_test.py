@@ -2443,6 +2443,7 @@ class ArchiveReroutedXidTest(unittest.TestCase):
                     'TPU_REROUTE_NO_ARCHIVE')}
     self.jobs = tempfile.mkstemp(suffix='.jobs.json')[1]
     self.legacy = tempfile.mkstemp(suffix='.legacy.json')[1]
+    os.unlink(self.legacy)   # an archive is a JSON object or absent, never 0 bytes
     os.environ['TPU_JOBS_FILE'] = self.jobs
     os.environ['TPU_JOBS_LEGACY_FILE'] = self.legacy
     os.environ.pop('TPU_REROUTE_NO_ARCHIVE', None)
@@ -2755,6 +2756,9 @@ class RerouteWarmRestartTest(unittest.TestCase):
                         'TPU_REROUTE_NO_ARCHIVE')}
     self._jobs = tempfile.mkstemp(suffix='.jobs.json')[1]
     self._legacy = tempfile.mkstemp(suffix='.legacy.json')[1]
+    os.unlink(self._legacy)  # an archive is a JSON object or absent, never 0 bytes
+    with open(self._jobs, 'w') as f:
+      f.write('{}')          # a registry is a JSON object, never 0 bytes
     os.environ['TPU_JOBS_FILE'] = self._jobs
     os.environ['TPU_JOBS_LEGACY_FILE'] = self._legacy
     os.environ.pop('TPU_REROUTE_NO_ARCHIVE', None)
