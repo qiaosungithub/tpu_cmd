@@ -2020,12 +2020,17 @@ class RunReconcileColdRerunTest(unittest.TestCase):
     self.assertTrue(any('warm-restart queued' in l for l in log))
 
 
-class _HwEvidence(_FakeRestartEvidence):
-  """_FakeRestartEvidence plus the hardware_fault_of side channel."""
+class _HwEvidence:
+  """Scripted (code_bug, checkpoint, trained) per xid plus the
+  hardware_fault_of side channel. Self-contained on purpose: _FakeRestartEvidence
+  is defined further down this module, so it cannot be a base class here."""
 
   def __init__(self, by_xid=None, hw_by_xid=None):
-    super().__init__(by_xid)
+    self._by_xid = by_xid or {}
     self._hw = hw_by_xid or {}
+
+  def code_bug_and_checkpoint(self, entry):
+    return self._by_xid.get(entry.xid, (None, None, False))
 
   def hardware_fault_of(self, entry):
     return self._hw.get(entry.xid)
