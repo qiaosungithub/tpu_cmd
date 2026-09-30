@@ -425,6 +425,10 @@ _HARDWARE_FAULT_SIGNATURES = (
     ('UNCORRECTABLE ECC ERROR', 'GPU uncorrectable ECC error'),
     ('GPU HAS FALLEN OFF THE BUS', 'GPU fell off the bus'),
     ('NVML_ERROR_GPU_IS_LOST', 'GPU lost (NVML)'),
+    # cudaErrorSystemNotReady: the host's NVSwitch fabric manager is not up
+    # (measured 2026-09-30, xid 294832980 on sh, died in torch.cuda.set_device).
+    ('ERROR 802: SYSTEM NOT YET INITIALIZED',
+     'CUDA system not initialized (fabric manager down on host)'),
 )
 _NVLINK_PAIR_RE = re.compile(r'NVLINK CONNECTED GPUS (\d+) AND (\d+)')
 

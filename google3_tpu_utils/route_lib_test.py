@@ -1914,6 +1914,14 @@ class HardwareFaultTest(unittest.TestCase):
         'NVRM: GPU at PCI:0000:3b:00: GPU has fallen off the bus.'))
     self.assertIsNotNone(R.looks_like_hardware_fault(
         'nvml returned NVML_ERROR_GPU_IS_LOST'))
+    # Real 2026-09-30 tail (xid 294832980): fabric manager not up on the host.
+    tail = ('Traceback (most recent call last):\n'
+            '    torch.cuda.set_device(local_rank)\n'
+            'RuntimeError: Unexpected error from cudaGetDeviceCount(). Did you run '
+            'some cuda functions before calling NumCudaDevices() that might have '
+            'already set an error? Error 802: system not yet initialized')
+    self.assertIsNotNone(R.looks_like_hardware_fault(tail))
+    self.assertIsNone(R.looks_like_code_bug(tail))
 
   def test_plain_runtime_error_is_still_a_code_bug(self):
     # NEGATIVE CONTROL: an ordinary crash (no host-fault phrase) stays a bug.
