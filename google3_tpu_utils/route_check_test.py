@@ -2020,6 +2020,95 @@ class RunReconcileColdRerunTest(unittest.TestCase):
     self.assertTrue(any('warm-restart queued' in l for l in log))
 
 
+class _HwEvidence(_FakeRestartEvidence):
+  """_FakeRestartEvidence plus the hardware_fault_of side channel."""
+
+  def __init__(self, by_xid=None, hw_by_xid=None):
+    super().__init__(by_xid)
+    self._hw = hw_by_xid or {}
+
+  def hardware_fault_of(self, entry):
+    return self._hw.get(entry.xid)
+
+
+class ReconcileHardwareFaultTest(unittest.TestCase):
+  """2026-09-30: two h100 jobs on one bad ga host died in NCCL init (NVLink P2P
+  disabled). A hardware death is external to a healthy run: reconcile must
+  auto-restart it (warm if a checkpoint exists, else bounded cold), steer the
+  restart off that (cell, arch), and label it HARDWARE, not CODE BUG."""
+
+  def setUp(self):
+    super().setUp()
+    p = mock.patch.object(RC, '_ALLOW_COLD_RERUN', True)
+    p.start()
+    self.addCleanup(p.stop)
+
+  def _dead(self, job_id, xid):
+    e = _submitted(job_id, xid, 'ga', submitted_at=0.0,
+                   launch_kwargs={'config': 'cfgH', 'exp_name': 'pc-h'})
+    e.arch = 'h100'
+    e.state = R.JobState.SUBMITTED
+    e.last_reason = 'h100-8 -> ga'
+    return e
+
+  def _run(self, e, ev):
+    probe = _FakeProbe({e.xid: RC.STATUS_TERMINAL},
+                       reasons={e.xid: 'RuntimeError: Failed to initialize '
+                                       'NCCL communicator'})
+    return RC.run_reconcile([e], now=100.0, probe=probe, dry_run=False,
+                            auto_resume_pruned=True, restart_evidence=ev,
+                            auto_resume_max=3)
+
+  def test_hw_fault_no_ckpt_never_trained_cold_reruns_off_bad_pair(self):
+    e = self._dead('h1', '901')
+    ev = _HwEvidence({'901': (None, None, False)},
+                     {'901': 'NVLink P2P disabled (bad GPU host): GPUs 6<->0'})
+    out, log = self._run(e, ev)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertIn('HARDWARE', e.last_reason)
+    self.assertNotIn('CODE BUG', e.last_reason)
+    new = [x for x in out if x.state == R.JobState.QUEUED]
+    self.assertEqual(len(new), 1)
+    self.assertNotIn('load_from', new[0].launch_kwargs)
+    self.assertTrue(R.pair_is_cooling(new[0], 'ga', 'h100', now=101.0))
+    self.assertTrue(any('steered off ga|h100' in l for l in log))
+
+  def test_hw_fault_with_ckpt_warm_restarts_off_bad_pair(self):
+    e = self._dead('h2', '902')
+    ev = _HwEvidence({'902': (None, '/cns/x/steps/step_1000.pt', True)},
+                     {'902': 'NVLink P2P disabled (bad GPU host)'})
+    out, log = self._run(e, ev)
+    new = [x for x in out if x.state == R.JobState.QUEUED]
+    self.assertEqual(len(new), 1)
+    self.assertEqual(new[0].launch_kwargs['load_from'],
+                     '/cns/x/steps/step_1000.pt')
+    self.assertTrue(R.pair_is_cooling(new[0], 'ga', 'h100', now=101.0))
+
+  def test_same_death_without_hw_signal_still_holds(self):
+    # NEGATIVE CONTROL: identical row, never trained, no checkpoint, and NO
+    # hardware verdict -> HOLD (a startup crash), no restart, no strike.
+    e = self._dead('h3', '903')
+    ev = _HwEvidence({'903': (None, None, False)}, {})
+    out, log = self._run(e, ev)
+    self.assertEqual([x for x in out if x.state == R.JobState.QUEUED], [])
+    self.assertTrue(any('HOLD' in l for l in log))
+
+  def test_code_bug_outranks_hw_side_channel(self):
+    # GUARD: if the evidence ALSO reports a code bug, the code bug wins (HOLD).
+    e = self._dead('h4', '904')
+    ev = _HwEvidence({'904': ('segfault (SIGSEGV)', None, True)},
+                     {'904': 'NCCL reports a hardware issue'})
+    out, _ = self._run(e, ev)
+    self.assertEqual([x for x in out if x.state == R.JobState.QUEUED], [])
+
+  def test_summarize_xm_failure_labels_hardware(self):
+    self.assertTrue(RC._summarize_xm_failure(
+        'NCCL Last Error: P2P is disabled between NVLINK connected GPUs 6 and '
+        '0 ... probably due to a hardware issue').startswith('HARDWARE:'))
+    self.assertTrue(RC._summarize_xm_failure(
+        'RuntimeError: bad shape').startswith('CODE BUG:'))
+
+
 # --- submit timeout: local failure is not remote absence -------------------
 # ★The bug this covers cost real money: `tpu queue` timed out at 1800s, the
 # submitter reported "no XID", the worker counted a failed attempt and

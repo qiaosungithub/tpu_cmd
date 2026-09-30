@@ -1585,7 +1585,10 @@ RESUME_COLD = 'RESUME_COLD'
 # `trained` is usually the load-bearing signal and this set is a bonus when a
 # cause IS available (e.g. from the queue row's failure reason).
 _PREEMPTION_CAUSES = (
-    'preempt', 'evict', 'drain', 'pruned', 'reclaim', 'affinity', 'ici', 'fish'
+    'preempt', 'evict', 'drain', 'pruned', 'reclaim', 'affinity', 'ici', 'fish',
+    # A detected host/device fault (looks_like_hardware_fault): the machine
+    # killed a healthy run, so it is retried like a preemption, off that cell.
+    'hardware',
 )
 
 
@@ -1667,8 +1670,12 @@ def plan_pruned_restart(
         return HOLD, (
             f'auto-resume budget spent ({used}/{max_auto_resumes}); a human '
             f'should look before this burns another XID')
-      why_ev = ('a preemption/eviction cause' if preempted
-                else 'no cause recorded but the log shows training progress')
+      if 'hardware' in cause:
+        why_ev = 'a hardware fault on the host'
+      elif preempted:
+        why_ev = 'a preemption/eviction cause'
+      else:
+        why_ev = 'no cause recorded but the log shows training progress'
       return RESUME_COLD, (
           f'terminal with no checkpoint, but {why_ev}: a healthy run killed '
           f'before its first save -- bounded cold rerun from step 0')
@@ -1824,10 +1831,81 @@ def looks_like_code_bug(log_tail: str) -> Optional[str]:
   if not log_tail:
     return None
   up = _drop_benign_banner_lines(log_tail.upper())
+  # A HARDWARE fault outranks every code-bug needle: the host's failure raises
+  # through our code, so its log also carries a Traceback / RuntimeError, but
+  # the fix is another machine, not a code change (_HARDWARE_FAULT_SIGNATURES).
+  if _hardware_fault_in(up):
+    return None
   for matcher, verdict in _CODE_BUG_MATCHERS:
     if matcher.search(up):
       return verdict
   return None
+
+
+# --- hardware faults: the HOST broke, not our code --------------------------
+# Matched against the same banner-stripped, upper-cased log tail. Every needle
+# is a long, library-authored phrase that only appears when a device/host fault
+# was DETECTED -- never a bare word -- so a healthy log cannot trip it. Measured
+# 2026-09-30: two parcae h100 jobs on one ga host died 6 min apart in NCCL init
+# with "P2P is disabled between NVLINK connected GPUs 6 and 0 ... probably due to
+# a hardware issue"; the RuntimeError traceback made them read as CODE BUG, so
+# reconcile HELD them instead of retrying on another machine.
+# KEEP IN SYNC with infra_check._HARDWARE_FAULT_SIGNATURES (the board's twin).
+_HARDWARE_FAULT_SIGNATURES = (
+    ('P2P IS DISABLED BETWEEN NVLINK', 'NVLink P2P disabled (bad GPU host)'),
+    ('PROBABLY DUE TO A HARDWARE ISSUE', 'NCCL reports a hardware issue'),
+    ('UNCORRECTABLE ECC ERROR', 'GPU uncorrectable ECC error'),
+    ('GPU HAS FALLEN OFF THE BUS', 'GPU fell off the bus'),
+    ('NVML_ERROR_GPU_IS_LOST', 'GPU lost (NVML)'),
+)
+_NVLINK_PAIR_RE = re.compile(r'NVLINK CONNECTED GPUS (\d+) AND (\d+)')
+
+
+def _hardware_fault_in(log_upper: str) -> Optional[str]:
+  """Hardware-fault verdict for an ALREADY upper-cased, banner-stripped text."""
+  for needle, verdict in _HARDWARE_FAULT_SIGNATURES:
+    if needle in log_upper:
+      m = _NVLINK_PAIR_RE.search(log_upper)
+      if m:
+        verdict = f'{verdict}: GPUs {m.group(1)}<->{m.group(2)}'
+      return verdict
+  return None
+
+
+def looks_like_hardware_fault(log_tail: str) -> Optional[str]:
+  """Short verdict if the log TAIL shows the job died of a HOST/DEVICE fault
+  (bad NVLink, ECC, GPU lost), else None. Such a death is external to a healthy
+  run: the restart path treats it like a preemption (retry, off that cell)."""
+  if not log_tail:
+    return None
+  return _hardware_fault_in(_drop_benign_banner_lines(log_tail.upper()))
+
+
+# How long a restart avoids the (cell, arch) whose host failed. A penalty, not a
+# gate (see cell_score), like every other cooldown.
+HARDWARE_FAULT_COOLDOWN_S = 7200.0
+
+
+def carry_hardware_strike(new: 'QueueEntry', dead: 'QueueEntry', now: float,
+                          cooldown_s: float = HARDWARE_FAULT_COOLDOWN_S
+                          ) -> list[str]:
+  """Stamp the dead row's (cell, arch) onto its restart row `new` as a pair
+  cooldown + one eviction strike, so the restart is steered off the bad host's
+  cell. build_*_restart_entry deliberately carries no penalties (a fresh row),
+  which is right for a preemption but would let a hardware-fault restart land
+  straight back on the broken machine. Returns the keys stamped."""
+  keys = _blame_keys(dead)
+  if not keys:
+    return []
+  if not new.evictions:
+    new.evictions = {}
+  for key in keys:
+    stamp_pair_cooldown(new, key, now, cooldown_s)
+    rec = dict(new.evictions.get(key) or {})
+    rec['strikes'] = int(rec.get('strikes', 0) or 0) + 1
+    rec['last'] = now
+    new.evictions[key] = rec
+  return keys
 
 
 _OUT_DIR_PATTERNS = (

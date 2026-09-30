@@ -1883,6 +1883,90 @@ class LooksLikeCodeBugTest(unittest.TestCase):
         'MinLogLevel verified\ncaught signal 11 (SIGSEGV), dumping'))
 
 
+# The real 2026-09-30 NCCL tail (xid 294811894, ga h100): banner, traceback,
+# RuntimeError, and NCCL's own hardware diagnosis.
+_NCCL_HW_TAIL = (
+    '[parcae-torch] minloglevel VERIFIED = 1 (set AND read back). The NCCL '
+    'log-sink SIGSEGV workaround is in force.\n'
+    'Traceback (most recent call last):\n'
+    '  File "distributed_c10d.py", line 804, in _new_process_group_helper\n'
+    'RuntimeError: Failed to initialize NCCL communicator: unhandled cuda error '
+    '(run with NCCL_DEBUG=INFO for details)\n'
+    'NCCL Last Error: P2P is disabled between NVLINK connected GPUs 6 and 0. '
+    'This should not be the case given their connectivity, and is probably due '
+    'to a hardware issue. If you still want to proceed, you can set '
+    'NCCL_IGNORE_DISABLED_P2P=1.\n')
+
+
+class HardwareFaultTest(unittest.TestCase):
+  """A host/device fault is NOT a code bug: it raises through our code (so the
+  tail has a Traceback/RuntimeError) but the fix is another machine."""
+
+  def test_nccl_nvlink_fault_is_hardware_not_code_bug(self):
+    self.assertEqual(R.looks_like_hardware_fault(_NCCL_HW_TAIL),
+                     'NVLink P2P disabled (bad GPU host): GPUs 6<->0')
+    self.assertIsNone(R.looks_like_code_bug(_NCCL_HW_TAIL))
+
+  def test_other_device_faults_flag(self):
+    self.assertIsNotNone(R.looks_like_hardware_fault(
+        'RuntimeError: CUDA error: uncorrectable ECC error encountered'))
+    self.assertIsNotNone(R.looks_like_hardware_fault(
+        'NVRM: GPU at PCI:0000:3b:00: GPU has fallen off the bus.'))
+    self.assertIsNotNone(R.looks_like_hardware_fault(
+        'nvml returned NVML_ERROR_GPU_IS_LOST'))
+
+  def test_plain_runtime_error_is_still_a_code_bug(self):
+    # NEGATIVE CONTROL: an ordinary crash (no host-fault phrase) stays a bug.
+    tail = ('Traceback (most recent call last):\n  File "m.py"\n'
+            'RuntimeError: shape mismatch (4, 8) vs (8, 4)')
+    self.assertIsNone(R.looks_like_hardware_fault(tail))
+    self.assertIsNotNone(R.looks_like_code_bug(tail))
+
+  def test_healthy_logs_are_not_hardware(self):
+    # NEGATIVE CONTROL: the banner, and words like 'NVLink'/'ECC' in healthy
+    # device-info lines, must not trip the phrase-level matcher.
+    self.assertIsNone(R.looks_like_hardware_fault(
+        '[parcae-torch] minloglevel VERIFIED = 1. The NCCL log-sink SIGSEGV '
+        'workaround is in force.\n8 GPUs, NVLink 18 links, ECC enabled\n'
+        '[parcae-torch] step 100 loss 4.2'))
+    self.assertIsNone(R.looks_like_hardware_fault(''))
+
+  def test_hardware_cause_gives_bounded_cold_rerun(self):
+    # No checkpoint + a hardware cause -> RESUME_COLD even if it never trained
+    # (died in NCCL init), and the why names the hardware.
+    e = _entry(auto_resumes=0)
+    verdict, why = R.plan_pruned_restart(
+        e, xm_terminal=True, code_bug=None, checkpoint=None,
+        other_live_writer=False, trained=False,
+        termination_cause='hardware: NVLink P2P disabled', allow_cold=True)
+    self.assertEqual(verdict, R.RESUME_COLD)
+    self.assertIn('hardware fault', why)
+
+  def test_hardware_cold_rerun_still_budgeted(self):
+    # NEGATIVE CONTROL: a bad host cannot loop forever -- same budget.
+    e = _entry(auto_resumes=3)
+    verdict, _ = R.plan_pruned_restart(
+        e, xm_terminal=True, code_bug=None, checkpoint=None,
+        other_live_writer=False, trained=False,
+        termination_cause='hardware: x', allow_cold=True, max_auto_resumes=3)
+    self.assertEqual(verdict, R.HOLD)
+
+  def test_carry_hardware_strike_cools_dead_pair_on_new_row(self):
+    dead = _entry('d', power='h100-8', archs=('h100', 'b200'))
+    dead.cell, dead.arch = 'ga', 'h100'
+    new = _entry('n', power='h100-8', archs=('h100', 'b200'))
+    keys = R.carry_hardware_strike(new, dead, now=1000.0)
+    self.assertEqual(keys, ['ga|h100'])
+    self.assertTrue(R.pair_is_cooling(new, 'ga', 'h100', now=1001.0))
+    self.assertFalse(R.pair_is_cooling(new, 'ga', 'b200', now=1001.0))
+    self.assertEqual(new.evictions['ga|h100']['strikes'], 1)
+
+  def test_carry_hardware_strike_no_cell_is_noop(self):
+    new = _entry('n')
+    self.assertEqual(R.carry_hardware_strike(new, _entry('d'), now=1.0), [])
+    self.assertFalse(new.evictions)
+
+
 
 class OutDirFromLogTest(unittest.TestCase):
 

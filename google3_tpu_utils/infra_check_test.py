@@ -84,6 +84,9 @@ check_contains('descheduled',
 check_contains('gqm price', 'GQM_RESOURCE_DEFICIT_INFO: waiting for price', None)
 check_contains('capacity', 'Pool capacity exhausted', None)
 check_contains('defrag', 'Preempted (SLICE_DEFRAGMENTATION)', None)
+check_contains('affinity group', 'error: AFFINITY_GROUP_IN_USE', None)
+check_contains('tpu ici setup', 'TASK_ACTION_FISH_ICI_SECURITY_SETUP', None)
+check_contains('zero work units', 'reports ZERO work units; experiment is gone', None)
 
 # --- A price cap and an empty auction are DIFFERENT verdicts. ----------------
 # These three messages used to collapse into one string, "Queued (GQM price
@@ -125,6 +128,100 @@ check_reason(
     'yutulpz the demand from admitted jobs exceeds the available cell supply. '
     'See GQM_OVERSOLD_MARKET.',
     'Queued (cell oversold; try another cell)')
+check_reason(
+    'Borg affinity group in use',
+    'FAILED_PRECONDITION: AffinityGroup name: "nk_qiaos.qiaos_group_292021393.1.main_alloc_ghostfish_2_4_4/qiaos" '
+    'is still in use... [borg.BorgMasterErrorResponse] { error: AFFINITY_GROUP_IN_USE }',
+    'Borg AffinityGroup in use (transient conflict; retry/reroute)')
+check_reason(
+    'TPU ICI security setup failure',
+    'Borg task failed: TASK_ACTION_FISH_ICI_SECURITY_SETUP',
+    'TPU ICI setup failure (hardware/bad node; reroute)')
+check_reason(
+    'XManager 0 work units gone',
+    'reconciled: XM resolves the id but reports ZERO work units (was local RUNNING); experiment is gone, row cleaned up',
+    'XManager experiment gone (0 work units)')
+
+# --- Regression (2026-09-22): empty/boilerplate status.message + log_tail / 0 CNS logs ---
+class _FailedWU:
+  def __init__(self, text: str = '', status_name: str = 'FAILED'):
+    self.status = type('_S', (), {'message': text})()
+    self.status_name = status_name
+
+check(
+    'log_tail AttributeError surfaces when status.message is generic FAILURE',
+    infra_check.derive_failure_reason(
+        '292067869',
+        _FailedWU('qiaos_group_292067869_1: Job terminated in state FAILURE'),
+        {'bucket_cp_path': '/no/such/cns/path'},
+        log_tail="Traceback (most recent call last):\nAttributeError: type object 'JaxOperationKey' has no attribute 'DOT_GENERAL'",
+    ),
+    "CODE BUG: AttributeError (type object 'JaxOperationKey' has no attribute 'DOT_GENERAL')",
+)
+check(
+    'pre-InitGoogle crash diagnosed when failed with 0 CNS logs and empty message',
+    infra_check.derive_failure_reason(
+        '292070904',
+        _FailedWU(''),
+        {'bucket_cp_path': '/no/such/cns/path'},
+        log_tail='',
+    ),
+    'CODE BUG (pre-InitGoogle crash): task exited in state FAILURE at step 0 with 0 CNS logs (check module imports / config flags; run why_probe)',
+)
+
+_STARTUP_BANNER = """
+[parcae-torch] minloglevel READ-BACK unavailable (ModuleNotFoundError: No module named 'base'); dep //base/python/clif:cpp_flag
+[parcae-torch] ★ minloglevel SET BUT UNPROVEN (readback='UNREADABLE: ModuleNotFoundError'). The set_flag half arrived, the read-back half did not, so this run CANNOT tell a working workaround from an absent one. If rank 0 SIGSEGVs in its first collective, THIS is why. Add //base/python/clif:cpp_flag to the BUILD deps.
+"""
+
+check(
+    'startup banner must NOT be misclassified as segfault / ModuleNotFoundError',
+    infra_check.derive_failure_reason(
+        '292460119',
+        _FailedWU(''),
+        {'bucket_cp_path': '/no/such/cns/path'},
+        log_tail=_STARTUP_BANNER,
+    ),
+    'Failed, no reason reported (try why_probe)',
+)
+
+# --- Regression (2026-09-30): a host fault is HARDWARE, not CODE BUG ---------
+_NCCL_HW_TAIL = (
+    '[parcae-torch] minloglevel VERIFIED = 1 (set AND read back). The NCCL '
+    'log-sink SIGSEGV workaround is in force.\n'
+    'Traceback (most recent call last):\n'
+    'RuntimeError: Failed to initialize NCCL communicator: unhandled cuda error\n'
+    'NCCL Last Error: P2P is disabled between NVLINK connected GPUs 6 and 0. '
+    'This should not be the case given their connectivity, and is probably due '
+    'to a hardware issue.\n')
+check(
+    'NCCL NVLink P2P fault in the log tail reads as HARDWARE',
+    infra_check.derive_failure_reason(
+        '294811894',
+        _FailedWU('qiaos_group_294811894_1: Job terminated in state FAILURE'),
+        {'bucket_cp_path': '/no/such/cns/path'},
+        log_tail=_NCCL_HW_TAIL,
+    ),
+    'HARDWARE: NVLink P2P disabled (bad GPU host): GPUs 6<->0 '
+    '(not a code bug; router retries on another host)',
+)
+check(
+    'VERIFIED minloglevel banner alone is NOT a segfault',
+    infra_check.derive_failure_reason(
+        '294811924', _FailedWU(''), {'bucket_cp_path': '/no/such/cns/path'},
+        log_tail=_NCCL_HW_TAIL.splitlines()[0] + '\n',
+    ),
+    'Failed, no reason reported (try why_probe)',
+)
+check(
+    'plain RuntimeError is still a CODE BUG (negative control)',
+    infra_check.derive_failure_reason(
+        'x', _FailedWU('Job terminated in state FAILURE'),
+        {'bucket_cp_path': '/no/such/cns/path'},
+        log_tail='Traceback (most recent call last):\nRuntimeError: bad shape',
+    ),
+    'CODE BUG: RuntimeError (bad shape)',
+)
 
 # --- The job-name prefix must be stripped from unrecognised messages. --------
 

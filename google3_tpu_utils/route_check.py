@@ -1793,6 +1793,9 @@ def _summarize_xm_failure(xm_msg: str) -> str:
     return 'TPU ICI setup failure'
   if 'PREEMPT' in up or 'DESCHEDULED' in up:
     return 'preempted/descheduled'
+  hw = route_lib.looks_like_hardware_fault(xm_msg)
+  if hw:
+    return f'HARDWARE: {hw}'
   cb = route_lib.looks_like_code_bug(xm_msg)
   if cb:
     return f'CODE BUG: {cb}'
@@ -1838,6 +1841,14 @@ class CnsRestartEvidence:
     self._timeout_s = timeout_s
     self._head_bytes = head_bytes
     self._tail_bytes = tail_bytes
+    # xid -> hardware-fault verdict seen in that xid's log tail by the last
+    # read. A side channel rather than a 5th tuple slot, so every existing
+    # (code_bug, ckpt, trained, err) caller and test fake stays unchanged.
+    self._hardware_faults: dict[str, str] = {}
+
+  def hardware_fault_of(self, entry: 'route_lib.QueueEntry') -> Optional[str]:
+    """Hardware-fault verdict from the last read of `entry`'s log, or None."""
+    return self._hardware_faults.get(str(getattr(entry, 'xid', '') or ''))
 
   def code_bug_and_checkpoint(
       self, entry: 'route_lib.QueueEntry'
@@ -1867,6 +1878,11 @@ class CnsRestartEvidence:
       head, tail = _read_log_head_tail(
           log_path, self._head_bytes, self._tail_bytes, self._timeout_s)
       code_bug = route_lib.looks_like_code_bug(tail)
+      hw = route_lib.looks_like_hardware_fault(tail)
+      if hw:
+        self._hardware_faults[str(entry.xid)] = hw
+      else:
+        self._hardware_faults.pop(str(entry.xid), None)
       out_dir = (route_lib.out_dir_from_log(head)
                  or route_lib.out_dir_from_log(tail))
       if not out_dir and '/logs/rank_0_attempt' in log_path:
@@ -1899,6 +1915,36 @@ class CnsCheckpointProbe:
           f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*', self._timeout_s), ''
     except CnsReadError as exc:
       return None, str(exc)
+
+
+def _hardware_fault_of(evidence, entry: 'route_lib.QueueEntry') -> Optional[str]:
+  """The evidence reader's hardware-fault verdict for `entry`, or None. Fakes
+  and older readers without `hardware_fault_of` read as 'no fault'. Never
+  raises."""
+  getter = getattr(evidence, 'hardware_fault_of', None) if evidence else None
+  if getter is None:
+    return None
+  try:
+    return getter(entry) or None
+  except Exception:  # pylint: disable=broad-except
+    return None
+
+
+def _steer_off_bad_host(new: 'route_lib.QueueEntry',
+                        dead: 'route_lib.QueueEntry', evidence, now: float,
+                        log: list[str], tag: str) -> None:
+  """If `dead` died of a hardware fault, carry a cooldown + eviction strike on
+  its (cell, arch) onto the restart row `new`, so it is not re-placed on the
+  broken host's cell."""
+  hw = _hardware_fault_of(evidence, dead)
+  if not hw:
+    return
+  keys = route_lib.carry_hardware_strike(new, dead, now)
+  if keys:
+    log.append(f'[auto-resume] {tag}: hardware fault ({hw}) -> restart '
+               f'{new.job_id} steered off {", ".join(keys)} '
+               f'(cooled {int(route_lib.HARDWARE_FAULT_COOLDOWN_S)}s + '
+               f'eviction strike)')
 
 
 def _gather_restart_evidence(dead: 'route_lib.QueueEntry', evidence):
@@ -1988,6 +2034,11 @@ def _restart_decision(dead: 'route_lib.QueueEntry',
   allow = _ALLOW_COLD_RERUN if allow_cold is None else allow_cold
   other = route_lib.has_live_config_sibling(dead, entries)
   cause = _termination_cause_of(dead)
+  hw = _hardware_fault_of(evidence, dead)
+  if hw:
+    # A detected host/device fault is positive evidence the death was external
+    # to a healthy run (route_lib._PREEMPTION_CAUSES carries 'hardware').
+    cause = f'hardware: {hw}'
   plan = route_lib.plan_pruned_restart(
       dead, xm_terminal=True, code_bug=cb, checkpoint=ckpt,
       other_live_writer=other, max_auto_resumes=max_resumes,
@@ -2256,6 +2307,12 @@ def run_reconcile(
       continue
     old_val = e.state.value
     summary = _summarize_xm_failure(xm_reason) if st != STATUS_GONE else ''
+    hw_seen = (_hardware_fault_of(restart_evidence, e)
+               if ev is not None and st != STATUS_GONE else None)
+    if hw_seen:
+      # The CNS log names the host fault even when XM's message only carries
+      # the RuntimeError it raised through our code.
+      summary = f'HARDWARE: {hw_seen}'
     reconcile_reason = (
         f'reconciled: XM reports terminal (was local {old_val}; '
         f'cause: {summary}); zombie cleaned up'
@@ -2310,6 +2367,7 @@ def run_reconcile(
             n_resumed += 1
             log.append(f'[auto-resume] {tag}: warm-restart queued as '
                        f'{new.job_id} from {ckpt}')
+            _steer_off_bad_host(new, e, restart_evidence, now, log, tag)
           elif verdict == route_lib.RESUME_COLD:
             new = route_lib.build_cold_restart_entry(
                 e, _new_resume_job_id(e.power))
@@ -2317,6 +2375,7 @@ def run_reconcile(
             n_resumed += 1
             log.append(f'[auto-resume] {tag}: COLD rerun queued as '
                        f'{new.job_id} ({why})')
+            _steer_off_bad_host(new, e, restart_evidence, now, log, tag)
           else:
             if 'code bug (' in why and 'cause:' not in (e.last_reason or ''):
               e.last_reason = f'{e.last_reason} [{why.split(";")[0]}]'

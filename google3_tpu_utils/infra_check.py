@@ -293,6 +293,16 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info, log_tail=''):
     if 'ZERO WORK UNITS' in msg_upper or 'NO WORK UNITS' in msg_upper or 'EXPERIMENT IS GONE' in msg_upper:
         return 'XManager experiment gone (0 work units)'
 
+    # Rule 5c: HARDWARE faults on the host (bad NVLink / ECC / GPU lost). Checked
+    # BEFORE the application rule: the fault raises through our code, so the
+    # same text also carries a Traceback / RuntimeError, but the fix is another
+    # machine, not a code change. The router auto-resumes these off that cell.
+    hw = _hardware_fault(msg_upper)
+    if not hw and log_tail:
+        hw = _hardware_fault(_clean_log_for_analysis(log_tail).upper())
+    if hw:
+        return f'HARDWARE: {hw} (not a code bug; router retries on another host)'
+
     # Rule 6: APPLICATION errors -- the job's own code broke, not the infra.
     # Also inspect the CNS rank-log tail (`log_tail`) when XManager's
     # status.message is empty or merely says "Job terminated in state FAILURE".
@@ -402,6 +412,34 @@ _APP_ERROR_MATCHERS = tuple(
     (_compile_app_error_matcher(needle), verdict)
     for needle, verdict in _APPLICATION_ERROR_SIGNATURES
 )
+
+
+# Host/device faults. Long, library-authored phrases that only appear when a
+# fault was DETECTED, never bare words. Measured 2026-09-30: two h100 jobs on
+# one ga host died in NCCL init with "P2P is disabled between NVLINK connected
+# GPUs 6 and 0 ... probably due to a hardware issue" and the board said
+# CODE BUG: RuntimeError. KEEP IN SYNC with route_lib._HARDWARE_FAULT_SIGNATURES.
+_HARDWARE_FAULT_SIGNATURES = (
+    ('P2P IS DISABLED BETWEEN NVLINK', 'NVLink P2P disabled (bad GPU host)'),
+    ('PROBABLY DUE TO A HARDWARE ISSUE', 'NCCL reports a hardware issue'),
+    ('UNCORRECTABLE ECC ERROR', 'GPU uncorrectable ECC error'),
+    ('GPU HAS FALLEN OFF THE BUS', 'GPU fell off the bus'),
+    ('NVML_ERROR_GPU_IS_LOST', 'GPU lost (NVML)'),
+)
+_NVLINK_PAIR_RE = re.compile(r'NVLINK CONNECTED GPUS (\d+) AND (\d+)')
+
+
+def _hardware_fault(text_upper):
+    """Hardware-fault verdict for upper-cased text, or None."""
+    if not text_upper:
+        return None
+    for needle, verdict in _HARDWARE_FAULT_SIGNATURES:
+        if needle in text_upper:
+            m = _NVLINK_PAIR_RE.search(text_upper)
+            if m:
+                verdict = f'{verdict}: GPUs {m.group(1)}<->{m.group(2)}'
+            return verdict
+    return None
 
 
 # How long after submission a missing work unit is still considered normal.
