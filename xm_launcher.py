@@ -89,6 +89,7 @@ _LOCALITY_SOURCE = os.path.expanduser(
 # _METRO_STORAGE_CELL below.
 _CELL_LOCALITY = {
     'lcbomp':      ('bom', 'ap'),
+    'lcbomy':      ('bom', 'ap'),
     'ly':          ('bom', 'ap'),
     'wu':          ('icn', 'ap'),
     'yukulwh':     ('kul', 'ap'),
@@ -101,6 +102,7 @@ _CELL_LOCALITY = {
     'si':          ('sin', 'ap'),
     'sj':          ('sin', 'ap'),
     'sk':          ('sin', 'ap'),
+    'sk-ml':       ('sin', 'ap'),
     'sl':          ('sin', 'ap'),
     'sm':          ('sin', 'ap'),
     'sn':          ('sin', 'ap'),
@@ -125,6 +127,7 @@ _CELL_LOCALITY = {
     'wh':          ('bru', 'eu'),
     'wi':          ('bru', 'eu'),
     'wq':          ('bru', 'eu'),
+    'yubrugv':     ('bru', 'eu'),
     'yubrupd-c':   ('bru', 'eu'),
     'ra':          ('dhr', 'eu'),
     'rb':          ('dhr', 'eu'),
@@ -214,6 +217,7 @@ _CELL_LOCALITY = {
     'vz':          ('chs', 'na'),
     'yuchspe':     ('chs', 'na'),
     'yuchstz':     ('chs', 'na'),
+    'yucidjy':     ('cid', 'na'),
     'ma':          ('ckv', 'na'),
     'mb':          ('ckv', 'na'),
     'md':          ('ckv', 'na'),
@@ -249,6 +253,7 @@ _CELL_LOCALITY = {
     'rw':          ('dfw', 'na'),
     'yudfwra':     ('dfw', 'na'),
     'yudfwra-c':   ('dfw', 'na'),
+    'yudfwta':     ('dfw', 'na'),
     'pw':          ('dls', 'na'),
     'px':          ('dls', 'na'),
     'py':          ('dls', 'na'),
@@ -265,6 +270,7 @@ _CELL_LOCALITY = {
     'ww':          ('iad', 'na'),
     'yuiadrs':     ('iad', 'na'),
     'yuiadtq':     ('iad', 'na'),
+    'yuiadum':     ('iad', 'na'),
     'dd':          ('las', 'na'),
     'dl':          ('las', 'na'),
     'dy':          ('las', 'na'),
@@ -319,6 +325,7 @@ _CELL_LOCALITY = {
 # because every cell in a metro shares its storage.
 _METRO_STORAGE_CELL = {
     'cbf':   'is-d',
+    'cid':   'yucidjy-d',
     'ckv':   'mb-d',
     'cmh':   'go-d',
     'dfw':   'rs-d',

@@ -562,8 +562,8 @@ pytype_strict_contrib_test(
 )
 
 pytype_strict_contrib_test(
-    name = "reroutebackoff_test",
-    srcs = ["reroutebackoff_test.py"],
+    name = "reroutebrake_test",
+    srcs = ["reroutebrake_test.py"],
     deps = [
         ":route_check_lib",
         ":route_lib",

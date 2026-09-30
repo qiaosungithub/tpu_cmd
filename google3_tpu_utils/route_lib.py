@@ -1953,7 +1953,7 @@ def apply_warm_restart_in_place(entry: 'QueueEntry',
   ★RECONCILE/REROUTE PARITY. run_reconcile handles a just-FAILED row by
   APPENDING a fresh build_warm_restart_entry row: it has no row to keep (the
   dead one goes FAILED), and a new row needs its whole spec cloned. run_reroute
-  is MOVING a row it KEEPS -- same job_id, same reroute backoff counter, and
+  is MOVING a row it KEEPS -- same job_id, same reroute counter, and
   (crucially) the pair cooldown + eviction strike mark_reroute/record_eviction
   just stamped ON THIS ROW so the next placement avoids the cell it was pulled
   off. build_warm_restart_entry carries NONE of those forward, so substituting a
@@ -2125,7 +2125,6 @@ def best_cell_for_shape(
   # turn a lookup miss into "no capacity anywhere", the exact failure that made
   # `--metro` read as an empty fleet.
   ranked: list[tuple[float, int, CellAvail]] = []
-  rejected_no_storage: list[str] = []
   rejected_over_cap: list[str] = []
   cap = _family_price_cap(arch)
   for ca in avail_by_cell.values():
@@ -2134,7 +2133,8 @@ def best_cell_for_shape(
     if allowed_metros and ca.metro.lower() not in allowed_metros:
       continue
     if not _metro_has_group_storage(ca.metro):
-      rejected_no_storage.append(ca.cell)
+      # Silent on purpose: see SAY WHY below -- a storage-less cell is simply
+      # not a candidate, so it never appears in the why-not line.
       continue
     if cap is not None and ca.price is not None and ca.price > cap:
       rejected_over_cap.append(ca.cell)
@@ -2171,17 +2171,20 @@ def best_cell_for_shape(
     # function's return type; plan_one folds it into the one-line reason that
     # `tpu check` / `tpu queue-status` show for a waiting job, so it is one
     # short clause per gate (why each gate exists is explained above).
-    if rejected_no_storage or rejected_over_cap:
-      bits = []
-      if rejected_no_storage:
-        names = sorted(rejected_no_storage)
-        bits.append(f'{len(names)} cell(s) in metros without group storage ('
-                    + ','.join(names[:3]) + (',...' if len(names) > 3 else '')
-                    + ')')
-      if rejected_over_cap:
-        bits.append(f'{len(rejected_over_cap)} cell(s) over limit-order cap '
-                    f'{cap}')
-      entry.last_filter_reason = f'{arch}-{chips}: ' + '; '.join(bits)
+    #
+    # ★THE STORAGE GATE IS NOT NAMED (operator 2026-09-30). The operator's
+    # contract is that the router handles storage by itself, so a cell in a
+    # metro without group storage is not a candidate at all, and the only
+    # honest reading for the user is "no free slice". Naming it ("N cell(s) in
+    # metros without group storage") read as a misconfigured submission, and it
+    # also hid the real cause: the gate runs before the free-chip check, so the
+    # listed cells were not even known to have a free slice, while every
+    # storage metro was simply full. Falls through to plan_one's no-free-slice
+    # note.
+    if rejected_over_cap:
+      entry.last_filter_reason = (
+          f'{arch}-{chips}: {len(rejected_over_cap)} cell(s) over limit-order '
+          f'cap {cap}')
     return None
   # score asc (cheapest effective), then roomier first as the tie-break
   ranked.sort(key=lambda r: (r[0], r[1]))
@@ -2266,8 +2269,9 @@ def plan_one(entry: QueueEntry,
 
   WHY-NOT (diagnostic only; no decision reads it). When nothing places,
   `entry.last_filter_reason` gets one line naming, per accepted arch, why its
-  preferred shape found no cell: the hard gate that refused its cells (no group
-  storage, over the limit-order cap) or "no free slice". It is reset on every
+  preferred shape found no cell: over the limit-order cap, or "no free slice"
+  (which also covers cells skipped for lacking group storage -- the router owns
+  that gate, so it is never surfaced to the user). It is reset on every
   call, so a row never carries a verdict from an earlier pass, and is '' when a
   placement is returned. `tpu check` / `tpu queue-status` show it.
 
@@ -2402,19 +2406,11 @@ def apply_placement(entry: QueueEntry, placement: Placement, xid: str,
   return entry
 
 
-# ★Re-route backoff disabled (2026-09-21, operator directive): exponential
-# backoff (2^min(reroutes, 4)) multiplied a 600s deadline into 9600s (160 min)
-# and trapped jobs stuck behind TRIGGERED_LIMIT_ORDER or capacity deficits for
-# 2.7 hours. Churn is already bounded by the (cell, arch) pair cooldown and the
-# global rate cap (REROUTE_GLOBAL_MAX_PER_HOUR).
-REROUTE_BACKOFF_MAX_DOUBLINGS = 0   # 0 = fixed deadline (base_s), no backoff
-
-
-# ★The GLOBAL brake, and why per-row backoff is not enough on its own: the
-# backoff above keys off entry.reroutes, which lives ON THE ROW, so dequeuing a
-# churning job and re-enqueuing it resets the counter to 0. Measured 2026-09-01:
-# one experiment burned 7 number plates across TWO rows (5 on a row that was
-# then dequeued, 2 on its replacement), and a per-row counter sees only the 2.
+# ★The GLOBAL brake, and why it is keyed on nothing: entry.reroutes lives ON
+# THE ROW, so dequeuing a churning job and re-enqueuing it resets the counter
+# to 0. Measured 2026-09-01: one experiment burned 7 number plates across TWO
+# rows (5 on a row that was then dequeued, 2 on its replacement), and a
+# per-row counter sees only the 2.
 # exp_name cannot key it either (it changed every re-send: armA, armA2, ...
 # 22 rows, 22 names), nor can load_from (9 unrelated rows shared one ckpt).
 # So the brake is keyed on NOTHING: it counts what the re-router itself did in
@@ -2441,14 +2437,23 @@ def global_reroute_brake(recent_reroute_times: Sequence[float], now: float,
   return sum(1 for t in recent_reroute_times if t >= cutoff) >= max_per_hour
 
 
-def reroute_deadline_s(entry: QueueEntry, base_s: float) -> float:
-  """Patience for THIS attempt: base * 2^min(reroutes, MAX_DOUBLINGS). Pure.
+# ★GPU PATIENCE (operator 2026-09-24 14:09Z, "同意" to doubling the GPU wait).
+# A GPU job waits in its pool's Borg queue before Borg even creates the job:
+# measured 14:05Z on 14 live rows, XM submit -> Borg job created took 95-655s
+# on b200@sj (g5) and 146-267s on h100@sm/sh (g3), then created -> VM group RUN
+# only 13-59s. So the 300s deadlines cancelled GPU jobs mid-queue: 6.25h before
+# the change, 43 of 59 GPU submissions (73%) ended re-routed, 28 of them
+# "nominally RUNNING" at 305-531s, while 3 of the 4 sj b200 jobs that did start
+# needed > 300s (347 / 702 / 710s). GPU rows get this multiple of BOTH the
+# pending re-route deadline and the nominal-RUNNING grace; TPU rows keep 1x.
+GPU_PATIENCE_MULTIPLIER = 2.0
 
-  A job that has already been moved N times is, empirically, not a job whose
-  next placement lands in 600s -- so each move buys the next attempt more time
-  instead of re-running the same failed experiment at the same speed."""
-  n = min(max(entry.reroutes, 0), REROUTE_BACKOFF_MAX_DOUBLINGS)
-  return base_s * (2 ** n)
+
+def patience_s(entry: 'QueueEntry', base_s: float) -> float:
+  """`base_s` scaled for this row's placed arch: GPU_PATIENCE_MULTIPLIER x for
+  a GPU, 1x otherwise (TPU, or no arch recorded). Pure."""
+  return base_s * (GPU_PATIENCE_MULTIPLIER
+                   if is_gpu(getattr(entry, 'arch', None) or '') else 1.0)
 
 
 def needs_reroute(entry: QueueEntry, now: float, reroute_after_s: float) -> bool:
@@ -2458,16 +2463,17 @@ def needs_reroute(entry: QueueEntry, now: float, reroute_after_s: float) -> bool
   by only calling this for jobs it has confirmed are still PENDING. Here we just
   own the CLOCK part of the rule: submitted, and older than the deadline.
 
-  The deadline GROWS with entry.reroutes (see reroute_deadline_s): a job moved
-  many times waits longer before the next move, but it is never given up on --
-  there is no bound past which re-routing stops. Churn stays bounded by that
-  backoff and by the global rate cap, and entry.reroutes is shown on the board
-  so a human can spot a stuck car and act."""
+  The deadline is `patience_s(entry, reroute_after_s)`: fixed for a given
+  arch, independent of how many times the row has been moved. A job is never
+  given up on -- there is no bound past which re-routing stops. Churn stays
+  bounded by the (cell, arch) pair cooldown and the global rate cap, and
+  entry.reroutes is shown on the board so a human can spot a stuck car and
+  act."""
   if entry.state != JobState.SUBMITTED:
     return False
   if entry.submitted_at is None:
     return False
-  return (now - entry.submitted_at) >= reroute_deadline_s(entry, reroute_after_s)
+  return (now - entry.submitted_at) >= patience_s(entry, reroute_after_s)
 
 
 def needs_liveness_recheck(entry: QueueEntry, now: float,
@@ -2476,8 +2482,8 @@ def needs_liveness_recheck(entry: QueueEntry, now: float,
   against something OTHER than XManager.
 
   ★Deliberately separate from needs_reroute. That function owns one question --
-  "is a SUBMITTED job stuck in the auction past its patience" -- and its clock
-  carries the re-route backoff. This one owns a different question: "is a row we
+  "is a SUBMITTED job stuck in the auction past its patience". This one owns a
+  different question: "is a row we
   already promoted to RUNNING actually on hardware?" XManager reports RUNNING
   for a job whose Borg VM groups never left PENDING, and because needs_reroute
   selects SUBMITTED only, promoting such a row removed it from every mechanism
@@ -2485,13 +2491,14 @@ def needs_liveness_recheck(entry: QueueEntry, now: float,
   PENDING, zero bytes written, six unused fallback metros).
 
   Selecting a row here is NOT a verdict -- the caller must confirm with an
-  independent probe before acting.
+  independent probe before acting. `grace_s` is the TPU base; a GPU row gets
+  patience_s(grace_s).
   """
   if entry.state != JobState.RUNNING:
     return False
   if entry.submitted_at is None:
     return False
-  return (now - entry.submitted_at) >= grace_s
+  return (now - entry.submitted_at) >= patience_s(entry, grace_s)
 
 
 def output_is_fresh(latest_mtime: Optional[float], now: float,

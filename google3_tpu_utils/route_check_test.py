@@ -2270,6 +2270,36 @@ class NominalRunningRerouteTest(unittest.TestCase):
     self.assertEqual(e.state, R.JobState.RUNNING)
     self.assertEqual(borg.calls, [])          # not even selected yet
 
+  def test_gpu_row_gets_double_grace(self):
+    # Operator 2026-09-24: b200@sj waited 95-655s for Borg to create the job,
+    # so a GPU row is judged against 2x the grace; a TPU row keeps 1x.
+    for arch, now, cancelled in (('b200', 500.0, False), ('b200', 650.0, True),
+                                 ('h100', 599.0, False), ('v7', 500.0, True)):
+      e = _running('j1', '111', 'sj', submitted_at=0.0)
+      e.arch = arch
+      sub, log, _ = self._run(e, borg_answer=False, mtime=None, now=now,
+                              grace=300.0)
+      self.assertEqual(sub.cancels, ['111'] if cancelled else [], (arch, now))
+      if cancelled:
+        grace = 600 if arch == 'b200' else 300
+        self.assertTrue(any(f'> {grace}s grace' in l for l in log), log)
+
+  def test_submitted_gpu_row_xm_running_uses_gpu_grace(self):
+    # A SUBMITTED row reaches the same branch through the pending deadline;
+    # the grace there must be the GPU one too, not the TPU base.
+    # _run's pending deadline is 600s, so a b200 row is picked at 1200s.
+    e = _submitted('j1', '111', 'sj', submitted_at=0.0)
+    e.arch, e.chips = 'b200', 8
+    sub, _, _ = self._run(e, borg_answer=False, mtime=None, now=1100.0,
+                          grace=300.0)
+    self.assertEqual(sub.cancels, [])
+    e = _submitted('j1', '111', 'sj', submitted_at=0.0)
+    e.arch, e.chips = 'b200', 8
+    sub, log, _ = self._run(e, borg_answer=False, mtime=None, now=1250.0,
+                            grace=300.0)
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertTrue(any('> 600s grace' in l for l in log), log)
+
   def test_dry_run_reports_but_does_not_cancel(self):
     e = _running('j1', '111', 'sj', submitted_at=0.0)
     sub, log, _ = self._run(e, borg_answer=False, mtime=None, dry_run=True)

@@ -2175,7 +2175,7 @@ def _reroute_requeue_after_cancel(
   restart_evidence=None (the default, and every existing test/call site) the plan
   is always HOLD, so the requeue is a bare cold start -- behaviour UNCHANGED.
 
-  We KEEP the row (same job_id, same reroute-backoff counter, and the cell
+  We KEEP the row (same job_id, same reroute counter, and the cell
   cooldown + eviction strike just stamped on it) and resume it warm IN PLACE
   (route_lib.apply_warm_restart_in_place) rather than appending a fresh row as
   reconcile does: build_warm_restart_entry carries none of those penalties
@@ -2460,13 +2460,16 @@ def run_reroute(
       vm_running = borg_probe.has_running_vmgroup(e) if borg_probe else None
       cell_known = bool((e.cell or '').strip())
       nominal = False
-      if vm_running is False and age >= nominal_running_grace_s and xid:
+      # GPU rows get route_lib.GPU_PATIENCE_MULTIPLIER x the grace (they queue
+      # minutes in their pool before Borg creates the job); TPU rows 1x.
+      grace_s = route_lib.patience_s(e, nominal_running_grace_s)
+      if vm_running is False and age >= grace_s and xid:
         # `latest_mtime` conflates "dir missing" with "lookup failed", so this
         # asks the weaker question it can actually answer: has ANYTHING ever
         # been written? A job holding chips writes rank logs within minutes.
         mtime_ever = output_probe.latest_mtime(e) if output_probe else None
         nominal = mtime_ever is None
-      elif not cell_known and age >= nominal_running_grace_s and xid:
+      elif not cell_known and age >= grace_s and xid:
         # ★STRUCTURALLY UNVERIFIABLE, NOT MERELY UNREAD. The row is STILL
         # cell-less after the recovery above (XM carried no usable placement, or
         # no probe was supplied). has_running_vmgroup's None here means
@@ -2495,10 +2498,10 @@ def run_reroute(
         continue
       stuck_why = (
           f'XM says RUNNING but the row has NO cell to verify against '
-          f'({age}s > {int(nominal_running_grace_s)}s grace; placement '
+          f'({age}s > {int(grace_s)}s grace; placement '
           f'unrecoverable from XM)' if not cell_known
           else f'XM says RUNNING but NO Borg VM group is RUN and nothing was '
-               f'ever written ({age}s > {int(nominal_running_grace_s)}s grace)')
+               f'ever written ({age}s > {int(grace_s)}s grace)')
       _reroute_requeue_after_cancel(
           e, xid, now, entries=entries, submitter=sub, dry_run=dry_run,
           cooldown_s=cooldown_s, hist=hist, history_file=history_file, log=log,

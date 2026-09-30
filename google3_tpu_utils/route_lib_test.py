@@ -287,14 +287,35 @@ class RerouteTest(unittest.TestCase):
     e.submitted_at = 0.0
     self.assertFalse(R.needs_reroute(e, now=1e9, reroute_after_s=600))
 
-  def test_reroute_deadline_has_no_exponential_backoff(self):
+  def test_reroute_deadline_independent_of_reroute_count(self):
     e = _entry()
     e.state = R.JobState.SUBMITTED
     e.submitted_at = 1000.0
     for r in (0, 1, 4, 10):
       e.reroutes = r
-      self.assertEqual(R.reroute_deadline_s(e, base_s=300.0), 300.0)
+      self.assertFalse(R.needs_reroute(e, now=1299.0, reroute_after_s=300.0))
       self.assertTrue(R.needs_reroute(e, now=1300.0, reroute_after_s=300.0))
+
+  def test_gpu_rows_get_double_patience_tpu_unchanged(self):
+    # Operator 2026-09-24: a GPU job queues minutes in its pool before Borg
+    # creates it, so GPU rows wait GPU_PATIENCE_MULTIPLIER x the base deadline.
+    self.assertEqual(R.GPU_PATIENCE_MULTIPLIER, 2.0)
+    for arch, deadline in (('b200', 600.0), ('h100', 600.0), ('v7', 300.0),
+                           ('v6e', 300.0), (None, 300.0)):
+      e = _entry()
+      e.state = R.JobState.SUBMITTED
+      e.submitted_at = 1000.0
+      e.arch = arch
+      self.assertEqual(R.patience_s(e, base_s=300.0), deadline, arch)
+      self.assertFalse(R.needs_reroute(e, now=1000.0 + deadline - 1,
+                                       reroute_after_s=300.0), arch)
+      self.assertTrue(R.needs_reroute(e, now=1000.0 + deadline,
+                                      reroute_after_s=300.0), arch)
+      e.state = R.JobState.RUNNING
+      self.assertFalse(R.needs_liveness_recheck(e, now=1000.0 + deadline - 1,
+                                                grace_s=300.0), arch)
+      self.assertTrue(R.needs_liveness_recheck(e, now=1000.0 + deadline,
+                                               grace_s=300.0), arch)
 
   def test_mark_reroute_sets_cooldown_and_requeues(self):
     e = _entry()
@@ -2217,7 +2238,7 @@ class ResolveJobRefsTest(unittest.TestCase):
 
 class ApplyWarmRestartInPlaceTest(unittest.TestCase):
   """The IN-PLACE warm-restart the reroute path uses: the SAME row is kept
-  (job_id, backoff counter, cooldowns), and only the resume pointer is wired in,
+  (job_id, reroute counter, cooldowns), and only the resume pointer is wired in,
   layout-correctly (ELT restart_from vs torch load_from). The twin of
   build_warm_restart_entry (which mints a fresh row for the reconcile path); both
   share _apply_resume_pointer, so the silently-destructive layout trap is decided
@@ -2373,16 +2394,27 @@ class PlanOneWhyNotTest(unittest.TestCase):
     self.assertEqual(e.last_filter_reason,
                      'v7-32: 1 cell(s) over limit-order cap 20')
 
-  def test_no_group_storage_is_named(self):
+  def test_no_group_storage_reads_as_no_free_slice(self):
+    # The router owns the storage gate; the user only ever sees "no free
+    # slice" (operator 2026-09-30), never the storage-less cells it skipped.
     e = _entry(power='v7-32', archs=('v7',))
     avail = {f'c{i}': _avail(f'c{i}', 'v7', free=320, metro='nostore')
              for i in range(5)}
     with mock.patch.object(R, '_metro_has_group_storage',
                            lambda m: m != 'nostore'):
       self.assertIsNone(R.plan_one(e, avail, now=0.0))
-    self.assertEqual(
-        e.last_filter_reason,
-        'v7-32: 5 cell(s) in metros without group storage (c0,c1,c2,...)')
+    self.assertEqual(e.last_filter_reason, 'v7-32: no free slice')
+    self.assertNotIn('storage', e.last_filter_reason)
+
+  def test_over_cap_still_named_when_storage_cells_also_skipped(self):
+    e = _entry(power='v7-32', archs=('v7',))
+    avail = {'s': _avail('s', 'v7', free=320, metro='nostore'),
+             'c7': _avail('c7', 'v7', free=320, price=25.0)}
+    with mock.patch.object(R, '_metro_has_group_storage',
+                           lambda m: m != 'nostore'):
+      self.assertIsNone(R.plan_one(e, avail, now=0.0))
+    self.assertEqual(e.last_filter_reason,
+                     'v7-32: 1 cell(s) over limit-order cap 20')
 
   def test_no_accepted_shape_is_named(self):
     # A locked v6p-32 (2x4x4) matches no v6e mesh, so no shape is tried.

@@ -33,7 +33,7 @@ Dependency-free by design (stdlib only, no google3, no I/O at import) so every
 layer -- launcher, router, training binary, dataloader -- can import the same
 module and cannot disagree.
 
-MEASURED 2026-08-30T03:03:42Z over 259 candidate cells: 259 resolved, 0 unresolved.
+MEASURED 2026-09-24T01:41:17Z over 267 candidate cells: 267 resolved, 0 unresolved.
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ UNKNOWN = _Unknown()
 #   (none -- every probed cell resolved)
 _MEASURED: dict[str, tuple[str, str, str]] = {
     'lcbomp':      ('bom', 'ap', 'muk'),
+    'lcbomy':      ('bom', 'ap', 'mhe'),
     'ly':          ('bom', 'ap', 'kwa'),
     'wu':          ('icn', 'ap', 'gmh'),
     'yukulwh':     ('kul', 'ap', 'ebp'),
@@ -79,6 +80,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'si-d':        ('sin', 'ap', 'wen'),
     'sj':          ('sin', 'ap', 'lyw'),
     'sk':          ('sin', 'ap', 'lyw'),
+    'sk-ml':       ('sin', 'ap', 'lyw'),
     'sl':          ('sin', 'ap', 'wen'),
     'sm':          ('sin', 'ap', 'wen'),
     'sm-d':        ('sin', 'ap', 'wen'),
@@ -105,6 +107,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'wh':          ('bru', 'eu', 'gbl'),
     'wi':          ('bru', 'eu', 'gbl'),
     'wq':          ('bru', 'eu', 'gbl'),
+    'yubrugv':     ('bru', 'eu', 'gbl'),
     'yubrupd-c':   ('bru', 'eu', 'gbl'),
     'ra':          ('dhr', 'eu', 'agr'),
     'rb':          ('dhr', 'eu', 'agr'),
@@ -209,6 +212,8 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'vz':          ('chs', 'na', 'mnk'),
     'yuchspe':     ('chs', 'na', 'mnk'),
     'yuchstz':     ('chs', 'na', 'sml'),
+    'yucidjy':     ('cid', 'na', 'ewd'),
+    'yucidjy-d':   ('cid', 'na', 'ewd'),
     'ma':          ('ckv', 'na', 'spc'),
     'mb':          ('ckv', 'na', 'spc'),
     'mb-d':        ('ckv', 'na', 'spc'),
@@ -252,6 +257,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'rw-d':        ('dfw', 'na', 'mdn'),
     'yudfwra':     ('dfw', 'na', 'red'),
     'yudfwra-c':   ('dfw', 'na', 'red'),
+    'yudfwta':     ('dfw', 'na', 'mdn'),
     'pw':          ('dls', 'na', 'dls'),
     'px':          ('dls', 'na', 'dls'),
     'py':          ('dls', 'na', 'dls'),
@@ -268,6 +274,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'ww':          ('iad', 'na', 'ara'),
     'yuiadrs':     ('iad', 'na', 'rlf'),
     'yuiadtq':     ('iad', 'na', 'rlf'),
+    'yuiadum':     ('iad', 'na', 'ara'),
     'dd':          ('las', 'na', 'hen'),
     'dl':          ('las', 'na', 'hen'),
     'dl-d':        ('las', 'na', 'hen'),
@@ -327,7 +334,7 @@ _MEASURED: dict[str, tuple[str, str, str]] = {
     'lcscld':      ('scl', 'sa', 'cno'),
 }
 
-MEASURED_AT = '2026-08-30T03:03:42Z'
+MEASURED_AT = '2026-09-24T01:41:17Z'
 MEASURE_COMMAND = 'mach_locality -k {kind} {cell}'
 
 
@@ -447,6 +454,7 @@ _METRO_STORAGE_CELL: dict[str, str] = {
     'dfw': 'rs-d',       # 45.0 PiB, sp50
     'las': 'dl-d',       # 32.0 PiB, sp10
     'cmh': 'go-d',       # 24.6 PiB, sp50
+    'cid': 'yucidjy-d',  # 100 TiB, sp10 (circle small, raised 2026-09-24 by qiaos; was tiny = 0 spindles)
 }
 
 # Metros with NO group registration: writes there land on the PERSONAL 500 GiB

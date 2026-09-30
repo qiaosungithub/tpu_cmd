@@ -60,23 +60,31 @@ flock -n 9 || { echo "[reroute-loop] another instance holds the lock; exiting.";
 # every 30s and the log fills with restarts that look like normal rounds).
 # Timestamping in the read loop is enough; bash `read` is unbuffered.
 while true; do
-  # 2026-09-06 16:25Z-18:2xZ: the nominal-RUNNING guard ran with its grace
-  # pushed to 999999999 (i.e. off) for two hours. Kept here as the reason the
-  # flag is now ABSENT rather than set to the default -- do not "restore" it.
-  # That guard cancels an XM-RUNNING row when Borg reports no VM group in RUN
-  # *and* nothing was ever written. Its disk half used to be blind to RESUMED
-  # jobs: CnsOutputProbe.latest_mtime globbed `xid_<new xid>_*`, but a resume
-  # keeps writing the directory it loaded from and never opens one of its own,
-  # so the probe always answered "nothing was ever written" and a single Borg
-  # sample was left deciding life and death. It cancelled elt_8n4l_v13a at
-  # 11:22:51, four minutes after that job wrote checkpoint step 345000 and 85
-  # seconds after its last tfevents write.
-  # Fixed by the load_from fallback in latest_mtime (clip_probe build, 125
-  # tests, mutation-verified: disabling the fallback fails 2). The guard is
-  # back on its 3600s default and now has two independent votes again.
+  # REROUTE PATIENCE (operator 2026-09-29: set both clocks explicitly, 900s).
+  # Both flags are the TPU base; route_lib.GPU_PATIENCE_MULTIPLIER (2x) applies
+  # on top for GPU rows, so 900 = 15 min for TPU, 30 min for GPU.
+  #   --reroute_after_s                  XM still PENDING this long after submit
+  #   --reroute_nominal_running_grace_s  XM RUNNING, but no Borg VM group RUN and
+  #                                      nothing ever written
+  # The binary defaults are 300s (so 10 min for GPU). That cancelled GPU jobs
+  # partway through a normal start. Measured 2026-09-29 on fresh h100/b200 rows:
+  # XM submit -> Borg job exists 4-7 min, Borg PENDING -> machines 0-7 min (sj
+  # b200 is the slow cell), container -> first CNS write ~2 min, so the first
+  # write lands 11-17 min after submit. Over the prior 24 h, 409 of 564
+  # submissions were cancelled before they ever started.
+  # An older note here said the default was 3600s. That was wrong: the default
+  # is 300s, lowered from 1200 on 2026-09-21. Never disable the nominal guard
+  # with a huge value (it ran at 999999999 once, on 2026-09-06). It is what
+  # rescues a job XManager calls RUNNING while its VM groups never leave PENDING.
+  # Its disk half follows a resumed job's load_from dir, so a resume that is
+  # writing is not judged "nothing written".
+  REROUTE_AFTER_S=900
+  NOMINAL_RUNNING_GRACE_S=900
   systemd-run --user --scope -q \
       -p MemoryMax=8G -p MemorySwapMax=0 \
-      "$BIN" --queue_file="$QUEUE" --reroute_loop --nodry_run --auto_resume_pruned 2>&1 \
+      "$BIN" --queue_file="$QUEUE" --reroute_loop --nodry_run --auto_resume_pruned \
+      --reroute_after_s="$REROUTE_AFTER_S" \
+      --reroute_nominal_running_grace_s="$NOMINAL_RUNNING_GRACE_S" 2>&1 \
       | while IFS= read -r _line; do
           printf '%s %s\n' "$(date -u +%FT%TZ)" "$_line"
         done >> "$LOG"

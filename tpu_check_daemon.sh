@@ -277,7 +277,7 @@ run_infra_check() {
   # the exact bug the suffix is meant to prevent. Verified: with `$$` the two
   # writers produced one file holding 5 lines of A followed by 15 of B.
   local tmp="${TMP_FILE}.${BASHPID:-$$}"
-  "$bin" 2>/dev/null | grep -Ev "274311238|274310306|274303586|274276782|274276523|274275526|274274881|274274856|274269375|274256617|274256088|274255958|274456072|274454581" > "$tmp"
+  timeout -k 10 "${INFRA_TIMEOUT_S:-300}" "$bin" 2>/dev/null | grep -Ev "274311238|274310306|274303586|274276782|274276523|274275526|274274881|274274856|274269375|274256617|274256088|274255958|274456072|274454581" > "$tmp"
   if [ -s "$tmp" ]; then
     # Capture the subshell's status IMMEDIATELY: any statement in between --
     # including an echo -- resets `$?`.

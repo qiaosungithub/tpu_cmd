@@ -292,6 +292,7 @@ _METRO_STORAGE_CELL: dict[str, str] = {{
     'dfw': 'rs-d',       # 45.0 PiB, sp50
     'las': 'dl-d',       # 32.0 PiB, sp10
     'cmh': 'go-d',       # 24.6 PiB, sp50
+    'cid': 'yucidjy-d',  # 100 TiB, sp10 (circle small, raised 2026-09-24 by qiaos; was tiny = 0 spindles)
 }}
 
 # Metros with NO group registration: writes there land on the PERSONAL 500 GiB
