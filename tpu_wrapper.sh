@@ -2357,7 +2357,11 @@ _order = {'BUILDING': 0, 'BUILD_REQUESTED': 1, 'HELD': 2, 'BUDGET_DEFERRED': 3,
           'QUEUED': 4, 'SUBMITTED': 5, 'FAILED': 6, 'CANCELLED': 7}
 _render_states = ('QUEUED', 'BUILD_REQUESTED', 'BUILDING', 'HELD',
                   'BUDGET_DEFERRED', 'SUBMITTED', 'FAILED', 'CANCELLED')
-rows = [e for e in entries if _dstate(e) in _render_states]
+# A row whose CNS dir could not be read on 3+ consecutive checks (route_lib.
+# CNS_READ_MAX_FAILURES) is shown even when RUNNING: the router refuses to act
+# on it (never cancels on a failed read), so a human has to look.
+_needs_human = lambda e: int(e.get('cns_read_failures', 0) or 0) >= 3
+rows = [e for e in entries if _dstate(e) in _render_states or _needs_human(e)]
 # Status column auto-widens to the longest state present (BUILD_REQUESTED /
 # BUDGET_DEFERRED are 15 chars) so every row stays aligned.
 _stw = max([9] + [len(str(_dstate(e))) for e in rows])
@@ -2365,7 +2369,7 @@ _stw = max([9] + [len(str(_dstate(e))) for e in rows])
 # trailing v5p/v4 and made jobs look like they excluded v4 when they did not.
 _archs = lambda e: ','.join(e.get('allowed_archs', []) or [])
 _aw = max([10] + [len(_archs(e)) for e in rows])
-for e in sorted(rows, key=lambda e: (_order.get(_dstate(e), 9), -e.get('priority', 0))):
+for e in sorted(rows, key=lambda e: (not _needs_human(e), _order.get(_dstate(e), 9), -e.get('priority', 0))):
     st = _dstate(e)
     disp = f"{COL.get(st,'')}{st:{_stw}s}\033[0m"
     # Show the experiment NAME (from launch_kwargs) as the primary id -- the
@@ -2378,6 +2382,8 @@ for e in sorted(rows, key=lambda e: (_order.get(_dstate(e), 9), -e.get('priority
         why = f"xid={e.get('xid')} {e.get('cell') or '?'} {e.get('arch') or ''}-{e.get('chips') or ''}".strip()
     elif st == 'BUILDING':
         why = ''  # STATUS column already says BUILDING; the worker host:pid is noise
+    if _needs_human(e):
+        why = f"\033[1;31m★NEEDS HUMAN\033[0m {why}"
     lock = ' \033[35m[lock]\033[0m' if e.get('topology_locked') else ''
     # reroute count: shown for every row so a churning job is visible at a glance
     # (the give-up->HELD bound was removed 2026-09-11; a high count is now the

@@ -3536,5 +3536,450 @@ class ReconcileBuildingGuardTest(unittest.TestCase):
     self.assertEqual(e.state, R.JobState.FAILED)
 
 
+# ============================================================================
+# A FAILED CNS READ IS NOT ABSENCE (2026-09-29 incidents: a step-40000 run
+# cancelled as "nothing was ever written" after a probe timeout, then requeued
+# cold; a requeue that kept a 1500-step-stale resume pointer).
+# ============================================================================
+_TIMEOUT = 'fileutil ls timed out after 60s'
+_W_UNIVERSE = ('W0930 18:41:46.387593 1302075 in_tpc.cc:16] Failed to get '
+               'ProdUniverse: NOT_FOUND: no prod universe set for this machine')
+
+
+class ClassifyFileutilResultTest(unittest.TestCase):
+  """stderr lines measured live 2026-09-30 (fileutil exits 1 for all three)."""
+
+  def test_ok_lines(self):
+    r = RC.classify_fileutil_result(0, '/cns/a\n\n/cns/b\n', _W_UNIVERSE)
+    self.assertEqual(r.status, RC.CNS_OK)
+    self.assertEqual(r.lines, ('/cns/a', '/cns/b'))
+
+  def test_missing_path_is_absent(self):
+    err = (_W_UNIVERSE + '\nE0930 18:41:50.562108 1302076 fileutil.cc:3669] '
+           'Could not stat /cns/si-d/home/qiaos/x: generic::not_found: no '
+           '/home/qiaos/x; BulkStat on /cns/si-d/home/qiaos/x')
+    self.assertEqual(RC.classify_fileutil_result(1, '', err).status,
+                     RC.CNS_ABSENT)
+
+  def test_empty_glob_is_absent(self):
+    err = ('E0930 18:41:55.399890 1303661 fileyielder.cc:784] No files '
+           'matched [/cns/si-d/home/qiaos/nonexistent_glob_*/x]')
+    self.assertEqual(RC.classify_fileutil_result(1, '', err).status,
+                     RC.CNS_ABSENT)
+
+  def test_unknown_cell_is_failed_not_absent(self):
+    err = ('E0930 18:41:56.322344 1304765 fileyielder.cc:788] '
+           'File::MatchAndStat error generic::not_found: colossus cell doesn\'t '
+           'exist: colossus_cell_name = "zz-d"')
+    r = RC.classify_fileutil_result(1, '', err)
+    self.assertEqual(r.status, RC.CNS_FAILED)
+    self.assertIn('colossus cell', r.error)
+
+  def test_warning_only_or_unfamiliar_error_is_failed(self):
+    # The ubiquitous W-line NOT_FOUND must not read as "absent".
+    self.assertTrue(RC.classify_fileutil_result(1, '', _W_UNIVERSE).failed)
+    self.assertTrue(RC.classify_fileutil_result(
+        1, '', 'E0930 1 x.cc:1] PERMISSION_DENIED: nope').failed)
+
+  def test_timeout_is_failed(self):
+    with mock.patch.object(
+        RC.subprocess, 'run',
+        side_effect=subprocess.TimeoutExpired(cmd='fileutil', timeout=60)):
+      r = RC.fileutil_ls(['/cns/x'], 60)
+    self.assertTrue(r.failed)
+    self.assertIn('timed out', r.error)
+
+
+class CnsProbeTriStateTest(unittest.TestCase):
+  """The real probes report a FAILED listing as an error, never as None."""
+
+  def _entry(self):
+    return _running('j1', '111', 'sj', submitted_at=0.0,
+                    launch_kwargs={'bucket': '/cns/x/home'})
+
+  def _ls(self, by_suffix):
+    def fake(args, timeout_s=60.0):
+      path = args[-1]
+      for suffix, res in by_suffix.items():
+        if path.endswith(suffix):
+          return res
+      return RC.CnsListing(RC.CNS_ABSENT)
+    return mock.patch.object(RC, 'fileutil_ls', side_effect=fake)
+
+  def test_output_probe(self):
+    with self._ls({'xid_111_*': RC.CnsListing(RC.CNS_FAILED, error=_TIMEOUT)}):
+      self.assertEqual(RC.CnsOutputProbe().read_latest_mtime(self._entry()),
+                       (None, _TIMEOUT))
+    with self._ls({}):  # negative control: cleanly absent
+      self.assertEqual(RC.CnsOutputProbe().read_latest_mtime(self._entry()),
+                       (None, ''))
+
+  def test_restart_evidence(self):
+    with self._ls({'.log': RC.CnsListing(RC.CNS_FAILED, error=_TIMEOUT)}):
+      ev = RC.CnsRestartEvidence().read_code_bug_and_checkpoint(self._entry())
+    self.assertEqual(ev[3], _TIMEOUT)
+    self.assertIsNone(ev[1])
+    with self._ls({}):
+      ev = RC.CnsRestartEvidence().read_code_bug_and_checkpoint(self._entry())
+    self.assertEqual(ev, (None, None, False, ''))
+
+  def test_checkpoint_probe(self):
+    with self._ls({'/steps': RC.CnsListing(RC.CNS_FAILED, error=_TIMEOUT)}):
+      self.assertEqual(
+          RC.CnsCheckpointProbe().read_latest_checkpoint(self._entry()),
+          (None, _TIMEOUT))
+    ok = RC.CnsListing(RC.CNS_OK, (
+        '/cns/x/home/logs/p/xid_111_a/steps/step_500.pt',
+        '/cns/x/home/logs/p/xid_111_a/steps/.step_1000.pt.tmp',
+        '/cns/x/home/logs/p/xid_111_a/steps/step_750.pt'))
+    with self._ls({'/steps': ok}):
+      self.assertEqual(
+          RC.CnsCheckpointProbe().read_latest_checkpoint(self._entry()),
+          ('/cns/x/home/logs/p/xid_111_a/steps/step_750.pt', ''))
+
+
+class _TriOutputProbe:
+  """read_latest_mtime -> scripted (mtime, err) per xid."""
+
+  def __init__(self, by_xid):
+    self._by_xid = by_xid
+
+  def latest_mtime(self, entry):
+    return self.read_latest_mtime(entry)[0]
+
+  def read_latest_mtime(self, entry):
+    return self._by_xid.get(entry.xid, (None, ''))
+
+
+class _TriEvidence:
+  """read_code_bug_and_checkpoint -> scripted SEQUENCE of 4-tuples per xid
+  (last one sticks). `calls` counts reads."""
+
+  def __init__(self, seq_by_xid):
+    self._seq = {k: list(v) for k, v in seq_by_xid.items()}
+    self.calls = 0
+
+  def read_code_bug_and_checkpoint(self, entry):
+    self.calls += 1
+    seq = self._seq.get(entry.xid) or [(None, None, False, '')]
+    return seq.pop(0) if len(seq) > 1 else seq[0]
+
+  def code_bug_and_checkpoint(self, entry):
+    return self.read_code_bug_and_checkpoint(entry)[:3]
+
+
+_FAIL_EV = (None, None, False, _TIMEOUT)
+
+
+class _IsolatedRegistryTest(unittest.TestCase):
+  """Real (dry_run=False) reroutes, with the history file and both registry
+  files redirected to temps (same isolation as RerouteWarmRestartTest)."""
+
+  def setUp(self):
+    super().setUp()
+    fh = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
+    fh.write(b'[]')
+    fh.close()
+    self._hist = fh.name
+    self._saved_env = {k: os.environ.get(k) for k in
+                       ('TPU_JOBS_FILE', 'TPU_JOBS_LEGACY_FILE',
+                        'TPU_REROUTE_NO_ARCHIVE')}
+    self._jobs = tempfile.mkstemp(suffix='.jobs.json')[1]
+    self._legacy = tempfile.mkstemp(suffix='.legacy.json')[1]
+    os.unlink(self._legacy)
+    with open(self._jobs, 'w') as f:
+      f.write('{}')
+    os.environ['TPU_JOBS_FILE'] = self._jobs
+    os.environ['TPU_JOBS_LEGACY_FILE'] = self._legacy
+    os.environ.pop('TPU_REROUTE_NO_ARCHIVE', None)
+
+  def tearDown(self):
+    for k, v in self._saved_env.items():
+      if v is None:
+        os.environ.pop(k, None)
+      else:
+        os.environ[k] = v
+    for p in (self._hist, self._jobs, self._legacy):
+      if os.path.exists(p):
+        os.unlink(p)
+    super().tearDown()
+
+
+class RerouteCnsReadFailureTest(_IsolatedRegistryTest):
+  """The reroute pass never cancels on a failed read; from the 3rd consecutive
+  failure the row is flagged NEEDS HUMAN -- still never cancelled, never HELD."""
+
+  def _nominal(self, e, output, evidence=None, entries=None):
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(
+        entries or [e], now=7200.0, probe=_FakeProbe({'111': RC.STATUS_RUNNING}),
+        submitter=sub, reroute_after_s=600.0, cooldown_s=1800.0, dry_run=False,
+        output_probe=output, sleep_fn=lambda _: None, history_file=self._hist,
+        borg_probe=_FakeBorgProbe(False), nominal_running_grace_s=3600.0,
+        restart_evidence=evidence, auto_resume_max=3)
+    return sub, log
+
+  def _row(self, **lk):
+    return _running('j1', '111', 'sj', submitted_at=0.0,
+                    launch_kwargs={'config': 'cfgX', 'exp_name': 'dw', **lk})
+
+  def test_negative_control_read_ok_and_empty_cancels(self):
+    e = self._row()
+    sub, _ = self._nominal(e, _TriOutputProbe({'111': (None, '')}))
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+
+  def test_failed_output_read_never_cancels_and_flags_at_three(self):
+    e = self._row()
+    probe = _TriOutputProbe({'111': (None, _TIMEOUT)})
+    for n in (1, 2):
+      sub, log = self._nominal(e, probe)
+      self.assertEqual(sub.cancels, [])
+      self.assertEqual(e.state, R.JobState.RUNNING)
+      self.assertEqual(e.cns_read_failures, n)
+      self.assertIn(f'CNS read failed ({n}/3)', e.last_reason)
+      self.assertFalse(any('NEEDS HUMAN' in l for l in log))
+    for n in (3, 4):
+      sub, log = self._nominal(e, probe)
+      self.assertEqual(sub.cancels, [])            # never, however many
+      self.assertEqual(e.state, R.JobState.RUNNING)  # never HELD: stays tracked
+      self.assertEqual(e.cns_read_failures, n)
+      self.assertTrue(e.last_reason.startswith('NEEDS HUMAN'))
+      self.assertTrue(any('NEEDS HUMAN' in l for l in log))
+    self.assertEqual(e.cns_read_error, _TIMEOUT)
+
+  def test_streak_clears_when_a_read_works(self):
+    e = self._row()
+    self._nominal(e, _TriOutputProbe({'111': (None, _TIMEOUT)}))
+    self.assertEqual(e.cns_read_failures, 1)
+    self._nominal(e, _TriOutputProbe({'111': (7000.0, '')}))  # wrote -> alive
+    self.assertEqual(e.cns_read_failures, 0)
+    self.assertEqual(e.cns_read_error, '')
+    self.assertEqual(e.state, R.JobState.RUNNING)
+
+  def test_failed_pending_read_never_cancels(self):
+    e = _submitted('j1', '111', 'yutulpz', submitted_at=0.0,
+                   launch_kwargs={'config': 'cfgX', 'exp_name': 'dw'})
+    sub = _FakeSubmitter()
+    RC.run_reroute(
+        [e], now=700.0,
+        probe=_SeqProbe({'111': [RC.STATUS_PENDING, RC.STATUS_PENDING]}),
+        submitter=sub, reroute_after_s=600.0, cooldown_s=1800.0,
+        dry_run=False, output_probe=_TriOutputProbe({'111': (None, _TIMEOUT)}),
+        confirm_gap_s=15.0, sleep_fn=lambda _: None, history_file=self._hist)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertEqual(e.cns_read_failures, 1)
+
+  def test_failed_checkpoint_read_before_cancel_leaves_job_alone(self):
+    # Output read worked and found nothing, but the checkpoint read that must
+    # precede a cancel+requeue failed: no cancel (it would requeue cold).
+    e = self._row()
+    ev = _TriEvidence({'111': [_FAIL_EV]})
+    sub, log = self._nominal(e, _TriOutputProbe({'111': (None, '')}), ev)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.RUNNING)
+    self.assertEqual(e.xid, '111')
+    self.assertEqual(e.cns_read_failures, 1)
+    # Negative control: same row, the read works -> cancelled + requeued warm.
+    e2 = self._row()
+    ev2 = _TriEvidence({'111': [(None, '/cns/y/steps/step_1024.pt', True, '')]})
+    sub2, _ = self._nominal(e2, _TriOutputProbe({'111': (None, '')}), ev2)
+    self.assertEqual(sub2.cancels, ['111'])
+    self.assertEqual(e2.launch_kwargs['load_from'], '/cns/y/steps/step_1024.pt')
+
+  def test_hold_requeue_advances_a_stale_resume_pointer(self):
+    # 2026-09-29 16:35: a row at step 41500 was requeued still pointing at
+    # step_40000. A live same-config sibling makes the plan HOLD (no warm
+    # restart), but the requeued row must not rewind.
+    e = self._row(load_from='/cns/x/steps/step_40000.pt')
+    sib = _entry('sib', launch_kwargs={'config': 'cfgX'})
+    sib.state = R.JobState.QUEUED
+    ev = _TriEvidence({'111': [(None, '/cns/y/steps/step_41500.pt', True, '')]})
+    sub, log = self._nominal(e, _TriOutputProbe({'111': (None, '')}), ev,
+                             entries=[e, sib])
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['load_from'], '/cns/y/steps/step_41500.pt')
+    self.assertEqual(e.last_known_checkpoint, '/cns/y/steps/step_41500.pt')
+    self.assertEqual(e.auto_resumes, 0)
+    self.assertTrue(any('resume pointer advanced' in l for l in log))
+
+  def test_terminal_left_for_reconcile_when_auto_resume_on(self):
+    e = _submitted('j1', '111', 'yutulpz', submitted_at=0.0)
+    _, log = RC.run_reroute(
+        [e], now=700.0, probe=_FakeProbe({'111': RC.STATUS_TERMINAL}),
+        submitter=_FakeSubmitter(), reroute_after_s=600.0, dry_run=False,
+        history_file=self._hist, restart_evidence=_TriEvidence({}))
+    self.assertEqual(e.state, R.JobState.SUBMITTED)   # reconcile's to decide
+    self.assertTrue(any('left for the reconcile pass' in l for l in log))
+    # Negative control: auto-resume off -> the old FAILED marking.
+    e2 = _submitted('j2', '112', 'yutulpz', submitted_at=0.0)
+    RC.run_reroute(
+        [e2], now=700.0, probe=_FakeProbe({'112': RC.STATUS_TERMINAL}),
+        submitter=_FakeSubmitter(), reroute_after_s=600.0, dry_run=False,
+        history_file=self._hist)
+    self.assertEqual(e2.state, R.JobState.FAILED)
+
+
+class ReconcileCnsReadFailureTest(unittest.TestCase):
+  """A dead row whose dir cannot be read: defer (row stays reconcilable) for
+  2 passes; on the 3rd, resume from the last KNOWN checkpoint or HOLD. Never
+  a cold rerun on a failed read."""
+
+  def setUp(self):
+    super().setUp()
+    p = mock.patch.object(RC, '_ALLOW_COLD_RERUN', True)
+    p.start()
+    self.addCleanup(p.stop)
+
+  def _dead(self, **lk):
+    e = _running('d1', '111', 'sj', submitted_at=0.0,
+                 launch_kwargs={'config': 'cfgX', 'exp_name': 'etd', **lk})
+    e.last_reason = 'guarantee reclaim: preempted out of sj'
+    return e
+
+  def _pass(self, entries, ev):
+    return RC.run_reconcile(
+        entries, now=100.0, probe=_FakeProbe({'111': RC.STATUS_TERMINAL}),
+        dry_run=False, auto_resume_pruned=True, restart_evidence=ev,
+        auto_resume_max=3)
+
+  def test_defers_twice_then_warm_from_last_known(self):
+    e = self._dead()
+    e.last_known_checkpoint = '/cns/y/steps/step_41500.pt'
+    ev = _TriEvidence({'111': [_FAIL_EV]})
+    entries = [e]
+    for n in (1, 2):
+      entries, log = self._pass(entries, ev)
+      self.assertEqual(e.state, R.JobState.RUNNING)   # still reconcilable
+      self.assertEqual(len(entries), 1)
+      self.assertEqual(e.cns_read_failures, n)
+      self.assertIn('preempted', e.last_reason)        # cause kept for later
+    entries, log = self._pass(entries, ev)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    new = [x for x in entries if x.state == R.JobState.QUEUED]
+    self.assertEqual(len(new), 1)
+    self.assertEqual(new[0].launch_kwargs['load_from'],
+                     '/cns/y/steps/step_41500.pt')
+    self.assertEqual(new[0].last_known_checkpoint, '/cns/y/steps/step_41500.pt')
+
+  def test_third_failure_with_nothing_known_holds_not_cold(self):
+    # trained + preemption cause would earn a COLD rerun on a read that worked;
+    # on a read that failed it must HOLD (a cold rerun lost 40k steps).
+    e = self._dead()
+    ev = _TriEvidence({'111': [(None, None, True, _TIMEOUT)]})
+    entries = [e]
+    for _ in range(3):
+      entries, log = self._pass(entries, ev)
+    self.assertEqual(e.state, R.JobState.HELD)
+    self.assertEqual(len(entries), 1)                  # nothing queued
+    self.assertIn('CNS unreadable', e.last_reason)
+    self.assertTrue(any('HELD' in l for l in log))
+    # Negative control: the SAME evidence with a working read -> COLD rerun.
+    e2 = self._dead()
+    out, _ = self._pass([e2], _TriEvidence({'111': [(None, None, True, '')]}))
+    self.assertEqual(e2.state, R.JobState.FAILED)
+    self.assertEqual(len([x for x in out if x.state == R.JobState.QUEUED]), 1)
+
+  def test_failed_read_ignores_a_stale_start_pointer(self):
+    # Started from step_40000, reached who-knows-where, dir unreadable, never
+    # censused: resuming from step_40000 could rewind days -> HOLD.
+    e = self._dead(load_from='/cns/x/steps/step_40000.pt')
+    ev = _TriEvidence({'111': [_FAIL_EV]})
+    entries = [e]
+    for _ in range(3):
+      entries, _ = self._pass(entries, ev)
+    self.assertEqual(e.state, R.JobState.HELD)
+    self.assertEqual(len(entries), 1)
+
+  def test_read_recovers_clears_streak_and_records_checkpoint(self):
+    e = self._dead()
+    ev = _TriEvidence({'111': [_FAIL_EV,
+                               (None, '/cns/y/steps/step_42000.pt', True, '')]})
+    entries, _ = self._pass([e], ev)
+    self.assertEqual(e.cns_read_failures, 1)
+    entries, _ = self._pass(entries, ev)
+    self.assertEqual(e.cns_read_failures, 0)
+    self.assertEqual(e.last_known_checkpoint, '/cns/y/steps/step_42000.pt')
+    new = [x for x in entries if x.state == R.JobState.QUEUED]
+    self.assertEqual(new[0].launch_kwargs['load_from'],
+                     '/cns/y/steps/step_42000.pt')
+
+  def test_dry_run_defers_without_counting(self):
+    e = self._dead()
+    RC.run_reconcile(
+        [e], now=100.0, probe=_FakeProbe({'111': RC.STATUS_TERMINAL}),
+        dry_run=True, auto_resume_pruned=True,
+        restart_evidence=_TriEvidence({'111': [_FAIL_EV]}), auto_resume_max=3)
+    self.assertEqual(e.state, R.JobState.RUNNING)
+    self.assertEqual(e.cns_read_failures, 0)
+
+
+class _FakeCheckpointProbe:
+
+  def __init__(self, by_xid):
+    self._by_xid = by_xid
+    self.calls = []
+
+  def read_latest_checkpoint(self, entry):
+    self.calls.append(entry.xid)
+    return self._by_xid.get(entry.xid, (None, ''))
+
+
+class CheckpointCensusTest(unittest.TestCase):
+
+  def _row(self, job_id, xid, state=R.JobState.RUNNING):
+    e = _running(job_id, xid, 'sj', submitted_at=0.0)
+    e.state = state
+    return e
+
+  def test_records_and_rate_limits(self):
+    a = self._row('a', '1')
+    probe = _FakeCheckpointProbe({'1': ('/cns/y/steps/step_500.pt', '')})
+    _, log = RC.run_checkpoint_census([a], now=1000.0, probe=probe)
+    self.assertEqual(a.last_known_checkpoint, '/cns/y/steps/step_500.pt')
+    self.assertEqual(a.last_known_checkpoint_checked_at, 1000.0)
+    self.assertTrue(any('last known checkpoint' in l for l in log))
+    RC.run_checkpoint_census([a], now=1000.0 + 60, probe=probe)
+    self.assertEqual(probe.calls, ['1'])                 # within interval
+    RC.run_checkpoint_census([a], now=1000.0 + 1800, probe=probe)
+    self.assertEqual(probe.calls, ['1', '1'])
+
+  def test_only_running_rows_and_cap_oldest_first(self):
+    rows = [self._row(f'r{i}', str(i)) for i in range(4)]
+    rows[0].last_known_checkpoint_checked_at = 10.0
+    rows[1].last_known_checkpoint_checked_at = 5.0
+    queued = self._row('q', '9', state=R.JobState.QUEUED)
+    probe = _FakeCheckpointProbe({})
+    RC.run_checkpoint_census(rows + [queued], now=10000.0, probe=probe,
+                             max_per_pass=3)
+    self.assertEqual(probe.calls, ['2', '3', '1'])      # never-checked first
+
+  def test_failed_read_keeps_known_and_does_not_count(self):
+    a = self._row('a', '1')
+    a.last_known_checkpoint = '/cns/y/steps/step_500.pt'
+    probe = _FakeCheckpointProbe({'1': (None, _TIMEOUT)})
+    _, log = RC.run_checkpoint_census([a], now=1000.0, probe=probe)
+    self.assertEqual(a.last_known_checkpoint, '/cns/y/steps/step_500.pt')
+    self.assertEqual(a.cns_read_failures, 0)
+    self.assertEqual(a.last_known_checkpoint_checked_at, 1000.0)
+    self.assertTrue(any('read FAILED' in l for l in log))
+
+  def test_never_moves_backwards_and_dry_run_is_inert(self):
+    a = self._row('a', '1')
+    a.last_known_checkpoint = '/cns/y/steps/step_900.pt'
+    RC.run_checkpoint_census(
+        [a], now=1000.0,
+        probe=_FakeCheckpointProbe({'1': ('/cns/y/steps/step_500.pt', '')}))
+    self.assertEqual(a.last_known_checkpoint, '/cns/y/steps/step_900.pt')
+    b = self._row('b', '2')
+    RC.run_checkpoint_census(
+        [b], now=1000.0, dry_run=True,
+        probe=_FakeCheckpointProbe({'2': ('/cns/y/steps/step_5.pt', '')}))
+    self.assertEqual(b.last_known_checkpoint, '')
+    self.assertIsNone(b.last_known_checkpoint_checked_at)
+
+
 if __name__ == '__main__':
   unittest.main()

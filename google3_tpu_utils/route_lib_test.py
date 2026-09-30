@@ -2692,5 +2692,125 @@ class GroupCanHoldTest(unittest.TestCase):
         R.group_can_hold(cap, 'h100', 16, None, pending={'H100': 8}).ok)
 
 
+class CnsReadFailureFieldsTest(unittest.TestCase):
+  """The persisted state behind 'a failed CNS read is not absence': the
+  failure streak and the lineage's last KNOWN checkpoint."""
+
+  def test_new_fields_default_and_roundtrip(self):
+    e = _entry()
+    self.assertEqual(e.cns_read_failures, 0)
+    self.assertEqual(e.last_known_checkpoint, '')
+    e.cns_read_failures = 2
+    e.cns_read_error = 'fileutil ls timed out after 60s'
+    e.last_known_checkpoint = '/cns/x/steps/step_40000.pt'
+    e.last_known_checkpoint_checked_at = 5.0
+    e2 = R.QueueEntry.from_dict(e.to_dict())
+    self.assertEqual(e2.cns_read_failures, 2)
+    self.assertEqual(e2.cns_read_error, 'fileutil ls timed out after 60s')
+    self.assertEqual(e2.last_known_checkpoint, '/cns/x/steps/step_40000.pt')
+    self.assertEqual(e2.last_known_checkpoint_checked_at, 5.0)
+
+  def test_old_row_without_fields_loads(self):
+    d = _entry().to_dict()
+    for k in ('cns_read_failures', 'cns_read_error', 'last_known_checkpoint',
+              'last_known_checkpoint_checked_at'):
+      d.pop(k)
+    e = R.QueueEntry.from_dict(d)
+    self.assertEqual(e.cns_read_failures, 0)
+    self.assertIsNone(e.last_known_checkpoint_checked_at)
+
+
+class LineageCheckpointTest(unittest.TestCase):
+
+  def test_lineage_step_covers_torch_and_elt(self):
+    self.assertEqual(R.lineage_checkpoint_step('/cns/x/steps/step_40000.pt'),
+                     40000)
+    self.assertEqual(R.lineage_checkpoint_step('/cns/x/wd/checkpoints/1536'),
+                     1536)
+    self.assertEqual(R.lineage_checkpoint_step('/cns/x/wd/other/1536'), -1)
+    self.assertEqual(R.lineage_checkpoint_step(''), -1)
+
+  def test_resume_pointer_of(self):
+    self.assertEqual(R.resume_pointer_of(_entry(
+        launch_kwargs={'load_from': '/cns/x/steps/step_8.pt'})),
+        '/cns/x/steps/step_8.pt')
+    self.assertEqual(R.resume_pointer_of(_entry(
+        launch_kwargs={'restart_from': '/cns/x/wd/', 'restart_step': '96'})),
+        '/cns/x/wd/checkpoints/96')
+    self.assertEqual(R.resume_pointer_of(_entry(
+        launch_kwargs={'load_from': 'None'})), '')
+    self.assertEqual(R.resume_pointer_of(_entry()), '')
+
+  def test_pick_prefers_newest_own_checkpoint(self):
+    e = _entry(launch_kwargs={'load_from': '/cns/x/steps/step_40000.pt'})
+    e.last_known_checkpoint = '/cns/y/steps/step_41500.pt'
+    self.assertEqual(R.pick_restart_checkpoint(e, '/cns/y/steps/step_41000.pt'),
+                     '/cns/y/steps/step_41500.pt')
+    self.assertEqual(R.pick_restart_checkpoint(e, '/cns/y/steps/step_42000.pt'),
+                     '/cns/y/steps/step_42000.pt')
+
+  def test_pick_never_lets_a_finetune_pointer_win_on_step(self):
+    # A fine-tune's load_from is its PRETRAIN checkpoint (step 400000); its own
+    # progress is step 1200. Resuming from the bigger number would restart the
+    # fine-tune from scratch.
+    e = _entry(launch_kwargs={'load_from': '/cns/pre/steps/step_400000.pt'})
+    self.assertEqual(R.pick_restart_checkpoint(e, '/cns/ft/steps/step_1200.pt'),
+                     '/cns/ft/steps/step_1200.pt')
+    e.last_known_checkpoint = '/cns/ft/steps/step_1000.pt'
+    self.assertEqual(R.pick_restart_checkpoint(e), '/cns/ft/steps/step_1000.pt')
+
+  def test_pick_falls_back_to_pointer_then_nothing(self):
+    e = _entry(launch_kwargs={'load_from': '/cns/x/steps/step_40000.pt'})
+    self.assertEqual(R.pick_restart_checkpoint(e), '/cns/x/steps/step_40000.pt')
+    self.assertEqual(R.pick_restart_checkpoint(_entry()), '')
+
+  def test_note_known_is_monotonic_and_stamps_time(self):
+    e = _entry()
+    self.assertTrue(R.note_known_checkpoint(e, '/cns/x/steps/step_1000.pt',
+                                            now=10.0))
+    self.assertEqual(e.last_known_checkpoint_checked_at, 10.0)
+    self.assertFalse(R.note_known_checkpoint(e, '/cns/x/steps/step_500.pt'))
+    self.assertEqual(e.last_known_checkpoint, '/cns/x/steps/step_1000.pt')
+    self.assertFalse(R.note_known_checkpoint(e, None, now=20.0))
+    self.assertEqual(e.last_known_checkpoint_checked_at, 20.0)
+    self.assertTrue(R.note_known_checkpoint(e, '/cns/x/steps/step_1500.pt'))
+    self.assertEqual(e.last_known_checkpoint, '/cns/x/steps/step_1500.pt')
+
+  def test_advance_moves_a_stale_pointer_forward(self):
+    # 2026-09-29: row at step 41500 requeued still pointing at step_40000.
+    e = _entry(launch_kwargs={'load_from': '/cns/x/steps/step_40000.pt'})
+    e.last_known_checkpoint = '/cns/y/steps/step_41500.pt'
+    self.assertTrue(R.advance_resume_pointer(e))
+    self.assertEqual(e.launch_kwargs['load_from'], '/cns/y/steps/step_41500.pt')
+    self.assertEqual(e.auto_resumes, 0)              # not a restart attempt
+    self.assertFalse(R.advance_resume_pointer(e))    # already there
+
+  def test_advance_elt_layout(self):
+    e = _entry(launch_kwargs={'restart_from': '/cns/x/wd', 'restart_step': '96'})
+    e.last_known_checkpoint = '/cns/x/wd/checkpoints/192'
+    self.assertTrue(R.advance_resume_pointer(e))
+    self.assertEqual(e.launch_kwargs['restart_step'], '192')
+    self.assertNotIn('load_from', e.launch_kwargs)
+
+  def test_advance_never_adds_or_rewinds(self):
+    cold = _entry(launch_kwargs={'config': 'c'})
+    cold.last_known_checkpoint = '/cns/x/steps/step_41500.pt'
+    self.assertFalse(R.advance_resume_pointer(cold))
+    self.assertNotIn('load_from', cold.launch_kwargs)
+    ahead = _entry(launch_kwargs={'load_from': '/cns/x/steps/step_50000.pt'})
+    ahead.last_known_checkpoint = '/cns/x/steps/step_41500.pt'
+    self.assertFalse(R.advance_resume_pointer(ahead))
+    self.assertEqual(ahead.launch_kwargs['load_from'],
+                     '/cns/x/steps/step_50000.pt')
+
+  def test_warm_restart_entry_carries_last_known(self):
+    dead = _entry(state=R.JobState.FAILED, xid='1',
+                  launch_kwargs={'config': 'c', 'exp_name': 'n'})
+    dead.last_known_checkpoint = '/cns/x/steps/step_41500.pt'
+    new = R.build_warm_restart_entry(dead, '/cns/x/steps/step_41500.pt', 'j2')
+    self.assertEqual(new.last_known_checkpoint, '/cns/x/steps/step_41500.pt')
+    self.assertEqual(new.cns_read_failures, 0)
+
+
 if __name__ == '__main__':
   unittest.main()

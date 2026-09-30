@@ -320,6 +320,14 @@ _REROUTE_LOOP = flags.DEFINE_bool(
 _REROUTE_LOOP_POLL_S = flags.DEFINE_float(
     'reroute_loop_poll_s', 120.0, 'Poll interval for the standalone --reroute_loop '
     'process (design default ~120s). Reconcile+reroute each round.')
+_CENSUS_INTERVAL_S = flags.DEFINE_float(
+    'census_interval_s', 1800.0, 'Checkpoint census (reroute-loop step C): '
+    're-read a RUNNING row\'s newest checkpoint at most this often, so a job '
+    'whose dir later becomes unreadable still resumes from its last KNOWN '
+    'checkpoint. <= 0 disables the census.')
+_CENSUS_MAX_PER_PASS = flags.DEFINE_integer(
+    'census_max_per_pass', 8, 'Checkpoint census: at most this many CNS reads '
+    'per reroute-loop round (least-recently-checked rows first).')
 _WORKER = flags.DEFINE_bool(
     'worker', False, 'Run as the SERIAL build-worker loop: claim one QUEUED job '
     'at a time as BUILDING, run `tpu queue` for it, record the result, repeat. '
@@ -1199,6 +1207,110 @@ def _parse_fileutil_mtime(fields: list[str]) -> Optional[float]:
   return None
 
 
+# --- CNS reads that tell "not there" apart from "could not look" -------------
+# ★A FAILED READ IS NOT AN EMPTY DIRECTORY (operator 2026-09-30). Every CNS
+# probe used to return the same None for "the path does not exist" and for "the
+# listing timed out", and each caller read that None as the convenient answer:
+# the liveness check as "nothing was ever written" (so cancel), the restart
+# check as "no checkpoint" (so requeue from step 0). 2026-09-29: an ETD run at
+# step 40000 was cancelled that way and restarted cold, eight times.
+#
+# `fileutil` exits 1 for EVERY error, so the exit code cannot separate the two;
+# only the text of its glog ERROR lines (`E0930 16:23:55 ...`) can. Measured
+# 2026-09-30 on this workstation:
+#   missing path          -> E-line `... generic::not_found: No parent directory ...`
+#   glob matched nothing  -> E-line `No files matched [...]`
+#   unknown CNS cell      -> E-line `generic::not_found: colossus cell doesn't exist`
+#   timeout               -> no exit code at all (we kill it)
+# So a result is ABSENT only on a positive not-found marker, and everything else
+# -- a timeout, a permission error, an unknown cell, an error we have never seen
+# -- is FAILED. An unfamiliar error therefore lands on the cautious side. The
+# W-line `NOT_FOUND: no prod universe` that every run prints is not an error
+# line and is ignored.
+CNS_OK = 'OK'
+CNS_ABSENT = 'ABSENT'
+CNS_FAILED = 'FAILED'
+# One read may wait this long. The old 20 s was half the measured cost of one
+# recursive listing of a 25B run's output dir (~10 s, 752 entries) on an idle
+# workstation, so a busy one timed out -- and a timeout read as "empty".
+CNS_READ_TIMEOUT_S = 60.0
+
+
+class CnsReadError(Exception):
+  """A CNS read that FAILED -- never a clean "not found"."""
+
+
+_GLOG_ERROR_LINE = re.compile(r'^E\d{4} ')
+_CNS_ABSENT_MARKERS = ('generic::not_found', 'No files matched')
+_CNS_NOT_ABSENT_MARKERS = ("colossus cell doesn't exist",)
+
+
+@dataclasses.dataclass(frozen=True)
+class CnsListing:
+  """One `fileutil ls` outcome: status OK (lines = its stdout rows), ABSENT (a
+  clean not-found), or FAILED (error = a short reason)."""
+  status: str
+  lines: tuple[str, ...] = ()
+  error: str = ''
+
+  @property
+  def failed(self) -> bool:
+    return self.status == CNS_FAILED
+
+
+def classify_fileutil_result(returncode: int, stdout: str,
+                             stderr: str) -> CnsListing:
+  """Pure: map a finished `fileutil ls` run to OK / ABSENT / FAILED."""
+  if returncode == 0:
+    return CnsListing(CNS_OK, tuple(ln.strip() for ln in (stdout or '').splitlines()
+                                    if ln.strip()))
+  errs = [ln.strip() for ln in (stderr or '').splitlines()
+          if _GLOG_ERROR_LINE.match(ln)]
+  blob = '\n'.join(errs)
+  if (errs and any(m in blob for m in _CNS_ABSENT_MARKERS)
+      and not any(m in blob for m in _CNS_NOT_ABSENT_MARKERS)):
+    return CnsListing(CNS_ABSENT)
+  detail = errs[-1].split('] ', 1)[-1] if errs else f'exit {returncode}, no error line'
+  return CnsListing(CNS_FAILED, error=detail[:200])
+
+
+def fileutil_ls(args: Sequence[str],
+                timeout_s: float = CNS_READ_TIMEOUT_S) -> CnsListing:
+  """`fileutil ls <args>` as a CnsListing. Never raises."""
+  try:
+    out = subprocess.run(['fileutil', 'ls', *args], capture_output=True,
+                         text=True, timeout=timeout_s)
+  except subprocess.TimeoutExpired:
+    return CnsListing(CNS_FAILED,
+                      error=f'fileutil ls timed out after {int(timeout_s)}s')
+  except OSError as exc:
+    return CnsListing(CNS_FAILED, error=f'fileutil could not run: {exc}')
+  return classify_fileutil_result(out.returncode, out.stdout, out.stderr)
+
+
+def _read_restarts(probe, entry) -> tuple[Optional[int], str]:
+  """(restarts since progress or None, read error), tri-state when the probe
+  supports it; an older probe's None is "cannot measure" with no error."""
+  if probe is None:
+    return None, ''
+  reader = getattr(probe, 'read_restarts_since_progress', None)
+  if reader is not None:
+    return reader(entry)
+  return probe.restarts_since_progress(entry), ''
+
+
+def _read_output_mtime(probe, entry) -> tuple[Optional[float], str]:
+  """(newest output mtime or None, read error). Uses the probe's tri-state
+  `read_latest_mtime` when it has one; a probe with only `latest_mtime` (the
+  older interface) is taken at its word, i.e. None means nothing written."""
+  if probe is None:
+    return None, ''
+  reader = getattr(probe, 'read_latest_mtime', None)
+  if reader is not None:
+    return reader(entry)
+  return probe.latest_mtime(entry), ''
+
+
 class _BorgVmProbe(Protocol):
   """Answers "is one of this job's Borg VM groups in RUN?".
 
@@ -1321,28 +1433,33 @@ class CnsOutputProbe:
   broken lookup can only make reroute MORE careful, never keep a dead job alive.
   """
 
-  def __init__(self, timeout_s: float = 20.0):
+  def __init__(self, timeout_s: float = CNS_READ_TIMEOUT_S):
     self._timeout_s = timeout_s
 
   def latest_mtime(self, entry: 'route_lib.QueueEntry') -> Optional[float]:
+    return self.read_latest_mtime(entry)[0]
+
+  def read_latest_mtime(
+      self, entry: 'route_lib.QueueEntry') -> tuple[Optional[float], str]:
+    """(newest mtime, '') when the read worked -- mtime None meaning nothing
+    is there -- or (None, reason) when it FAILED. Callers must not read a
+    failure as "nothing was ever written" (see CNS_FAILED)."""
     xid = entry.xid
+    if not xid:
+      return None, ''
     bucket = _bucket_for_entry(entry)
-    if not xid or not bucket:
-      return None
+    if not bucket:
+      return None, (f'cannot resolve the output bucket of cell '
+                    f'{entry.cell or "<none>"!r}')
     # XID-prefixed dir: <bucket>/logs/<project>/xid_<xid>_*  (fileutil ** does
     # NOT recurse across levels, so name the levels explicitly). -R then walks
     # the whole subtree so we see the newest rank/task log, not just top-level.
     pattern = f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*'
-    try:
-      out = subprocess.run(
-          ['fileutil', 'ls', '-l', '-R', pattern],
-          capture_output=True, text=True, timeout=self._timeout_s)
-    except (subprocess.TimeoutExpired, OSError):
-      return None
-    if out.returncode != 0 or not out.stdout.strip():
-      return None
+    res = fileutil_ls(['-l', '-R', pattern], self._timeout_s)
+    if res.failed:
+      return None, res.error
     newest: Optional[float] = None
-    for line in out.stdout.splitlines():
+    for line in res.lines:
       # Default `-l` row: '<perms> <n> <user> <group> <size> <YYYY/MM/DD> '
       # '<HH:MM:SS> <path>'. Directories (perms start 'd') carry the dir's own
       # mtime too -- fine, a fresh file bumps its dir. Parse date+time fields.
@@ -1356,7 +1473,7 @@ class CnsOutputProbe:
         continue
       if newest is None or mt > newest:
         newest = mt
-    return newest
+    return newest, ''
 
 
 class CnsRestartProbe:
@@ -1389,21 +1506,18 @@ class CnsRestartProbe:
   progress.
   """
 
-  def __init__(self, timeout_s: float = 20.0):
+  def __init__(self, timeout_s: float = CNS_READ_TIMEOUT_S):
     self._timeout_s = timeout_s
 
   def _ls_l(self, pattern: str) -> Optional[list[list[str]]]:
-    """`fileutil ls -l <pattern>` -> list of split-field rows, or None on any
-    failure / empty. Same parse contract as CnsOutputProbe."""
-    try:
-      out = subprocess.run(['fileutil', 'ls', '-l', pattern],
-                           capture_output=True, text=True,
-                           timeout=self._timeout_s)
-    except (subprocess.TimeoutExpired, OSError):
-      return None
-    if out.returncode != 0 or not out.stdout.strip():
-      return None
-    return [ln.split() for ln in out.stdout.splitlines() if ln.strip()]
+    """`fileutil ls -l <pattern>` -> list of split-field rows, or None when
+    the path is cleanly absent / empty. RAISES CnsReadError when the read
+    FAILED, so a timeout can never be counted as "no restarts" or "no
+    checkpoint" (see CNS_FAILED)."""
+    res = fileutil_ls(['-l', pattern], self._timeout_s)
+    if res.failed:
+      raise CnsReadError(res.error)
+    return [ln.split() for ln in res.lines] or None
 
   def _newest_checkpoint_mtime(self, bucket: str, xid: str) -> Optional[float]:
     """Newest mtime among COMPLETE checkpoint leaves, or None if none exist.
@@ -1492,6 +1606,25 @@ class CnsRestartProbe:
       entry: 'route_lib.QueueEntry',
       now: Optional[float] = None,
   ) -> Optional[int]:
+    return self.read_restarts_since_progress(entry, now)[0]
+
+  def read_restarts_since_progress(
+      self,
+      entry: 'route_lib.QueueEntry',
+      now: Optional[float] = None,
+  ) -> tuple[Optional[int], str]:
+    """(restarts since progress or None, '') or (None, reason) on a FAILED
+    read."""
+    try:
+      return self._restarts_since_progress(entry, now), ''
+    except CnsReadError as exc:
+      return None, str(exc)
+
+  def _restarts_since_progress(
+      self,
+      entry: 'route_lib.QueueEntry',
+      now: Optional[float] = None,
+  ) -> Optional[int]:
     xid = entry.xid
     bucket = _bucket_for_entry(entry)
     if not xid or not bucket:
@@ -1550,15 +1683,8 @@ def _find_newest_rank0_log(bucket: str, xid: str,
   the attempt), so its tail is where a crash -- if any -- would be.
   """
   pattern = f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*/logs/rank_0_attempt*.log'
-  try:
-    out = subprocess.run(['fileutil', 'ls', pattern],
-                         capture_output=True, text=True, timeout=timeout_s)
-  except (subprocess.TimeoutExpired, OSError):
-    return None
-  if out.returncode != 0 or not out.stdout.strip():
-    return None
   best_n, best = -1, None
-  for line in out.stdout.splitlines():
+  for line in _ls_cns(pattern, timeout_s):
     p = line.strip()
     m = re.search(r'rank_0_attempt(\d+)\.log$', p)
     if not m:
@@ -1589,16 +1715,14 @@ def _read_log_head_tail(path: str, head_bytes: int, tail_bytes: int,
           _slice(f'tail -c {int(tail_bytes)}'))
 
 
-def _ls_cns(path: str, timeout_s: float) -> Optional[list[str]]:
-  """`fileutil ls <path>` -> list of entry paths, or None on any failure/empty."""
-  try:
-    out = subprocess.run(['fileutil', 'ls', path],
-                         capture_output=True, text=True, timeout=timeout_s)
-  except (subprocess.TimeoutExpired, OSError):
-    return None
-  if out.returncode != 0 or not out.stdout.strip():
-    return None
-  return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+def _ls_cns(path: str, timeout_s: float) -> list[str]:
+  """`fileutil ls <path>` -> entry paths ([] when cleanly absent). RAISES
+  CnsReadError when the read FAILED, so no caller can mistake a timeout for an
+  empty directory."""
+  res = fileutil_ls([path], timeout_s)
+  if res.failed:
+    raise CnsReadError(res.error)
+  return list(res.lines)
 
 
 def _latest_complete_checkpoint(out_dir: str,
@@ -1630,7 +1754,7 @@ def _latest_complete_checkpoint(out_dir: str,
 
   # torch: <out_dir>/steps/step_<N>.pt files
   steps = base + '/steps'
-  for p in (_ls_cns(steps, timeout_s) or []):
+  for p in _ls_cns(steps, timeout_s):
     name = p.rsplit('/', 1)[-1]
     if not (name.startswith('step_') and name.endswith('.pt')):
       continue
@@ -1641,7 +1765,7 @@ def _latest_complete_checkpoint(out_dir: str,
 
   # ELT/EqR-jax: <out_dir>/checkpoints/<N> dirs (bare-int leaf = complete)
   ckpts = base + '/checkpoints'
-  for p in (_ls_cns(ckpts, timeout_s) or []):
+  for p in _ls_cns(ckpts, timeout_s):
     name = p.rstrip('/').rsplit('/', 1)[-1]
     s = route_lib.elt_checkpoint_leaf_step(name)
     if s > best_step:
@@ -1709,7 +1833,7 @@ class CnsRestartEvidence:
   as an injectable object so run_reconcile stays unit-testable with a fake.
   """
 
-  def __init__(self, timeout_s: float = 30.0,
+  def __init__(self, timeout_s: float = CNS_READ_TIMEOUT_S,
                head_bytes: int = 32768, tail_bytes: int = 65536):
     self._timeout_s = timeout_s
     self._head_bytes = head_bytes
@@ -1722,30 +1846,120 @@ class CnsRestartEvidence:
     shows the run reached at least one training step -- the signal that a
     no-checkpoint death was a preemption of a HEALTHY run (retry cold) rather
     than a startup crash (hold). Kept in this same read so the cold-rerun
-    decision needs no extra CNS round-trip."""
+    decision needs no extra CNS round-trip. Drops the read error; decision
+    code must use read_code_bug_and_checkpoint."""
+    return self.read_code_bug_and_checkpoint(entry)[:3]
+
+  def read_code_bug_and_checkpoint(
+      self, entry: 'route_lib.QueueEntry'
+  ) -> tuple[Optional[str], Optional[str], bool, str]:
+    """(code_bug, checkpoint, trained, read_error). A non-empty read_error
+    means the listing FAILED and checkpoint=None says NOTHING about whether a
+    checkpoint exists (see CNS_FAILED)."""
     bucket = _bucket_for_entry(entry)
     if not bucket or not entry.xid:
-      return None, None, False
-    log_path = _find_newest_rank0_log(bucket, str(entry.xid), self._timeout_s)
-    if not log_path:
-      return None, None, False
-    head, tail = _read_log_head_tail(
-        log_path, self._head_bytes, self._tail_bytes, self._timeout_s)
-    code_bug = route_lib.looks_like_code_bug(tail)
-    out_dir = (route_lib.out_dir_from_log(head)
-               or route_lib.out_dir_from_log(tail))
-    if not out_dir and '/logs/rank_0_attempt' in log_path:
-      out_dir = os.path.dirname(os.path.dirname(log_path))
-    checkpoint = (_latest_complete_checkpoint(out_dir, self._timeout_s)
-                  if out_dir else None)
+      return None, None, False, ''
+    try:
+      log_path = _find_newest_rank0_log(bucket, str(entry.xid),
+                                        self._timeout_s)
+      if not log_path:
+        return None, None, False, ''
+      head, tail = _read_log_head_tail(
+          log_path, self._head_bytes, self._tail_bytes, self._timeout_s)
+      code_bug = route_lib.looks_like_code_bug(tail)
+      out_dir = (route_lib.out_dir_from_log(head)
+                 or route_lib.out_dir_from_log(tail))
+      if not out_dir and '/logs/rank_0_attempt' in log_path:
+        out_dir = os.path.dirname(os.path.dirname(log_path))
+      checkpoint = (_latest_complete_checkpoint(out_dir, self._timeout_s)
+                    if out_dir else None)
+    except CnsReadError as exc:
+      return None, None, False, str(exc)
     trained = route_lib.looks_trained(head) or route_lib.looks_trained(tail)
-    return code_bug, checkpoint, trained
+    return code_bug, checkpoint, trained, ''
+
+
+class CnsCheckpointProbe:
+  """Newest complete checkpoint under a RUNNING job's own output dir, for the
+  checkpoint census (run_checkpoint_census). Same layouts and completeness
+  rules as _latest_complete_checkpoint, via the XID-dir glob."""
+
+  def __init__(self, timeout_s: float = CNS_READ_TIMEOUT_S):
+    self._timeout_s = timeout_s
+
+  def read_latest_checkpoint(
+      self, entry: 'route_lib.QueueEntry') -> tuple[Optional[str], str]:
+    """(checkpoint or None, '') or (None, reason) when the read FAILED."""
+    xid = entry.xid
+    bucket = _bucket_for_entry(entry)
+    if not xid or not bucket:
+      return None, ''
+    try:
+      return _latest_complete_checkpoint(
+          f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*', self._timeout_s), ''
+    except CnsReadError as exc:
+      return None, str(exc)
+
+
+def _gather_restart_evidence(dead: 'route_lib.QueueEntry', evidence):
+  """(code_bug, found_checkpoint, trained, read_error) for a restart decision.
+  Uses the evidence object's tri-state reader when it has one; an older/fake
+  evidence with only code_bug_and_checkpoint (2- or 3-tuple) never fails."""
+  if not evidence:
+    return None, None, False, ''
+  reader = getattr(evidence, 'read_code_bug_and_checkpoint', None)
+  if reader is not None:
+    return reader(dead)
+  ev = evidence.code_bug_and_checkpoint(dead)
+  if len(ev) == 3:
+    return ev[0], ev[1], ev[2], ''
+  return ev[0], ev[1], False, ''
+
+
+def _note_cns_read_failure(e: 'route_lib.QueueEntry', err: str,
+                           dry_run: bool) -> int:
+  """Count one more consecutive failed CNS read on `e`; returns the new count
+  (not stored in dry_run)."""
+  n = int(getattr(e, 'cns_read_failures', 0) or 0) + 1
+  if not dry_run:
+    e.cns_read_failures = n
+    e.cns_read_error = (err or '')[:200]
+  return n
+
+
+def _clear_cns_read_failure(e: 'route_lib.QueueEntry', dry_run: bool) -> None:
+  """A read on `e` worked: the failure streak is over."""
+  if not dry_run and (e.cns_read_failures or e.cns_read_error):
+    e.cns_read_failures = 0
+    e.cns_read_error = ''
+
+
+def _flag_cns_unreadable(e: 'route_lib.QueueEntry', tag: str, err: str,
+                         doing: str, log: list[str], dry_run: bool) -> None:
+  """A LIVE row whose check could not read CNS: take no action this pass and
+  say so. From CNS_READ_MAX_FAILURES on, the row is flagged NEEDS HUMAN --
+  still never cancelled, and never HELD (a HELD row is not reconciled against
+  XManager any more, so a live job would be orphaned)."""
+  n = _note_cns_read_failure(e, err, dry_run)
+  mx = route_lib.CNS_READ_MAX_FAILURES
+  if n >= mx:
+    e.last_reason = (f'NEEDS HUMAN: CNS unreadable on {n} consecutive checks '
+                     f'while {doing}; left alone, NOT cancelled ({err})')
+    log.append(f'[reroute] {tag}: ★NEEDS HUMAN -- CNS read failed {n}x '
+               f'while {doing}; left alone, never cancelled on a failed read '
+               f'({err})')
+  else:
+    e.last_reason = (f'CNS read failed ({n}/{mx}) while {doing}; no action, '
+                     f're-checking next pass ({err})')
+    log.append(f'[reroute] {tag}: CNS read FAILED ({n}/{mx}) while {doing} '
+               f'-> no action this pass ({err})')
 
 
 def _restart_decision(dead: 'route_lib.QueueEntry',
                       entries: list['route_lib.QueueEntry'],
                       evidence, max_resumes: int,
-                      *, log: Optional[list] = None, tag: str = ''):
+                      *, log: Optional[list] = None, tag: str = '',
+                      ev=None, allow_cold: Optional[bool] = None):
   """(plan, checkpoint) for a just-failed row: gather CNS evidence, apply the
   pure decision. plan is (verdict, why). Kept separate so both the dry-run and
   the live branch of run_reconcile decide identically.
@@ -1757,35 +1971,33 @@ def _restart_decision(dead: 'route_lib.QueueEntry',
   phase 2a: the evidence is gathered and the shadow decision is logged, but the
   live verdict stays exactly what it was before (HOLD). Phase 2b flips it on.
   """
-  ev = (evidence.code_bug_and_checkpoint(dead)
-        if evidence else (None, None, False))
-  # Back-compat: a fake/legacy evidence returning a 2-tuple still works.
-  if len(ev) == 3:
-    cb, ckpt, trained = ev
+  # `ev` lets a caller that already read the evidence (to check for a failed
+  # read before acting) pass it in instead of paying for a second CNS read.
+  cb, found, trained, read_err = (ev if ev is not None
+                                  else _gather_restart_evidence(dead, evidence))
+  if read_err:
+    # The dir could not be read: only a checkpoint this run was actually SEEN
+    # to write counts. The pointer it was started from may be days behind
+    # (a row started at step 40000 that reached 47000), so it is not used
+    # here; with nothing seen the caller HOLDs.
+    ckpt = (getattr(dead, 'last_known_checkpoint', '') or '') or None
   else:
-    cb, ckpt = ev
-    trained = False
-  if not ckpt:
-    lk = getattr(dead, 'launch_kwargs', None) or {}
-    prior_lf = str(lk.get('load_from') or '').strip()
-    prior_rf = str(lk.get('restart_from') or '').strip()
-    prior_rs = str(lk.get('restart_step') or '').strip()
-    if prior_lf:
-      ckpt = prior_lf
-    elif prior_rf and prior_rs.isdigit():
-      ckpt = f"{prior_rf.rstrip('/')}/checkpoints/{prior_rs}"
+    # The run's own checkpoint (just found, or recorded earlier), else the
+    # pointer it was started from; see route_lib.pick_restart_checkpoint.
+    ckpt = route_lib.pick_restart_checkpoint(dead, found) or None
+  allow = _ALLOW_COLD_RERUN if allow_cold is None else allow_cold
   other = route_lib.has_live_config_sibling(dead, entries)
   cause = _termination_cause_of(dead)
   plan = route_lib.plan_pruned_restart(
       dead, xm_terminal=True, code_bug=cb, checkpoint=ckpt,
       other_live_writer=other, max_auto_resumes=max_resumes,
-      trained=trained, termination_cause=cause, allow_cold=_ALLOW_COLD_RERUN)
+      trained=trained, termination_cause=cause, allow_cold=allow)
   # ★SHADOW (phase 2a). When the live gate is OFF, re-run the SAME pure decision
   # with allow_cold=True and log what it WOULD have done -- without acting. This
   # is how we watch, on the real reconcile stream, which no-checkpoint HOLDs the
   # cold path would rescue, before ever changing behavior. No-op once
   # _ALLOW_COLD_RERUN is True (the live plan already is the cold plan).
-  if log is not None and not _ALLOW_COLD_RERUN:
+  if log is not None and not allow:
     shadow_verdict, shadow_why = route_lib.plan_pruned_restart(
         dead, xm_terminal=True, code_bug=cb, checkpoint=ckpt,
         other_live_writer=other, max_auto_resumes=max_resumes,
@@ -1996,6 +2208,28 @@ def run_reconcile(
       log.append(f'[reconcile] {tag} -> CANCELLED (tpu cancel{at}; registry '
                  f'CANCELLED; not a crash, no auto-resume)')
       continue
+    # ★READ THE EVIDENCE BEFORE THE ROW LEAVES RECONCILE'S REACH. Once a row is
+    # FAILED it is never looked at again, so a restart decision taken on a
+    # FAILED read is final. Read first; if the read failed, leave the row as it
+    # is (still reconcilable) and try again next pass, up to
+    # CNS_READ_MAX_FAILURES; then resume from the lineage's last known
+    # checkpoint, or HOLD for a human. Never a cold rerun on a failed read.
+    ev = None
+    if (new_state == route_lib.JobState.FAILED and auto_resume_pruned
+        and restart_evidence is not None):
+      ev = _gather_restart_evidence(e, restart_evidence)
+    read_err = ev[3] if ev is not None else ''
+    if read_err:
+      n_fail = _note_cns_read_failure(e, read_err, dry_run)
+      if n_fail < route_lib.CNS_READ_MAX_FAILURES:
+        n_unknown += 1
+        # last_reason is deliberately NOT touched: it carries the termination
+        # cause (e.g. 'preempted out of sh') that the restart decision reads
+        # once a read works. The streak lives in cns_read_failures/_error.
+        log.append(f'[reconcile] {tag}: XM dead but CNS read FAILED '
+                   f'({n_fail}/{route_lib.CNS_READ_MAX_FAILURES}) -> row left '
+                   f'as is, restart decided next pass ({read_err})')
+        continue
     if dry_run:
       log.append(f'[DRY][reconcile] would set {tag} -> {new_state.value}')
       if new_state == route_lib.JobState.FAILED:
@@ -2004,7 +2238,8 @@ def run_reconcile(
           e.last_reason = f'{prior_reason} {xm_reason}'.strip()
           try:
             (verdict, why), ckpt = _restart_decision(
-                e, entries, restart_evidence, auto_resume_max, log=log, tag=tag)
+                e, entries, restart_evidence, auto_resume_max, log=log, tag=tag,
+                ev=ev, allow_cold=(False if read_err else None))
           finally:
             e.last_reason = prior_reason
           if verdict == route_lib.RESUME_WARM:
@@ -2038,13 +2273,36 @@ def run_reconcile(
           log.append(f'[reconcile] {tag} -> FAILED (zombie cleaned up'
                      f'{"; " + summary if summary else ""})')
         if auto_resume_pruned:
+          if ev is not None and not read_err:
+            _clear_cns_read_failure(e, dry_run)
+            if ev[1]:
+              route_lib.note_known_checkpoint(e, ev[1])
           saved_reconciled_reason = e.last_reason
           e.last_reason = f'{prior_reason} {xm_reason}'.strip()
           try:
+            # After CNS_READ_MAX_FAILURES failed reads, decide on what the
+            # row already knows: its recorded checkpoint or its resume pointer
+            # (pick_restart_checkpoint). No cold rerun on a failed read.
             (verdict, why), ckpt = _restart_decision(
-                e, entries, restart_evidence, auto_resume_max, log=log, tag=tag)
+                e, entries, restart_evidence, auto_resume_max, log=log, tag=tag,
+                ev=ev, allow_cold=(False if read_err else None))
           finally:
             e.last_reason = saved_reconciled_reason
+          if read_err and not (verdict == route_lib.RESUME_WARM and ckpt):
+            route_lib.hold_entry(
+                e, f'CNS unreadable on {e.cns_read_failures} consecutive '
+                   f'checks after XM reported the job dead, and no known '
+                   f'checkpoint to resume from ({why}). Check the run\'s '
+                   f'output dir by hand; `tpu requeue` restarts it AS IS '
+                   f'(cold unless it has a resume pointer). Last read error: '
+                   f'{read_err}')
+            log.append(f'[auto-resume] {tag}: HELD -- CNS read failed '
+                       f'{e.cns_read_failures}x and no known checkpoint '
+                       f'({read_err})')
+            continue
+          if verdict == route_lib.RESUME_WARM and ckpt and read_err:
+            why = (f'{why}; CNS unreadable {e.cns_read_failures}x, resuming '
+                   f'from the last KNOWN checkpoint')
           if verdict == route_lib.RESUME_WARM and ckpt:
             new = route_lib.build_warm_restart_entry(
                 e, ckpt, _new_resume_job_id(e.power))
@@ -2194,8 +2452,20 @@ def _reroute_requeue_after_cancel(
   # would re-queue it WITHOUT its newest checkpoint (rolling back progress).
   effective_max_resumes = max(
       auto_resume_max, int(getattr(e, 'auto_resumes', 0) or 0) + 1)
+  # ★READ THE CHECKPOINTS BEFORE CANCELLING, AND DO NOT CANCEL IF THE READ
+  # FAILED. A failed read is not "no checkpoint"; acting on it is what requeued
+  # a 40k-step run from step 0 (2026-09-29). Leave the job exactly as it is,
+  # count the failure, and re-check next pass.
+  ev = _gather_restart_evidence(e, restart_evidence)
+  if ev[3]:
+    _flag_cns_unreadable(e, f'{e.job_id} (xid={xid})', ev[3],
+                         'reading its checkpoints before a cancel+requeue',
+                         log, dry_run)
+    return
+  if ev[1] and not dry_run:
+    route_lib.note_known_checkpoint(e, ev[1])
   (verdict, warm_why), ckpt = _restart_decision(
-      e, entries, restart_evidence, effective_max_resumes)
+      e, entries, restart_evidence, effective_max_resumes, ev=ev)
   warm = verdict == route_lib.RESUME_WARM and bool(ckpt)
   if dry_run:
     log.append(f'[DRY][reroute] would cancel + re-route {dry_reason}'
@@ -2220,8 +2490,15 @@ def _reroute_requeue_after_cancel(
     # superseded the dead xid into prior_xids and cleared cell/arch/chips.
     route_lib.apply_warm_restart_in_place(e, ckpt)
     log.append(f'{ok_reason}; WARM-restart from {ckpt} ({warm_why})')
+  elif route_lib.advance_resume_pointer(e):
+    # Not a warm restart (e.g. a live same-config sibling), but the row already
+    # resumes from somewhere: never let it resume from an OLDER step than the
+    # run is known to have reached.
+    log.append(f'{ok_reason}; resume pointer advanced to '
+               f'{e.last_known_checkpoint} ({warm_why})')
   else:
     log.append(ok_reason)
+  _clear_cns_read_failure(e, dry_run)
   _archive_rerouted_xid(xid, log)
   if persist_fn is not None:
     try:
@@ -2348,11 +2625,17 @@ def run_reroute(
       if vm_running_now is False and output_probe is not None:
         log.append(f'[reroute] {tag}: no Borg VM group is RUN -> ignoring '
                    f'pre-preemption CNS output freshness')
-      mtime = (output_probe.latest_mtime(e)
-               if (output_probe and vm_running_now is not False) else None)
+      mtime, rerr = (_read_output_mtime(output_probe, e)
+                     if vm_running_now is not False else (None, ''))
+      if rerr:
+        # Could not see whether it is writing: that is not "not writing".
+        _flag_cns_unreadable(e, tag, rerr, 'checking a PENDING job for fresh '
+                             'output', log, dry_run)
+        continue
       out_fresh = route_lib.output_is_fresh(mtime, now, fresh_output_s)
       if out_fresh:
         age_out = int(now - mtime) if mtime else -1
+        _clear_cns_read_failure(e, dry_run)
         e.last_reason = f'alive: output written {age_out}s ago (not re-routed)'
         log.append(f'[reroute] {tag} has FRESH output ({age_out}s ago) '
                    f'-> alive, no action')
@@ -2363,10 +2646,15 @@ def run_reroute(
       # A cheap disk re-check inside the window costs nothing and catches a
       # write that landed during the gap (v26: time-staggered second sample).
       vm_running_2 = borg_probe.has_running_vmgroup(e) if borg_probe else None
-      mtime2 = (output_probe.latest_mtime(e)
-                if (output_probe and vm_running_2 is not False) else None)
+      mtime2, rerr2 = (_read_output_mtime(output_probe, e)
+                       if vm_running_2 is not False else (None, ''))
+      if rerr2:
+        _flag_cns_unreadable(e, tag, rerr2, 're-checking a PENDING job for '
+                             'fresh output', log, dry_run)
+        continue
       if route_lib.output_is_fresh(mtime2, time.time(), fresh_output_s):
         age_out = int(time.time() - mtime2) if mtime2 else -1
+        _clear_cns_read_failure(e, dry_run)
         e.last_reason = f'alive: output written {age_out}s ago (2nd check)'
         log.append(f'[reroute] {tag} output FRESH on 2nd check '
                    f'-> alive, no action')
@@ -2438,7 +2726,12 @@ def run_reroute(
       # moved. Checked BEFORE the borg/promote logic because a thrashing job IS
       # borg-RUNNING -- that is exactly why it slips through today.
       if inplace_reroute and restart_probe is not None and xid:
-        rsp = restart_probe.restarts_since_progress(e)
+        rsp, terr = _read_restarts(restart_probe, e)
+        if terr:
+          # rsp is None, which decide_inplace_reroute never acts on; the
+          # liveness checks below still run (and flag a failed read there).
+          log.append(f'[reroute] {tag}: restart-count read FAILED ({terr}) '
+                     f'-> no thrash verdict this pass')
         if route_lib.decide_inplace_reroute(
             state, rsp, threshold=inplace_restart_threshold):
           why = (f'in-place preemption thrash: {rsp} restart(s) on {e.cell} '
@@ -2467,7 +2760,14 @@ def run_reroute(
         # `latest_mtime` conflates "dir missing" with "lookup failed", so this
         # asks the weaker question it can actually answer: has ANYTHING ever
         # been written? A job holding chips writes rank logs within minutes.
-        mtime_ever = output_probe.latest_mtime(e) if output_probe else None
+        # ★A FAILED read is not "nothing was ever written": that reading
+        # cancelled a run at step 40000 (2026-09-29). Only a read that WORKED
+        # and found nothing may make this row nominal.
+        mtime_ever, nerr = _read_output_mtime(output_probe, e)
+        if nerr:
+          _flag_cns_unreadable(e, tag, nerr, 'checking whether an XM-RUNNING '
+                               'job ever wrote output', log, dry_run)
+          continue
         nominal = mtime_ever is None
       elif not cell_known and age >= grace_s and xid:
         # ★STRUCTURALLY UNVERIFIABLE, NOT MERELY UNREAD. The row is STILL
@@ -2487,6 +2787,7 @@ def run_reroute(
       # from `str | None` to `str` for the cancel call below, and a reader
       # should not have to prove that invariant from two places at once.
       if not nominal or not xid:
+        _clear_cns_read_failure(e, dry_run)
         e.state = route_lib.JobState.RUNNING
         route_lib.sync_current_submission(e, e.state)
         e.last_reason = f'running in {e.cell} ({e.arch}-{e.chips})'
@@ -2514,6 +2815,13 @@ def run_reroute(
                        f'left as-is.'),
           persist_fn=persist_fn)
     elif state == STATUS_TERMINAL:
+      if restart_evidence is not None:
+        # Auto-resume is on: the reconcile pass (next round) owns dead rows,
+        # because only it decides warm / cold / hold. Marking FAILED here took
+        # the row out of reconcile's reach, so it was never resumed at all.
+        log.append(f'[reroute] {tag} is TERMINAL -> left for the reconcile '
+                   f'pass (it decides the warm/cold restart)')
+        continue
       e.state = route_lib.JobState.FAILED
       route_lib.sync_current_submission(
           e, e.state, reason='terminal per XManager (failed/stopped)')
@@ -2521,6 +2829,49 @@ def run_reroute(
       log.append(f'[reroute] {tag} is TERMINAL -> marked FAILED')
     else:  # STATUS_UNKNOWN
       log.append(f'[reroute] {tag} status UNKNOWN -> no action (never cancel blind)')
+  return entries, log
+
+
+# --- checkpoint census ----------------------------------------------------
+def run_checkpoint_census(
+    entries: list[route_lib.QueueEntry], *, now: float, probe,
+    dry_run: bool = False, min_interval_s: float = 1800.0,
+    max_per_pass: int = 8) -> tuple[list[route_lib.QueueEntry], list[str]]:
+  """Record each RUNNING row's newest checkpoint while CNS is readable.
+
+  This is what makes "after 3 failed reads, resume from the last KNOWN
+  checkpoint" possible: when the job later dies and its dir cannot be read,
+  the restart falls back to last_known_checkpoint instead of going cold or
+  HELD. Best-effort and rate-limited: each row at most once per
+  min_interval_s, at most max_per_pass reads per pass, least-recently-checked
+  first. A failed read changes nothing but the timestamp (so one unreadable
+  row cannot starve the rest) and never counts toward cns_read_failures,
+  which belongs to the decision paths."""
+  log: list[str] = []
+  due = []
+  for e in entries:
+    if e.state != route_lib.JobState.RUNNING or not e.xid:
+      continue
+    last = getattr(e, 'last_known_checkpoint_checked_at', None)
+    if last is not None and now - float(last) < min_interval_s:
+      continue
+    due.append(e)
+  due.sort(key=lambda r: (r.last_known_checkpoint_checked_at is not None,
+                          r.last_known_checkpoint_checked_at or 0.0))
+  for e in due[:max(0, int(max_per_pass))]:
+    tag = f'{e.job_id} (xid {e.xid})'
+    ckpt, err = probe.read_latest_checkpoint(e)
+    if dry_run:
+      log.append(f'[census] {tag}: would record {ckpt or "nothing"}'
+                 + (f' (read FAILED: {err})' if err else ''))
+      continue
+    if err:
+      e.last_known_checkpoint_checked_at = now
+      log.append(f'[census] {tag}: read FAILED, kept '
+                 f'{e.last_known_checkpoint or "nothing"} ({err})')
+      continue
+    if route_lib.note_known_checkpoint(e, ckpt, now=now):
+      log.append(f'[census] {tag}: last known checkpoint -> {ckpt}')
   return entries, log
 
 
@@ -3689,6 +4040,25 @@ def main(argv):
       except Exception as e:  # pylint: disable=broad-except
         print(f'  [reroute-loop:reroute] pass FAILED (non-fatal): {e}',
               flush=True)
+      # (C) checkpoint census: remember each RUNNING row's newest checkpoint
+      # while CNS is readable, so a later unreadable dir still resumes warm.
+      if _CENSUS_INTERVAL_S.value > 0:
+        try:
+          snap = load_queue(_QUEUE_FILE.value)
+          baseline = {e.job_id: e.to_dict() for e in snap}
+          cs_entries, cs_log = run_checkpoint_census(
+              snap, now=time.time(), probe=CnsCheckpointProbe(),
+              dry_run=_DRY_RUN.value,
+              min_interval_s=_CENSUS_INTERVAL_S.value,
+              max_per_pass=_CENSUS_MAX_PER_PASS.value)
+          for line in cs_log:
+            print(f'  [reroute-loop:census] {line}', flush=True)
+          if not _DRY_RUN.value:
+            merge_and_save_touched(_QUEUE_FILE.value, cs_entries,
+                                   baseline=baseline)
+        except Exception as e:  # pylint: disable=broad-except
+          print(f'  [reroute-loop:census] pass FAILED (non-fatal): {e}',
+                flush=True)
       time.sleep(_REROUTE_LOOP_POLL_S.value)
     return  # unreachable; defensive
 

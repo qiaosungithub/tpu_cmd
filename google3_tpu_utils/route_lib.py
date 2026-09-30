@@ -876,6 +876,24 @@ class QueueEntry:
   # ★How many times the rule set has already re-dispatched this row. Persisted,
   # because the budget is meaningless if it resets whenever the process does.
   auto_resumes: int = 0
+  # ★CNS READ FAILURES (operator 2026-09-30). Consecutive passes on which a
+  # decision about this row needed a CNS read (its output dir, its checkpoints)
+  # and the read FAILED -- a timeout or an error that is not a clean "not
+  # found". A failed read decides nothing: the row is left as it is and retried
+  # next pass. At CNS_READ_MAX_FAILURES a live row is flagged for a human and
+  # never cancelled; a dead row resumes from last_known_checkpoint or is HELD.
+  # Persisted, because the reroute loop restarts. Reset when a read succeeds.
+  cns_read_failures: int = 0
+  cns_read_error: str = ''          # the last failed read, for `tpu check`
+  # ★The newest complete checkpoint this row's lineage is KNOWN to have, written
+  # whenever a CNS read sees one (periodically while the job runs, and at every
+  # restart decision). It is the fallback a restart uses when CNS cannot be read
+  # at the moment it matters, so a transient read failure costs at most the
+  # steps since the last record, never the whole run (2026-09-29: a 40k-step
+  # ETD run was re-queued from step 0 on an unreadable check). Opaque string,
+  # replayed verbatim like every checkpoint path.
+  last_known_checkpoint: str = ''
+  last_known_checkpoint_checked_at: Optional[float] = None
 
   # ---- xid / prior_xids: DERIVED read + COMPAT write over `submissions` ----
   # These read as VIEWS of the authoritative list and write by mutating it, so
@@ -1449,6 +1467,102 @@ def elt_checkpoint_leaf_step(name: str) -> int:
   return int(n) if n.isdigit() else -1
 
 
+# --- checkpoint lineage: the fallback a restart uses when CNS is unreadable ---
+# How many consecutive failed CNS reads a row tolerates before the router stops
+# waiting (operator 2026-09-30: retry next pass, at most 3 reads, then HOLD --
+# and a LIVE row is only flagged, never cancelled or held, because a HELD row is
+# no longer reconciled against XManager and would be orphaned while it runs).
+CNS_READ_MAX_FAILURES = 3
+
+
+def lineage_checkpoint_step(path: Optional[str]) -> int:
+  """Step of ANY fleet checkpoint path, or -1: the prefixed shapes that
+  checkpoint_step() knows plus ELT's `<workdir>/checkpoints/<N>` bare-int leaf.
+  The bare-int rule is applied only under a `checkpoints/` parent, the one place
+  it is safe (see elt_checkpoint_leaf_step)."""
+  s = checkpoint_step(path)
+  if s >= 0 or not path:
+    return s
+  parts = str(path).rstrip('/').rsplit('/', 2)
+  if len(parts) == 3 and parts[1] == 'checkpoints':
+    return elt_checkpoint_leaf_step(parts[2])
+  return -1
+
+
+def resume_pointer_of(entry: 'QueueEntry') -> str:
+  """The checkpoint this row was told to resume FROM, as a checkpoint path, or
+  ''. `load_from` verbatim; an ELT `restart_from`+`restart_step` pair as its
+  `<workdir>/checkpoints/<N>` leaf (the inverse of _apply_resume_pointer)."""
+  lk = getattr(entry, 'launch_kwargs', None) or {}
+  lf = str(lk.get('load_from') or '').strip()
+  if lf and lf.lower() not in ('none', 'null'):
+    return lf
+  rf = str(lk.get('restart_from') or '').strip()
+  rs = str(lk.get('restart_step') or '').strip()
+  if rf and rs.isdigit():
+    return f"{rf.rstrip('/')}/checkpoints/{rs}"
+  return ''
+
+
+def pick_restart_checkpoint(entry: 'QueueEntry',
+                            found: Optional[str] = None) -> str:
+  """The checkpoint a restart of `entry` should resume from, or ''.
+
+  PRIORITY, NOT A GLOBAL MAX OVER EVERYTHING. `found` (just read off this run's
+  own output dir) and `last_known_checkpoint` (recorded from earlier reads of
+  the run's own dirs) are the same lineage, so the higher step wins between
+  them. The row's resume pointer is only the last resort: it can name a
+  DIFFERENT run -- a fine-tune's `load_from` is its pretrain checkpoint, whose
+  step number dwarfs the fine-tune's own -- so letting it compete on step would
+  rewind a fine-tune to its starting point."""
+  own = [str(c) for c in (found, getattr(entry, 'last_known_checkpoint', ''))
+         if c]
+  if own:
+    return max(own, key=lineage_checkpoint_step)
+  return resume_pointer_of(entry)
+
+
+def note_known_checkpoint(entry: 'QueueEntry', checkpoint: Optional[str],
+                          now: Optional[float] = None) -> bool:
+  """Record `checkpoint` as the row's last_known_checkpoint if it is newer than
+  what the row already knows. Returns True when the record changed. `now`, when
+  given, stamps last_known_checkpoint_checked_at (the census rate limit).
+
+  Call ONLY with a checkpoint read off this run's own output dirs, never with a
+  resume pointer (see pick_restart_checkpoint for why)."""
+  if now is not None:
+    entry.last_known_checkpoint_checked_at = now
+  if not checkpoint:
+    return False
+  cur = getattr(entry, 'last_known_checkpoint', '') or ''
+  if cur and lineage_checkpoint_step(checkpoint) <= lineage_checkpoint_step(cur):
+    return False
+  entry.last_known_checkpoint = str(checkpoint)
+  return True
+
+
+def advance_resume_pointer(entry: 'QueueEntry') -> bool:
+  """Move a row's EXISTING resume pointer forward to its last_known_checkpoint,
+  under the same never-backwards rule as _apply_resume_pointer. Returns True
+  when the pointer moved.
+
+  For a requeue that is NOT a warm restart (the restart plan said HOLD, e.g. a
+  live same-config sibling): the row otherwise keeps the pointer it was first
+  given, and that stale pointer silently rewinds the run (2026-09-29: a row at
+  step 41500 was requeued still pointing at step_40000). Never adds a pointer to
+  a row that had none, and does not touch auto_resumes."""
+  known = getattr(entry, 'last_known_checkpoint', '') or ''
+  if not known or not resume_pointer_of(entry):
+    return False
+  lk = dict(entry.launch_kwargs or {})
+  before = dict(lk)
+  _apply_resume_pointer(lk, known)
+  if lk == before:
+    return False
+  entry.launch_kwargs = lk
+  return True
+
+
 # The pruned-restart verdict REUSES the LOAD_FROM contract: the pruner deleted
 # the old experiment, so there is no XID to append to (RESUME_XID is impossible)
 # and the only honest option is a NEW experiment warm from an explicit leaf
@@ -1878,6 +1992,9 @@ def build_warm_restart_entry(dead: 'QueueEntry', checkpoint: str,
       last_reason=(f'auto warm-restart from {checkpoint} after '
                    f'pruned/preempted death of {dead.job_id} '
                    f'(xid {dead.xid})'),
+      # The lineage's newest known checkpoint travels with the run, so the NEXT
+      # restart can fall back to it if CNS is unreadable at that moment.
+      last_known_checkpoint=getattr(dead, 'last_known_checkpoint', '') or '',
   )
   # prior_xids is a DERIVED, property-backed field (Phase 2a), not a real
   # __init__ parameter -- seed it through the setter AFTER construction (it
