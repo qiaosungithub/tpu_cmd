@@ -1843,6 +1843,45 @@ class LooksLikeCodeBugTest(unittest.TestCase):
     self.assertIsNone(R.looks_like_code_bug(
         'GPU0 HBM memory limit 40.0 GiB; 8 devices visible'))
 
+  def test_verified_minloglevel_banner_is_none(self):
+    # REGRESSION (2026-09-30): the VERIFIED banner carries a BARE 'SIGSEGV'
+    # token (not 'SIGSEGVs'), so the word boundary does not save it, and a
+    # parcae log is short enough that the tail IS the whole file. Every parcae
+    # run read as a segfault -> 16 rerouted runs requeued COLD. Must be None.
+    banner = ('[parcae-torch] minloglevel VERIFIED = 1 (set AND read back). '
+              'The NCCL log-sink SIGSEGV workaround is in force.')
+    self.assertIsNone(R.looks_like_code_bug(banner))
+
+  def test_verified_banner_then_healthy_training_is_none(self):
+    # The full shape of the real 2026-09-30 logs: banner, then clean training.
+    tail = ('[parcae-torch] config /x/configs/parcae-psm-a.yml (parcae-psm-a)\n'
+            '[parcae-torch] minloglevel VERIFIED = 1 (set AND read back). The '
+            'NCCL log-sink SIGSEGV workaround is in force.\n'
+            '[parcae-torch] step 1000 loss 3.31 gnorm 0.42 0.61 step/s\n'
+            '[parcae-torch] checkpoint saved -> /cns/si-d/x/steps/step_1000.pt')
+    self.assertIsNone(R.looks_like_code_bug(tail))
+
+  def test_verified_banner_does_not_mask_a_real_crash(self):
+    # GUARD AGAINST OVER-FIXING: only the banner LINE is dropped. A real crash
+    # after it -- a segfault or a Python traceback -- must still flag.
+    banner = ('[parcae-torch] minloglevel VERIFIED = 1 (set AND read back). '
+              'The NCCL log-sink SIGSEGV workaround is in force.\n')
+    self.assertEqual(
+        R.looks_like_code_bug(
+            banner + 'Fatal Python error: Segmentation fault (SIGSEGV)'),
+        'segfault (SIGSEGV)')
+    self.assertEqual(
+        R.looks_like_code_bug(
+            banner + 'Traceback (most recent call last):\n  File "a.py"\n'
+            'KeyError: x'),
+        'unhandled Python exception')
+
+  def test_banner_filter_is_line_scoped(self):
+    # A crash on a DIFFERENT line from any minloglevel mention still flags,
+    # and the case of the marker does not matter.
+    self.assertIsNotNone(R.looks_like_code_bug(
+        'MinLogLevel verified\ncaught signal 11 (SIGSEGV), dumping'))
+
 
 
 class OutDirFromLogTest(unittest.TestCase):

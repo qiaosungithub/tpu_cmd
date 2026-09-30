@@ -1779,6 +1779,36 @@ _CODE_BUG_MATCHERS = tuple(
     for _needle, _verdict in _CODE_BUG_SIGNATURES)
 
 
+# --- benign boot-banner lines, dropped BEFORE matching ----------------------
+# The torch launchers (parcae-torch main.py and every sibling repo forked from
+# it since 2026-08-29: loopformer, etd, parcae-*, persite-magma-skip, ...) print
+# a minloglevel status line at boot, in one of three variants:
+#   "minloglevel VERIFIED = 1 (set AND read back). The NCCL log-sink SIGSEGV
+#    workaround is in force."
+#   "minloglevel SET BUT UNPROVEN ... If rank 0 SIGSEGVs in its first
+#    collective, THIS is why. ... //base/python/clif:cpp_flag ..."
+#   "minloglevel READ-BACK unavailable (ModuleNotFoundError: ...) ... cpp_flag"
+# The word-boundary matcher above handles 'SIGSEGVs', but the VERIFIED variant
+# carries a bare 'SIGSEGV' token -- and a parcae log is ~10-20 KB, so the 64 KB
+# "tail" IS the whole file, banner included. Measured 2026-09-30: EVERY parcae
+# log (healthy ones too) read as 'segfault (SIGSEGV)', so the reroute path
+# requeued 16 rerouted runs COLD (checkpoints dropped, up to 6400 steps each)
+# and reconcile HELD auto-resume on two NCCL hardware failures.
+# These lines are status reports, never a crash, so drop them outright rather
+# than whack-a-mole on their wording. Same markers infra_check's
+# _clean_log_for_analysis already drops for the board (KEEP IN SYNC). A real
+# crash is still caught: its Traceback / 'Fatal Python error' / 'signal 11'
+# lines carry neither marker.
+_BENIGN_BANNER_MARKERS = ('MINLOGLEVEL', 'CPP_FLAG')
+
+
+def _drop_benign_banner_lines(log_upper: str) -> str:
+  """`log_upper` minus every line carrying a _BENIGN_BANNER_MARKERS token."""
+  return '\n'.join(
+      line for line in log_upper.splitlines()
+      if not any(m in line for m in _BENIGN_BANNER_MARKERS))
+
+
 def looks_like_code_bug(log_tail: str) -> Optional[str]:
   """Return a short code-bug verdict if the log TAIL shows the run killed
   ITSELF (crash / OOM / unhandled exception), else None.
@@ -1788,10 +1818,12 @@ def looks_like_code_bug(log_tail: str) -> Optional[str]:
   'ModuleNotFoundError: No module named base' readback note (measured on the dw
   line), and scanning it would misread every healthy pruned run as a bug and
   HOLD it -- the exact false positive this whole path exists to avoid.
+  ★And the tail of a SHORT log still contains that banner, so the minloglevel
+  status lines are dropped first (see _BENIGN_BANNER_MARKERS).
   """
   if not log_tail:
     return None
-  up = log_tail.upper()
+  up = _drop_benign_banner_lines(log_tail.upper())
   for matcher, verdict in _CODE_BUG_MATCHERS:
     if matcher.search(up):
       return verdict
