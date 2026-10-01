@@ -3220,5 +3220,68 @@ class FleetPairScoringTest(unittest.TestCase):
     self.assertEqual([p.cell for p in pl], ['lb'])
 
 
+
+def _floor_cap(group, floor=None, used=None, balance=0.0):
+  return R.GroupCapacity(group=group, floor=dict(floor or {}),
+                         used=dict(used or {}), balance=balance,
+                         above_floor_burn=0.0, limit_caps={}, age_s=5.0,
+                         prices={'h100': 0.5})
+
+
+class ChooseGroupTest(unittest.TestCase):
+  """THE alloc-group policy (pure): pin, then FLOOR room in 5,3,9 (operator
+  2026-10-01 00:02Z, g9 included), then today's preference order."""
+
+  ORDER = ['5', '3', '9']
+
+  def _choose(self, caps, entry=None, floor_first=None, fits=None,
+              pending=None):
+    e = entry or _entry('j', power='h100-8', archs=('h100',))
+    fits = fits or {'5': True, '3': True, '9': True}
+    return R.choose_group(
+        e, self.ORDER, self.ORDER if floor_first is None else floor_first,
+        1000.0, arch='h100', chips=8, price=None,
+        capacity=(None if caps is None else caps.get),
+        pending=pending if pending is not None else {},
+        probe=lambda g: {'fits': fits[g], 'g': g})
+
+  def test_floor_anywhere_beats_balance(self):
+    caps = {'5': _floor_cap('5', balance=1e6), '3': _floor_cap('3', balance=1e6),
+            '9': _floor_cap('9', floor={'h100': 16})}
+    c = self._choose(caps)
+    self.assertEqual((c.group, c.pass_name), ('9', 'FLOOR'))
+    self.assertFalse(_ok(c.verdict).above_floor)
+
+  def test_no_floor_falls_back_to_the_preference_pass(self):
+    caps = {'5': _floor_cap('5', balance=1e6), '3': _floor_cap('3', balance=1e6)}
+    c = self._choose(caps)
+    self.assertEqual((c.group, c.pass_name), ('5', 'balance'))
+
+  def test_no_capacity_data_means_no_floor_pass(self):
+    c = self._choose(None)
+    self.assertEqual((c.group, c.pass_name), ('5', 'balance'))
+
+  def test_floor_admission_debits_pending(self):
+    pending = {}
+    caps = {'3': _floor_cap('3', floor={'h100': 8})}
+    first = self._choose(caps, pending=pending)
+    second = self._choose(caps, pending=pending)
+    self.assertEqual((first.group, first.pass_name), ('3', 'FLOOR'))
+    self.assertNotEqual(second.pass_name, 'FLOOR')
+    self.assertEqual(pending, {'3': {'h100': 8.0}})
+
+  def test_pin_wins_and_is_still_probed(self):
+    e = _entry('j', power='h100-8', archs=('h100',))
+    e.pin_group = '9'
+    c = self._choose({'3': _floor_cap('3', floor={'h100': 64})}, entry=e,
+                     fits={'5': True, '3': True, '9': False})
+    self.assertEqual((c.group, c.pass_name, c.probe['fits']),
+                     ('9', 'PIN', False))
+
+  def test_nothing_fits_returns_the_fallback(self):
+    c = self._choose({}, fits={'5': False, '3': False, '9': False})
+    self.assertEqual((c.group, c.pass_name), ('9', 'fallback'))
+
+
 if __name__ == '__main__':
   unittest.main()

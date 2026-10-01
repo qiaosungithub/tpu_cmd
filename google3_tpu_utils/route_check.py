@@ -319,6 +319,9 @@ DEFAULT_GROUP = '9'
 # nobody is on the hook) -- and only then the g9 floor, whose 1/10 ceiling is
 # the one a human answers for. "优先" means TRY IN THIS ORDER, per job.
 DEFAULT_GROUP_ORDER = ['5', '3', '9']
+# Groups tried for FLOOR room before the preference order (operator 2026-10-01
+# 00:02Z: g9 included -- "有floor就用，什么group都行"). See choose_group.
+DEFAULT_FLOOR_FIRST_GROUPS = ['5', '3', '9']
 
 # Same acceptance the wrapper uses (ANSI-stripped): XManager prints "Launched
 # experiment <id>" on create and "Added N work unit(s) to experiment <id>" on
@@ -347,6 +350,12 @@ _DRY_RUN = flags.DEFINE_bool(
     'dry_run', True, 'Plan only; do NOT submit. Default True -- pass '
     '--nodry_run to actually submit.')
 _GROUP = flags.DEFINE_string('group', DEFAULT_GROUP, 'Alloc group for submits.')
+_FLOOR_FIRST_GROUPS = flags.DEFINE_list(
+    'floor_first_groups', DEFAULT_FLOOR_FIRST_GROUPS, 'Dispatch tries these '
+    'alloc groups FIRST for room inside their PROD floor (group_can_hold ok and '
+    'not above floor, budget probe fits, group not cooling for the job), before '
+    'the --group_order preference pass (operator 2026-10-01). Empty = no floor '
+    'pass (the preference order alone).')
 _GROUP_ORDER = flags.DEFINE_string(
     'group_order', None,
     'Comma-separated alloc groups to TRY IN ORDER for placement, e.g. "5,9": '
@@ -3680,6 +3689,7 @@ def run_dispatch_once(
     group_order: Optional[list[str]] = None,
     provider: 'Optional[_Provider | ViewSource]' = None,
     group_capacity_fn: 'Optional[Callable[[str], Optional[route_lib.GroupCapacity]]]' = None,
+    floor_first_groups: Optional[Sequence[str]] = None,
 ) -> tuple[str, list[str]]:
   """ONE router-dispatch round (the DISPATCH half of the rewritten worker).
 
@@ -3841,139 +3851,72 @@ def run_dispatch_once(
     if key not in _cost_cache:
       _cost_cache[key] = budget_query_fn(key[0], key[1], '', g) or {}
     return _cost_cache[key]
-  def _pick_group(e: route_lib.QueueEntry) -> tuple:
-    """First group in `group_order` whose budget gate admits this job.
-
-    Returns (group, probe). Falls back to the LAST group in the order (the g9
-    floor) when none fits, so the job is budget-deferred against g9 exactly as
-    before -- the preference can only move a job to a cheaper pool, never make
-    a previously-placeable job unplaceable.
-
-    ★A CALLER PIN OVERRIDES THE ORDER ENTIRELY (and is still budget-probed, so
-    a pinned-to-g9 job that exceeds the income/10 bar is deferred exactly like
-    any other g9 job -- a pin buys a POOL, never a bypass of the bar). The
-    preference order is a fleet-wide default; it is right for a job that has no
-    opinion and wrong for one that keeps being preempted out of g5's
-    vqfree-xm. Without this branch there was no way to express the exception:
-    every route into the row (`--group=`, `--launch=group=`) was either eaten
-    by absl or dropped at build time."""
-    pin = route_lib.pinned_group(e)
-    if pin:
-      if pin != group_order[-1]:
-        _debit_group(e, pin)   # a pinned job still takes that pool's room
-      return pin, (_probe_group(e, pin) or {})
-    last = (group_order[-1], {})
-    for g in group_order:
-      if g != group_order[-1]:
-        why_not = _group_gate(e, g)
-        if why_not:
-          skipped.setdefault(e.job_id, []).append(why_not)
-          continue        # this pool cannot take it now: try the next one
-      pr = _probe_group(e, g)
-      if not pr:
-        continue          # probe failed for this group: try the next one
-      last = (g, pr)
-      if pr.get('fits'):
-        if g != group_order[-1]:
-          _debit_group(e, g)
-        return g, pr
-    return last
-  # ★GROUP GATES (operator 2026-09-23: "和对tpu type / cell做冷却时一样的逻辑，
-  # 再次之外加一个'g5能不能用'的判断，如果不能就不route到g5"). Before this the
-  # order was consulted blind: g5 is budget-EXEMPT, so its probe always "fits"
-  # and every unpinned job went to g5 (20,613 dispatch lines to g5, 0 to g3) on
-  # a day g5's H100 floor was full and its balance ~0 -- the jobs sat PENDING
-  # ("99% of SCUs in your pool are queued ahead") or were reclaimed ("guarantee
-  # reclaim -- we were ABOVE"), were re-routed, and were sent straight back to
-  # g5 (one row 10 times). Two gates now guard every NON-FALLBACK group; the
-  # last group of the order (the g9 floor) is never gated, so a gate can only
-  # move a job on to g9, never strand it:
-  #   1. group cooldown -- this job was re-routed off that pool recently
-  #      (route_lib.group_cooling, stamped by mark_reroute like cell/arch);
-  #   2. can the pool hold it -- route_lib.group_can_hold over the checker
-  #      caches (group limit order vs price, then floor room, else balance to
-  #      buy above-floor weight), failing closed. Gate 2 is off when
-  #      group_capacity_fn is None (unit tests of the bare preference order).
-  # group -> {family: chips} sent to that pool and not running yet: SUBMITTED
-  # rows (absent from the quota table's Used, but GQM must seat them first), plus
-  # every job admitted to it earlier in THIS round (_debit_group). BUILD_REQUESTED
-  # / BUILDING rows need no entry: backpressure above returned if any existed.
+  # ★GROUP CHOICE: route_lib.choose_group is the whole policy (pin, then the
+  # FLOOR pass over floor_first_groups, then the 5,3,9 order with its cooldown
+  # and capacity gates). This function only supplies the I/O: the budget
+  # probe, the capacity caches (read once per group per round, failing
+  # closed), and the per-group pending debit -- SUBMITTED rows (absent from the
+  # quota table's Used, but GQM must seat them first) plus every admission
+  # earlier in this round. BUILD_REQUESTED / BUILDING rows need no entry:
+  # backpressure above returned if any existed.
   pending_by_group: dict = {}
   for x in entries:
     if (x.state == route_lib.JobState.SUBMITTED and x.group and x.arch
         and x.chips):
-      fams = pending_by_group.setdefault(str(x.group), {})
-      fams[x.arch.lower()] = fams.get(x.arch.lower(), 0.0) + float(x.chips)
-  verdicts: dict = {}     # (job_id, group) -> route_lib.HoldVerdict
-  skipped: dict = {}      # job_id -> [why each preferred pool was passed over]
+      route_lib._debit_pending(pending_by_group, str(x.group), x.arch, x.chips)  # pylint: disable=protected-access
   _cap_cache: dict = {}
-  def _shape_of(e: route_lib.QueueEntry) -> tuple:
-    pl = placement_by_id.get(e.job_id)
-    if pl is not None:
-      return pl.arch, pl.chips, pl.price
-    return e.arch, e.chips, None
-  def _group_gate(e: route_lib.QueueEntry, g: str) -> str:
-    """'' if non-fallback group `g` may take `e` now, else why it may not."""
-    rec = route_lib.group_cooling(e, g, now)
-    if rec is not None:
-      return (f'g{g} cooling for this job ({int(float(rec["until"]) - now)}s '
-              f'left, strike {rec.get("strikes", 1)})')
-    if group_capacity_fn is None:
-      return ''
+  def _capacity(g: str) -> Optional[route_lib.GroupCapacity]:
     if g not in _cap_cache:
       try:
-        _cap_cache[g] = group_capacity_fn(g)
+        _cap_cache[g] = group_capacity_fn(g) if group_capacity_fn else None
       except Exception:  # pylint: disable=broad-except
         _cap_cache[g] = None   # fail closed: an unreadable pool is not usable
-    arch, chips, price = _shape_of(e)
-    try:
-      v = route_lib.group_can_hold(_cap_cache[g], arch, chips, price,
-                                   pending=pending_by_group.get(g))
-    except Exception as ex:  # pylint: disable=broad-except
-      # Fail closed and never crash the round: a gate bug must cost this pool
-      # one job, not stop dispatch fleet-wide (the wrapper would restart-loop).
-      v = route_lib.HoldVerdict(False, f'g{g}: capacity gate error: {ex!r}')
-    verdicts[(e.job_id, g)] = v
-    return '' if v.ok else v.reason
-  def _debit_group(e: route_lib.QueueEntry, g: str) -> None:
-    """Count a job admitted to pool `g` as pending there for the rest of the
-    round, so later jobs see its chips as taken."""
-    arch, chips, _ = _shape_of(e)
-    if arch and chips:
-      fams = pending_by_group.setdefault(str(g), {})
-      fams[arch.lower()] = fams.get(arch.lower(), 0.0) + float(chips)
+    return _cap_cache[g]
+  # None = the production default; [] = no floor pass (preference order only).
+  floor_first = [str(g) for g in (DEFAULT_FLOOR_FIRST_GROUPS
+                                  if floor_first_groups is None
+                                  else floor_first_groups) if str(g)]
   # Decide each job's pool ONCE, in the order plan_dispatch admits them
   # (priority first, stable), so a higher-priority job gets first claim on a
   # pool's floor room and the round debit is never counted twice.
   picks: dict = {}
   for e in sorted(queued, key=lambda x: -x.priority):
-    picks[e.job_id] = _pick_group(e)
+    pl = placement_by_id.get(e.job_id)
+    arch, chips, price = ((pl.arch, pl.chips, pl.price) if pl is not None
+                          else (e.arch, e.chips, None))
+    picks[e.job_id] = route_lib.choose_group(
+        e, group_order, floor_first, now, arch=arch, chips=chips, price=price,
+        capacity=_capacity if group_capacity_fn is not None else None,
+        pending=pending_by_group,
+        probe=lambda g, _e=e: _probe_group(_e, g))
   def _probe(e: route_lib.QueueEntry) -> dict:
-    return picks[e.job_id][1]
+    return picks[e.job_id].probe
   def cost_of(e: route_lib.QueueEntry) -> float:
     return float(_probe(e).get('new_cost', 0.0))
   def is_exempt(e: route_lib.QueueEntry) -> bool:
     return bool(_probe(e).get('exempt', False))
 
   # Remember which pool won for each candidate, so the BUILDER submits under it.
-  chosen: dict = {jid: p[0] for jid, p in picks.items()}
+  chosen: dict = {jid: c.group for jid, c in picks.items()}
   for e in queued:
-    g = chosen.get(e.job_id)
-    pin = route_lib.pinned_group(e)
-    if pin:
-      log.append(f'[dispatch] {e.job_id} -> group g{g} (PINNED by caller; '
-                 f'preference order {",".join(group_order)} not consulted)')
+    c = picks[e.job_id]
+    if c.pass_name == 'PIN':
+      log.append(f'[dispatch] {e.job_id} -> group g{c.group} (PINNED by '
+                 f'caller; preference order {",".join(group_order)} not '
+                 f'consulted)')
       continue
     notes = []
-    if g and g != group_order[-1]:
+    if c.pass_name == 'FLOOR' and c.verdict is not None:
+      notes.append(c.verdict.reason)
+    if c.group != group_order[-1]:
       notes.append('exempt from the g9 income/10 bar')
-      v = verdicts.get((e.job_id, g))
-      if v is not None:
-        notes.append(v.reason)
-    if skipped.get(e.job_id):
-      notes.append('skipped ' + '; '.join(skipped[e.job_id]))
+    if c.pass_name != 'FLOOR' and c.verdict is not None:
+      notes.append(c.verdict.reason)
+    if c.skipped:
+      notes.append('skipped ' + '; '.join(c.skipped))
     if notes:
-      log.append(f'[dispatch] {e.job_id} -> group g{g} ({"; ".join(notes)})')
+      log.append(f'[dispatch] {e.job_id} -> group g{c.group} '
+                 f'({c.pass_name}: {"; ".join(notes)})')
 
   plan = route_lib.plan_dispatch(queued, headroom, cost_of, is_exempt)
 
@@ -4079,6 +4022,7 @@ def run_dispatch_worker_loop(
     budget_query_fn: 'Callable[..., Optional[dict]]' = budget_query,
     max_iterations: Optional[int] = None,
     group_capacity_fn: 'Optional[Callable[[str], Optional[route_lib.GroupCapacity]]]' = load_group_capacity,
+    floor_first_groups: Optional[Sequence[str]] = None,
 ) -> None:
   """Step3 combined loop (the rewritten worker): DISPATCH then BUILD, forever.
 
@@ -4104,7 +4048,8 @@ def run_dispatch_worker_loop(
         queue_file, now=time.time(), group=group,
         budget_query_fn=budget_query_fn, dry_run=False,
         group_order=group_order, provider=cached_provider,
-        group_capacity_fn=group_capacity_fn)
+        group_capacity_fn=group_capacity_fn,
+        floor_first_groups=floor_first_groups)
     for line in dlog:
       print(line, flush=True)
     # 2. BUILD one BUILD_REQUESTED (serial). Claim from BUILD_REQUESTED so we
@@ -4199,6 +4144,7 @@ def main(argv):
         group=_GROUP.value,
         srcfs_fail_brake=_SRCFS_FAIL_BRAKE.value,
         max_build_attempts=_MAX_BUILD_ATTEMPTS.value,
+        floor_first_groups=_FLOOR_FIRST_GROUPS.value,
     )
     return
 

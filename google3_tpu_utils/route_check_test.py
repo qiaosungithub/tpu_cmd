@@ -3431,7 +3431,8 @@ class DispatchGroupGateTest(unittest.TestCase):
 
   def _run(self, entries, caps: Optional[dict] = None,
            group_order: Optional[list] = None, now: float = 1000.0,
-           gated: bool = True):
+           gated: bool = True, floor_first: Optional[list] = None,
+           seam=None):
     RC.save_queue(self.path, entries)
 
     def cap_fn(g: str) -> Optional[R.GroupCapacity]:
@@ -3442,9 +3443,10 @@ class DispatchGroupGateTest(unittest.TestCase):
       return c
 
     _, log = RC.run_dispatch_once(
-        self.path, now=now, budget_query_fn=self._seam, dry_run=False,
+        self.path, now=now, budget_query_fn=seam or self._seam, dry_run=False,
         group_order=group_order or ['5', '3', '9'],
-        group_capacity_fn=cap_fn if gated else None)
+        group_capacity_fn=cap_fn if gated else None,
+        floor_first_groups=floor_first)
     return {e.job_id: e for e in RC.load_queue(self.path)}, log
 
   def test_full_g5_sends_the_job_to_g3(self):
@@ -3471,8 +3473,16 @@ class DispatchGroupGateTest(unittest.TestCase):
     self.assertIn('g3:', line[0])
 
   def test_the_fallback_is_never_gated(self):
-    rows, _ = self._run([self._q('a')], {}, group_order=['5', '9'])
+    # No capacity data for any pool: the floor pass admits nothing, and the
+    # preference pass never gates the fallback, so the job still lands on g9.
+    rows, log = self._run([self._q('a')], {}, group_order=['5', '9'])
     self.assertEqual(rows['a'].state, R.JobState.BUILD_REQUESTED)
+    self.assertEqual(rows['a'].group, '9')
+    self.assertFalse(any('FLOOR' in l for l in log), log)
+    # With no floor pass configured, g9's capacity is not even read.
+    self.cap_calls.clear()
+    rows, _ = self._run([self._q('a')], {}, group_order=['5', '9'],
+                        floor_first=[])
     self.assertEqual(rows['a'].group, '9')
     self.assertNotIn('9', self.cap_calls)
 
@@ -3497,9 +3507,11 @@ class DispatchGroupGateTest(unittest.TestCase):
     self.assertTrue(any('capacity gate error' in l for l in log))
 
   def test_capacity_is_loaded_once_per_group_per_round(self):
+    # g9 is read too: the floor pass checks g9's floor explicitly (operator
+    # 2026-10-01 00:02Z), once per round like every other pool.
     self._run([self._q('a'), self._q('b'), self._q('c')],
               {'5': _G5_FULL, '3': _G3_RICH})
-    self.assertEqual(sorted(self.cap_calls), ['3', '5'])
+    self.assertEqual(sorted(self.cap_calls), ['3', '5', '9'])
 
   def test_a_cooling_group_is_skipped_even_with_room(self):
     a = self._q('a')
@@ -3571,6 +3583,73 @@ class DispatchGroupGateTest(unittest.TestCase):
     rows, _ = self._run([job()],
                         {'5': None, '3': _gate_cap('3', balance=need)})
     self.assertEqual(rows['a'].group, '3')
+
+  # --- FLOOR-FIRST (operator 2026-10-01 00:02Z: "如果能知道 floor 还剩多少，
+  # 就优先往有 floor 的地方调度；如果全都没 floor 就退回现在的情况"; g9 included:
+  # "算进去。有floor就用，什么group都行").
+  _G5_RICH = _gate_cap('5', balance=55996.0)          # no floor, rich balance
+  _G3_FLOOR8 = _gate_cap('3', floor={'h100': 8})      # exactly one h100-8 slot
+  _G9_FLOOR = _gate_cap('9', floor={'h100': 64})
+
+  def test_floor_room_in_g3_beats_g5_balance(self):
+    rows, log = self._run([self._q('a')],
+                          {'5': self._G5_RICH, '3': self._G3_FLOOR8})
+    self.assertEqual(rows['a'].group, '3')
+    self.assertIn('[dispatch] a -> group g3 (FLOOR: g3: h100 floor room 8 >= 8;'
+                  ' exempt from the g9 income/10 bar)', log)
+    # NEGATIVE CONTROL: with no floor pass, the preference order sends it to
+    # g5 on balance -- exactly the pre-change choice.
+    rows, log = self._run([self._q('a')],
+                          {'5': self._G5_RICH, '3': self._G3_FLOOR8},
+                          floor_first=[])
+    self.assertEqual(rows['a'].group, '5')
+    self.assertTrue(any('a -> group g5 (balance:' in l for l in log), log)
+
+  def test_no_floor_anywhere_gives_todays_choice(self):
+    caps = {'5': self._G5_RICH, '3': _G3_RICH}
+    new, _ = self._run([self._q('a'), self._q('b', priority=1)], caps)
+    old, _ = self._run([self._q('a'), self._q('b', priority=1)], caps,
+                       floor_first=[])
+    self.assertEqual({k: v.group for k, v in new.items()},
+                     {k: v.group for k, v in old.items()})
+    self.assertEqual(new['a'].group, '5')
+
+  def test_g9_floor_wins_when_g5_and_g3_have_none(self):
+    rows, log = self._run([self._q('a')], {'5': _G5_FULL, '3': _G3_RICH,
+                                           '9': self._G9_FLOOR})
+    self.assertEqual(rows['a'].group, '9')
+    self.assertIn('[dispatch] a -> group g9 (FLOOR: g9: h100 floor room 64 '
+                  '>= 8)', log)
+
+  def test_g9_floor_still_needs_the_income_bar(self):
+    def seam(tpu_type, tier='PROD', lo='', group=''):
+      exempt = group in ('3', '5')
+      return {'income': 1000.0, 'bar': 100.0, 'current': 0.0,
+              'headroom': 1000.0, 'new_cost': 0.0 if exempt else 10.0,
+              'exempt': exempt, 'fits': exempt}      # g9 over its bar
+    rows, log = self._run([self._q('a')], {'5': _G5_FULL, '3': _G3_RICH,
+                                           '9': self._G9_FLOOR}, seam=seam)
+    self.assertEqual(rows['a'].group, '3')          # pass 2, on balance
+    self.assertFalse(any('FLOOR' in l for l in log), log)
+
+  def test_a_cooling_group_is_skipped_in_the_floor_pass(self):
+    a = self._q('a')
+    a.cooldown_groups = {'3': {'until': 1500.0, 'strikes': 1}}
+    rows, log = self._run([a], {'5': self._G5_RICH, '3': self._G3_FLOOR8},
+                          now=1000.0)
+    self.assertEqual(rows['a'].group, '5')
+    self.assertFalse(any('FLOOR' in l for l in log), log)
+
+  def test_the_in_round_debit_stops_two_jobs_taking_one_floor_slot(self):
+    rows, log = self._run([self._q('hi', priority=2), self._q('lo', priority=1)],
+                          {'5': self._G5_RICH, '3': self._G3_FLOOR8})
+    self.assertEqual(rows['hi'].group, '3')
+    self.assertEqual(rows['lo'].group, '5')
+    self.assertTrue(any('lo -> group g5 (balance:' in l for l in log), log)
+
+  def test_the_dispatch_loop_defaults_to_5_3_9(self):
+    self.assertEqual(RC.DEFAULT_FLOOR_FIRST_GROUPS, ['5', '3', '9'])
+    self.assertEqual(RC._FLOOR_FIRST_GROUPS.default, ['5', '3', '9'])
 
   def test_the_worker_loop_wires_the_real_loader(self):
     import inspect  # pylint: disable=g-import-not-at-top

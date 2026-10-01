@@ -3256,6 +3256,113 @@ def group_can_hold(cap: Optional[GroupCapacity], arch: Optional[str],
                             f'{reserve_h:g}h above floor')
 
 
+@dataclasses.dataclass
+class GroupChoice:
+  """One job's alloc-group decision (choose_group)."""
+  group: str
+  probe: dict
+  pass_name: str      # 'PIN' | 'FLOOR' | 'balance' | 'fallback'
+  verdict: Optional[HoldVerdict] = None   # the chosen pool's capacity verdict
+  skipped: list = dataclasses.field(default_factory=list)  # pass-2 why-nots
+
+
+def _debit_pending(pending: dict, group: str, arch: Optional[str],
+                   chips: Optional[int]) -> None:
+  """Count `chips` x `arch` as pending in `group` for the rest of the round."""
+  if arch and chips:
+    fams = pending.setdefault(str(group), {})
+    fams[arch.lower()] = fams.get(arch.lower(), 0.0) + float(chips)
+
+
+def _hold_verdict(capacity: Callable[[str], Optional[GroupCapacity]],
+                  group: str, arch: Optional[str], chips: Optional[int],
+                  price: Optional[float], pending: dict) -> HoldVerdict:
+  """group_can_hold for `group`, FAILING CLOSED on any error: a gate bug must
+  cost this pool one job, never crash the dispatch round."""
+  try:
+    return group_can_hold(capacity(group), arch, chips, price,
+                          pending=pending.get(group))
+  except Exception as ex:  # pylint: disable=broad-except
+    return HoldVerdict(False, f'g{group}: capacity gate error: {ex!r}')
+
+
+def choose_group(entry: QueueEntry, order: Sequence[str],
+                 floor_first: Sequence[str], now: float, *,
+                 arch: Optional[str], chips: Optional[int],
+                 price: Optional[float],
+                 capacity: Optional[Callable[[str], Optional[GroupCapacity]]],
+                 pending: dict,
+                 probe: Callable[[str], dict]) -> GroupChoice:
+  """THE alloc-group policy for one job (the dispatch worker's only caller).
+
+  `order` is the preference order (5,3,9; its LAST group is the fallback),
+  (arch, chips, price) the shape the builder will submit, `capacity(g)` the
+  pool's GroupCapacity (None: no capacity gating at all), `pending` the
+  per-group {family: chips} sent there and not yet running (SUBMITTED rows +
+  this round's admissions; MUTATED on admission), `probe(g)` the budget seam
+  ({} = probe failed; 'fits' = under the bar).
+
+  0. PIN: a caller pin wins outright (still probed: a pin buys a pool, never a
+     bypass of the g9 income/10 bar).
+  1. ★FLOOR PASS (operator 2026-10-01 00:02Z: "如果能知道 floor 还剩多少，就优先
+     往有 floor 的地方调度；如果全都没 floor 就退回现在的情况" / "算进去。有floor
+     就用，什么group都行"). For each g in `floor_first` that is also in `order`:
+     skip it while this job is cooling off g; take group_can_hold's verdict
+     (EXPLICITLY for the fallback g9 too -- pass 2 never gates g9); if it is
+     ok INSIDE the floor (not above_floor) and the budget probe fits, admit.
+     Floor chips cost no balance and are not reclaimed, so floor room anywhere
+     beats balance-bought room in g5/g3. Needs capacity data; without it this
+     pass is empty.
+  2. PASS 2, unchanged from before: the first group of `order` whose gates
+     (cooldown, then capacity if available) pass and whose probe fits; the
+     fallback (last group) is never gated; when nothing fits, the last probed
+     group (normally g9) is returned so the job is budget-deferred there.
+  A preferred (non-fallback) pool admitted in pass 2, and ANY pool admitted
+  in pass 1, is debited into `pending`."""
+  fallback = order[-1]
+  pin = pinned_group(entry)
+  if pin:
+    if pin != fallback:
+      _debit_pending(pending, pin, arch, chips)
+    return GroupChoice(pin, probe(pin) or {}, 'PIN')
+  if capacity is not None:
+    for g in floor_first:
+      if g not in order or group_cooling(entry, g, now) is not None:
+        continue
+      v = _hold_verdict(capacity, g, arch, chips, price, pending)
+      if not v.ok or v.above_floor:
+        continue
+      pr = probe(g) or {}
+      if pr.get('fits'):
+        _debit_pending(pending, g, arch, chips)
+        return GroupChoice(g, pr, 'FLOOR', v)
+  skipped: list[str] = []
+  last = GroupChoice(fallback, {}, 'fallback', None, skipped)
+  for g in order:
+    v = None
+    if g != fallback:
+      rec = group_cooling(entry, g, now)
+      if rec is not None:
+        skipped.append(f'g{g} cooling for this job '
+                       f'({int(float(rec["until"]) - now)}s left, strike '
+                       f'{rec.get("strikes", 1)})')
+        continue
+      if capacity is not None:
+        v = _hold_verdict(capacity, g, arch, chips, price, pending)
+        if not v.ok:
+          skipped.append(v.reason)
+          continue
+    pr = probe(g) or {}
+    if not pr:
+      continue          # probe failed for this group: try the next one
+    last = GroupChoice(g, pr, 'fallback', v, skipped)
+    if pr.get('fits'):
+      if g != fallback:
+        _debit_pending(pending, g, arch, chips)
+      return GroupChoice(g, pr, 'balance', v, skipped)
+  return last
+
+
 def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry:
   """Return the entry reset to QUEUED after a failed placement.
 
