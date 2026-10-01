@@ -41,6 +41,7 @@ survivable -- we cannot predict it, only react to it.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import enum
 import random
@@ -3084,35 +3085,421 @@ def output_is_fresh(latest_mtime: Optional[float], now: float,
   return (now - latest_mtime) < fresh_within_s
 
 
-def decide_reroute(first_state: str, second_state: Optional[str],
-                   output_fresh: bool,
-                   pending_const: str = 'PENDING') -> bool:
-  """Pure decision: should this candidate ACTUALLY be re-routed?
+# ---------------------------------------------------------------------------
+# ONE REROUTE DECISION OVER PARALLEL OBSERVATIONS (operator 2026-10-01 01:31Z
+# + 02:15Z decisions 2/3). route_check gathers a RerouteObs per candidate --
+# XM status, Borg stage, output freshness, restart count, in two samples, in
+# parallel -- and decide_reroute below turns it into ONE RerouteAction. The
+# decision is pure; every probe, cancel and queue write stays in route_check.
 
-  The safety invariant: this only ever returns True when EVERY guard has failed
-  to find life. It never widens the reroute path -- each guard can only turn a
-  would-be reroute OFF.
+# XM statuses as route_check's probes report them (route_check.STATUS_*).
+XM_PENDING = 'PENDING'
+XM_RUNNING = 'RUNNING'
+XM_TERMINAL = 'TERMINAL'
+XM_UNKNOWN = 'UNKNOWN'
 
-    1. first_state != PENDING  -> not reroute (RUNNING/TERMINAL/UNKNOWN handled
-       by the caller's own branches; we never reroute a non-PENDING first read).
-    2. output_fresh            -> not reroute (disk says it is alive NOW).
-    3. second_state != PENDING -> not reroute (the shadow-gap cleared on the
-       second sample; UNKNOWN also protects -- never cancel on ambiguity).
-    4. both PENDING and no fresh output -> RE-ROUTE (double-confirmed stuck).
+# Borg stage of a job's VM groups, from the LATEST transition (decision 3).
+STAGE_RUN = 'RUN'
+STAGE_STARTING = 'STARTING'          # latest transition is ASSIGN or SETUP
+STAGE_BORG_PENDING = 'BORG_PENDING'  # latest transition is PENDING
+# `findjobs` answered and printed nothing. A LOG LABEL ONLY: an empty result
+# is just as likely a wrong cell or name_re as a job that does not exist, so
+# every decision treats it exactly like an unreadable probe (None).
+STAGE_NO_JOB = 'NO_JOB'
 
-  `second_state` is None when the caller has not taken a second sample (e.g. the
-  first read was already non-PENDING, or output was fresh so we short-circuited);
-  in that case guards 1/2 must have decided, and reaching here with None means
-  'do not reroute' (defensive)."""
-  if first_state != pending_const:
+_VMGROUP_STAGE = {'RUN': STAGE_RUN, 'ASSIGN': STAGE_STARTING,
+                  'SETUP': STAGE_STARTING, 'PENDING': STAGE_BORG_PENDING}
+_STAGE_RANK = {STAGE_RUN: 3, STAGE_STARTING: 2, STAGE_BORG_PENDING: 1}
+_VMG_TS_RE = re.compile(
+    r'vm_group_state_timestamps\s*\{\s*state:\s*VMGROUP_STATE_([A-Z_]+)\s*'
+    r'max_last_state_transition_time\s*\{\s*seconds:\s*(\d+)'
+    r'(?:\s*nanos:\s*(\d+))?')
+_FINDJOBS_JOB_RE = re.compile(r'^job \{', re.M)
+
+
+@dataclasses.dataclass(frozen=True)
+class BorgStage:
+  """Where a job's VM groups are NOW: `stage` (STAGE_*, or the raw
+  VMGROUP_STATE suffix for any other state, e.g. 'DEAD') since `since`
+  (epoch seconds of that transition; None for NO_JOB)."""
+  stage: str
+  since: Optional[float] = None
+
+
+def parse_borg_stage(findjobs_text: Optional[str]) -> Optional[BorgStage]:
+  """The Borg stage in `borg findjobs` text, or None when there is none.
+
+  Each job block carries `vm_group_state_timestamps { state: VMGROUP_STATE_X
+  max_last_state_transition_time { seconds: N nanos: M } }` entries. A job's
+  stage is the state with the LATEST transition time -- not "any RUN ever",
+  which shielded a job preempted back to PENDING for 20 minutes on its stale
+  output (operator decision 3, 2026-10-01). Measured on sj b200 294884132:
+  PENDING 22:33:49 -> ASSIGN/SETUP 22:34:50 -> RUN 22:37:03.
+
+  When several jobs match (work units / auxiliary jobs), the most advanced
+  stage wins (RUN > STARTING > BORG_PENDING > other) -- the protective
+  direction, since only a non-RUN reading can enable a cancel; ties take the
+  most recent transition. Empty or unparseable text is None (an empty
+  findjobs result is never evidence of absence; the probe labels it NO_JOB).
+  Pure."""
+  text = findjobs_text or ''
+  parts = _FINDJOBS_JOB_RE.split(text)
+  blocks = parts[1:] if len(parts) > 1 else [text]
+  best: Optional[BorgStage] = None
+  for block in blocks:
+    hits = _VMG_TS_RE.findall(block)
+    if not hits:
+      continue
+    state, sec, nanos = max(hits, key=lambda h: (int(h[1]), int(h[2] or 0)))
+    st = BorgStage(_VMGROUP_STAGE.get(state, state),
+                   int(sec) + int(nanos or 0) / 1e9)
+    if best is None:
+      best = st
+      continue
+    rank = (_STAGE_RANK.get(st.stage, 0), st.since or 0.0)
+    if rank > (_STAGE_RANK.get(best.stage, 0), best.since or 0.0):
+      best = st
+  return best
+
+
+def stage_vm_running(st: Optional[BorgStage]) -> Optional[bool]:
+  """Tri-state "is a VM group RUN now": True for RUN, False for any other
+  parsed stage (Borg answered, the latest state is not RUN), None when Borg
+  could not tell (no reading, or NO_JOB). Only False is a verdict."""
+  if st is None or st.stage == STAGE_NO_JOB:
+    return None
+  return st.stage == STAGE_RUN
+
+
+def stage_note(st: Optional[BorgStage], now: float) -> str:
+  """'stage=BORG_PENDING 1203s' -- the stage and the age in it, logged at
+  every cancel (Fix 3 rule c). 'stage=NO_JOB' / 'stage=unknown' when Borg
+  printed nothing / could not be read."""
+  if st is None:
+    return 'stage=unknown'
+  if st.since is None:
+    return f'stage={st.stage}'
+  return f'stage={st.stage} {max(0, int(now - st.since))}s'
+
+
+def starting_hold_s(st: Optional[BorgStage], now: float,
+                    starting_max_s: float) -> Optional[int]:
+  """RULE a: seconds the job has been STARTING when that holds off a cancel
+  (Borg has assigned it a machine and is setting it up -- cancelling now
+  throws away a slot that is about to run), else None. Bounded: from
+  `starting_max_s` on (and when starting_max_s <= 0) it holds nothing."""
+  if starting_max_s <= 0 or st is None or st.stage != STAGE_STARTING:
+    return None
+  age = 0 if st.since is None else max(0, int(now - st.since))
+  return age if age < starting_max_s else None
+
+
+@dataclasses.dataclass
+class RerouteObs:
+  """Everything the I/O layer saw of one reroute candidate. Sample 1 is
+  taken for every candidate; sample 2 (sampled2) only for a PENDING one
+  needs_second_sample() names, after ONE shared confirm gap. `error` is a
+  probe that raised: the candidate is then never actioned."""
+  xm1: str = XM_UNKNOWN
+  stage1: Optional[BorgStage] = None
+  mtime1: Optional[float] = None
+  out_err1: str = ''
+  out_skipped1: bool = False   # PENDING, Borg says not RUN: output not read
+  restarts_read: bool = False
+  restarts: Optional[int] = None
+  restarts_err: str = ''
+  recovered: Optional[tuple[str, str, int]] = None   # cell, arch, chips
+  sampled2: bool = False
+  stage2: Optional[BorgStage] = None
+  mtime2: Optional[float] = None
+  out_err2: str = ''
+  t2: Optional[float] = None
+  xm2: Optional[str] = None
+  error: str = ''
+
+
+@dataclasses.dataclass(frozen=True)
+class RerouteParams:
+  """The tunables of one reroute pass. starting_max_s <= 0 turns rule a off
+  and require_better=False turns rule b off (the pre-2026-10-01 behaviour)."""
+  fresh_output_s: float = 1200.0
+  nominal_running_grace_s: float = 300.0
+  inplace_reroute: bool = True
+  inplace_restart_threshold: int = 3
+  starting_max_s: float = 0.0
+  require_better: bool = False
+  terminal_to_reconcile: bool = False
+  cooldown_s: float = 1800.0
+
+
+ACT_CANCEL = 'cancel'          # end the attempt (end = END_PENDING/NOMINAL/THRASH)
+ACT_PROMOTE = 'promote'        # mark RUNNING
+ACT_ALIVE = 'alive'            # fresh output: alive, note it
+ACT_FLAG_CNS = 'flag_cns'      # a read failed: no action, count the failure
+ACT_MARK_FAILED = 'mark_failed'
+ACT_DEFER = 'defer'            # would cancel, held by rule a or b
+ACT_NOOP = 'noop'              # nothing to do (ambiguous / left for reconcile)
+ACT_UNKNOWN = 'unknown'        # could not tell: never act blind
+ACT_NEED_VIEW = 'need_view'    # rule b needs the placement view: build it, ask again
+
+
+@dataclasses.dataclass(frozen=True)
+class RerouteAction:
+  """decide_reroute's verdict. `log` follows the row's tag; `reason` is the
+  row's new last_reason ('' = leave it); `notes` are log lines that precede
+  the verdict. A cancel carries `end`, `why`, the rule-c `stage` note and,
+  under rule b, the `better` placement it is moving towards."""
+  kind: str
+  log: str = ''
+  reason: str = ''
+  notes: tuple[str, ...] = ()
+  end: str = ''
+  why: str = ''
+  stage: str = ''
+  better: Optional[Placement] = None
+  cns_err: str = ''
+  cns_doing: str = ''
+
+
+def reroute_age_s(entry: 'QueueEntry', now: float) -> int:
+  """Seconds since the row was submitted. `or now` would read a submitted_at
+  of 0.0 as "no timestamp" -- harmless for real epoch stamps, wrong for a
+  literal 0 -- so None is tested explicitly."""
+  return int(now - (entry.submitted_at if entry.submitted_at is not None
+                    else now))
+
+
+def wants_output_read(entry: 'QueueEntry', obs: RerouteObs, now: float,
+                      params: RerouteParams) -> bool:
+  """Does sample 1 need the output mtime? PENDING: unless Borg says no VM
+  group is RUN (Bug 3, 2026-09-21: a preempted job's last writes are history,
+  not life). RUNNING: only for the nominal check (Borg not RUN, past grace)."""
+  if not entry.xid or obs.error:
     return False
-  if output_fresh:
-    return False
-  if second_state is None:
-    return False
-  if second_state != pending_const:
-    return False
-  return True
+  vm = stage_vm_running(obs.stage1)
+  if obs.xm1 == XM_PENDING:
+    return vm is not False
+  if obs.xm1 == XM_RUNNING:
+    return vm is False and reroute_age_s(entry, now) >= patience_s(
+        entry, params.nominal_running_grace_s)
+  return False
+
+
+def needs_second_sample(entry: 'QueueEntry', obs: RerouteObs, now: float,
+                        params: RerouteParams) -> bool:
+  """A PENDING candidate whose first sample found no life and read cleanly
+  gets a second sample after the shared confirm gap (2026-08-24: a BATCH
+  job's EMA shadow units read `all pending` between segments)."""
+  return (not obs.error and obs.xm1 == XM_PENDING and bool(entry.xid)
+          and not obs.out_err1
+          and not output_is_fresh(obs.mtime1, now, params.fresh_output_s))
+
+
+def needs_second_status(obs: RerouteObs, params: RerouteParams) -> bool:
+  """Sample 2 asks XM again only when its own disk re-check found no life."""
+  return not obs.out_err2 and not output_is_fresh(
+      obs.mtime2, obs.t2 if obs.t2 is not None else 0.0, params.fresh_output_s)
+
+
+def better_placement(entry: 'QueueEntry', view: 'PlacementView', now: float,
+                     cooldown_s: float) -> tuple[Optional[Placement], str]:
+  """RULE b: (placement, '') when the row would land on a DIFFERENT (cell,
+  arch) if it were re-queued NOW, else (None, why not).
+
+  Asked of a deep copy with mark_reroute applied (its current pair cooled,
+  exactly as a cancel would leave it), over the round's view WITHOUT the
+  row's own in-flight claim (view.excluding: a row asking "is there somewhere
+  better" must not count its own GQM claim against the cell it is in), through
+  THE placement function. Fleet records stay a soft score there, so they can
+  never force a cross-arch move on their own. Pure."""
+  probe = copy.deepcopy(entry)
+  mark_reroute(probe, now, cooldown_s)
+  p = place(probe, view.excluding(entry.job_id), now)
+  if p is None:
+    return None, ('nothing placeable'
+                  + (f': {probe.last_filter_reason}'
+                     if probe.last_filter_reason else ''))
+  if pair_key(p.cell, p.arch) == pair_key(entry.cell or '', entry.arch or ''):
+    return None, f'best is still {pair_key(p.cell, p.arch)}'
+  return p, ''
+
+
+def _freshest_stage(obs: RerouteObs) -> Optional[BorgStage]:
+  """Sample 2's stage when Borg answered it, else sample 1's."""
+  if obs.sampled2 and stage_vm_running(obs.stage2) is not None:
+    return obs.stage2
+  if stage_vm_running(obs.stage1) is not None:
+    return obs.stage1
+  return obs.stage2 if obs.sampled2 and obs.stage2 is not None else obs.stage1
+
+
+def _never_started_cancel(entry: 'QueueEntry', end: str, why: str,
+                          st: Optional[BorgStage], now: float,
+                          params: RerouteParams,
+                          view: 'Optional[PlacementView]', view_error: str,
+                          notes: tuple[str, ...]) -> RerouteAction:
+  """The last two gates of BOTH never-started cancels (XM PENDING past the
+  deadline; XM RUNNING with nothing on hardware), operator decision 2."""
+  stage = stage_note(st, now)
+  held = starting_hold_s(st, now, params.starting_max_s)
+  if held is not None:
+    return RerouteAction(
+        ACT_DEFER, notes=notes, stage=stage,
+        log=(f'past deadline but Borg is STARTING ({held}s < '
+             f'{int(params.starting_max_s)}s) -> not cancelled; {stage}'))
+  better = None
+  if params.require_better:
+    if view is None:
+      if not view_error:
+        return RerouteAction(ACT_NEED_VIEW, notes=notes)
+      return RerouteAction(
+          ACT_DEFER, notes=notes, stage=stage,
+          log=(f'past deadline but availability is unreadable ({view_error}) '
+               f'-> no better placement can be shown; keep its GQM queue '
+               f'position; {stage}'))
+    better, why_not = better_placement(entry, view, now, params.cooldown_s)
+    if better is None:
+      return RerouteAction(
+          ACT_DEFER, notes=notes, stage=stage,
+          log=(f'past deadline but no better placement ({why_not}) -> keep '
+               f'its GQM queue position; {stage}'))
+  return RerouteAction(ACT_CANCEL, notes=notes, end=end, why=why, stage=stage,
+                       better=better)
+
+
+def _decide_pending(entry: 'QueueEntry', obs: RerouteObs, now: float,
+                    params: RerouteParams, view: 'Optional[PlacementView]',
+                    view_error: str) -> RerouteAction:
+  """XM PENDING past the deadline. Every guard can only turn a cancel OFF:
+  a failed read, fresh output (either sample), or a second XM read that is
+  not PENDING (UNKNOWN included) each leave the row alone."""
+  notes: tuple[str, ...] = ()
+  if obs.out_skipped1:
+    notes = ('no Borg VM group is RUN -> ignoring pre-preemption CNS output '
+             'freshness',)
+  if obs.out_err1:
+    return RerouteAction(ACT_FLAG_CNS, notes=notes, cns_err=obs.out_err1,
+                         cns_doing='checking a PENDING job for fresh output')
+  if obs.mtime1 is not None and output_is_fresh(obs.mtime1, now,
+                                                params.fresh_output_s):
+    a = int(now - obs.mtime1)
+    return RerouteAction(
+        ACT_ALIVE, notes=notes,
+        log=f'has FRESH output ({a}s ago) -> alive, no action',
+        reason=f'alive: output written {a}s ago (not re-routed)')
+  if not obs.sampled2:
+    return RerouteAction(ACT_NOOP, notes=notes,
+                         log='no 2nd sample taken -> no action')
+  if obs.out_err2:
+    return RerouteAction(ACT_FLAG_CNS, notes=notes, cns_err=obs.out_err2,
+                         cns_doing='re-checking a PENDING job for fresh output')
+  t2 = obs.t2 if obs.t2 is not None else now
+  if obs.mtime2 is not None and output_is_fresh(obs.mtime2, t2,
+                                                params.fresh_output_s):
+    a = int(t2 - obs.mtime2)
+    return RerouteAction(
+        ACT_ALIVE, notes=notes,
+        log='output FRESH on 2nd check -> alive, no action',
+        reason=f'alive: output written {a}s ago (2nd check)')
+  if obs.xm2 != XM_PENDING:
+    return RerouteAction(
+        ACT_NOOP, notes=notes,
+        log=f'2nd probe={obs.xm2} (not PENDING) -> alive/ambiguous, no action')
+  return _never_started_cancel(entry, END_PENDING,
+                               'PENDING x2, no fresh output',
+                               _freshest_stage(obs), now, params, view,
+                               view_error, notes)
+
+
+def _decide_running(entry: 'QueueEntry', obs: RerouteObs, now: float,
+                    params: RerouteParams, view: 'Optional[PlacementView]',
+                    view_error: str) -> RerouteAction:
+  """XM RUNNING. XM RUNNING is not "has chips": promote only when something
+  independent of XManager agrees (Borg RUN, output ever written, or Borg
+  unreadable -> fail open). In-place thrash is checked first because a
+  thrashing job IS Borg-RUN; rules a and b do not apply to it."""
+  notes: list[str] = []
+  xid = entry.xid
+  if params.inplace_reroute and obs.restarts_read:
+    if obs.restarts_err:
+      notes.append(f'restart-count read FAILED ({obs.restarts_err}) -> no '
+                   f'thrash verdict this pass')
+    if decide_inplace_reroute(obs.xm1, obs.restarts,
+                              threshold=params.inplace_restart_threshold,
+                              running_const=XM_RUNNING):
+      why = (f'in-place preemption thrash: {obs.restarts} restart(s) on '
+             f'{entry.cell} since the last checkpoint '
+             f'(>= {params.inplace_restart_threshold}), zero durable progress')
+      return RerouteAction(ACT_CANCEL, notes=tuple(notes), end=END_THRASH,
+                           why=why, stage=stage_note(obs.stage1, now))
+  age = reroute_age_s(entry, now)
+  vm = stage_vm_running(obs.stage1)
+  cell_known = bool((entry.cell or '').strip())
+  grace_s = patience_s(entry, params.nominal_running_grace_s)
+  nominal = False
+  if vm is False and age >= grace_s and xid:
+    # A FAILED read is not "nothing was ever written" (that reading cancelled
+    # a run at step 40000, 2026-09-29).
+    if obs.out_err1:
+      return RerouteAction(
+          ACT_FLAG_CNS, notes=tuple(notes), cns_err=obs.out_err1,
+          cns_doing='checking whether an XM-RUNNING job ever wrote output')
+    nominal = obs.mtime1 is None
+  elif not cell_known and age >= grace_s and xid:
+    # Structurally unverifiable (no cell even after recovery): XM's RUNNING is
+    # the only signal left, and it is the one that lies.
+    nominal = True
+  if not nominal or not xid:
+    why = ('borg vmgroup RUN' if vm
+           else 'borg unreadable' if vm is None
+           else 'output written' if age >= grace_s
+           else f'within {int(grace_s)}s grace')
+    return RerouteAction(
+        ACT_PROMOTE, notes=tuple(notes),
+        log=f'is RUNNING now -> promoted ({why}), no action',
+        reason=f'running in {entry.cell} ({entry.arch}-{entry.chips})')
+  stuck_why = (
+      f'XM says RUNNING but the row has NO cell to verify against '
+      f'({age}s > {int(grace_s)}s grace; placement unrecoverable from XM)'
+      if not cell_known
+      else f'XM says RUNNING but NO Borg VM group is RUN and nothing was ever '
+           f'written ({age}s > {int(grace_s)}s grace)')
+  return _never_started_cancel(entry, END_NOMINAL, stuck_why, obs.stage1, now,
+                               params, view, view_error, tuple(notes))
+
+
+def decide_reroute(entry: 'QueueEntry', obs: RerouteObs, now: float,
+                   params: RerouteParams,
+                   view: 'Optional[PlacementView]' = None,
+                   view_error: str = '') -> RerouteAction:
+  """THE reroute decision for one candidate, from its observation. Pure.
+
+  The safety invariant: a CANCEL is returned only when every guard has failed
+  to find life, and every rule added since (rule a: STARTING is not
+  cancelled within params.starting_max_s; rule b: a never-started cancel
+  needs a better placement NOW) can only turn a cancel OFF.
+
+  Rule b needs the round's PlacementView. When params.require_better is set
+  and `view` is None, the answer is ACT_NEED_VIEW: the caller builds the view
+  (once per pass) and asks again; if the build failed it passes view_error
+  and the row keeps its GQM position (no better placement can be shown)."""
+  if obs.error:
+    return RerouteAction(ACT_UNKNOWN, log=f'observation FAILED ({obs.error}) '
+                         f'-> no action (never cancel blind)')
+  if obs.xm1 == XM_PENDING and entry.xid:
+    return _decide_pending(entry, obs, now, params, view, view_error)
+  if obs.xm1 == XM_RUNNING:
+    return _decide_running(entry, obs, now, params, view, view_error)
+  if obs.xm1 == XM_TERMINAL:
+    if params.terminal_to_reconcile:
+      # Auto-resume is on: the reconcile pass owns dead rows (it decides the
+      # warm / cold restart); FAILED here would take the row out of its reach.
+      return RerouteAction(ACT_NOOP, log='is TERMINAL -> left for the '
+                           'reconcile pass (it decides the warm/cold restart)')
+    return RerouteAction(ACT_MARK_FAILED, log='is TERMINAL -> marked FAILED',
+                         reason='terminal per XManager (failed/stopped)')
+  return RerouteAction(ACT_UNKNOWN,
+                       log='status UNKNOWN -> no action (never cancel blind)')
 
 
 def decide_inplace_reroute(

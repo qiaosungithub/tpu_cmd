@@ -2250,13 +2250,19 @@ class PriorXidsTest(unittest.TestCase):
     self.assertEqual(back.prior_xids, [])
 
 class _FakeBorgProbe:
-  """Scripted has_running_vmgroup(): True / False / None (could not tell)."""
+  """Scripted stage(). `answer` is a route_lib.BorgStage (or None = could not
+  tell), or the old tri-state shorthand: True = RUN, False = Borg answered
+  and the latest stage is not RUN (BORG_PENDING), None = could not tell."""
 
   def __init__(self, answer):
+    if answer is True:
+      answer = R.BorgStage(R.STAGE_RUN, 0.0)
+    elif answer is False:
+      answer = R.BorgStage(R.STAGE_BORG_PENDING, 0.0)
     self._answer = answer
     self.calls = []
 
-  def has_running_vmgroup(self, entry):
+  def stage(self, entry):
     self.calls.append(entry.job_id)
     return self._answer
 
@@ -4594,6 +4600,319 @@ class ChainAuditTest(unittest.TestCase):
     self.assertTrue(lines[0].startswith('chain 20260930T135726-9d081b5922'))
     self.assertIn('[live]', lines[-1])
     self.assertIn('matched no job', RC.show_chain([e], 'nope')[0])
+
+
+# ---------------------------------------------------------------------------
+# C4: the reroute pass over parallel observations (Fix 3 + Fix 5).
+
+
+class _CountingSleep:
+
+  def __init__(self):
+    self.calls = []
+
+  def __call__(self, s):
+    self.calls.append(s)
+
+
+class _StageProbe:
+  """Scripted stage() per xid (a BorgStage, or None = could not tell)."""
+
+  def __init__(self, by_xid):
+    self._by_xid = by_xid
+    self.calls = []
+
+  def stage(self, entry):
+    self.calls.append(entry.xid)
+    return self._by_xid.get(entry.xid)
+
+
+class FindjobsStageTest(unittest.TestCase):
+  """BorgVmProbe's reading of a findjobs result (the parse itself is
+  route_lib_test.BorgStageParseTest, on the captured fixtures)."""
+
+  def test_failed_call_is_none_empty_is_no_job(self):
+    self.assertIsNone(RC.borg_stage_from_findjobs(1, 'whatever'))
+    self.assertEqual(RC.borg_stage_from_findjobs(0, '\n'),
+                     R.BorgStage(R.STAGE_NO_JOB))
+    self.assertIsNone(RC.borg_stage_from_findjobs(0, 'job {\n}\n'))
+
+  def test_probe_runs_findjobs_on_the_cell_and_parses_the_latest_stage(self):
+    e = _submitted('j1', '294917078', 'sh', submitted_at=0.0)
+    out = subprocess.CompletedProcess(
+        [], 0, stdout=(
+            'job {\n  state: "PENDING"\n  vm_group_state_timestamps {\n'
+            '    state: VMGROUP_STATE_PENDING\n'
+            '    max_last_state_transition_time {\n      seconds: 1790816142\n'
+            '    }\n  }\n}\n'), stderr='')
+    with mock.patch.object(RC.subprocess, 'run', return_value=out) as run:
+      st = RC.BorgVmProbe().stage(e)
+    self.assertEqual(st, R.BorgStage(R.STAGE_BORG_PENDING, 1790816142.0))
+    argv = run.call_args[0][0]
+    self.assertEqual(argv[:3], ['borg', '--borg=sh', 'findjobs'])
+    self.assertIn('_group_294917078', argv[3])
+
+  def test_no_cell_is_none_without_a_call(self):
+    e = _submitted('j1', '1', None, submitted_at=0.0)
+    with mock.patch.object(RC.subprocess, 'run') as run:
+      self.assertIsNone(RC.BorgVmProbe().stage(e))
+    run.assert_not_called()
+
+
+class RerouteParallelPassTest(unittest.TestCase):
+  """Fix 5: phase-1 probes for all candidates, ONE shared confirm gap, the
+  second samples, then serial decisions; the pass timing line."""
+
+  def setUp(self):
+    super().setUp()
+    fh = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
+    fh.write(b'[]')
+    fh.close()
+    self.hist = fh.name
+    self.addCleanup(os.unlink, self.hist)
+
+  def _rows(self, n):
+    return [_submitted(f'j{i}', str(100 + i), 'yutulpz', submitted_at=0.0)
+            for i in range(n)]
+
+  def test_one_shared_sleep_for_all_pending_candidates(self):
+    rows = self._rows(5)
+    xids = [e.xid for e in rows]               # cleared by the requeue
+    probe = _SeqProbe({x: [RC.STATUS_PENDING, RC.STATUS_PENDING]
+                       for x in xids})
+    sleep = _CountingSleep()
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(
+        rows, now=700.0, probe=probe, submitter=sub, reroute_after_s=600.0,
+        dry_run=False, output_probe=_FakeOutputProbe({}), confirm_gap_s=15.0,
+        sleep_fn=sleep, history_file=self.hist)
+    self.assertEqual(sleep.calls, [15.0])          # ONE gap, not five
+    self.assertEqual(sorted(sub.cancels), sorted(xids))
+    self.assertTrue(all(probe.calls[x] == 2 for x in xids))
+    timing = [l for l in log if l.startswith('[reroute] pass: ')]
+    self.assertEqual(len(timing), 1)
+    self.assertRegex(timing[0], r'^\[reroute\] pass: 5 candidates, probes '
+                     r'\d+\.\ds, total \d+\.\ds')
+
+  def test_no_sleep_when_no_candidate_needs_a_second_sample(self):
+    rows = self._rows(2)
+    probe = _FakeProbe({e.xid: RC.STATUS_TERMINAL for e in rows})
+    sleep = _CountingSleep()
+    _, log = RC.run_reroute(rows, now=700.0, probe=probe,
+                            submitter=_FakeSubmitter(), reroute_after_s=600.0,
+                            dry_run=False, sleep_fn=sleep,
+                            history_file=self.hist)
+    self.assertEqual(sleep.calls, [])
+    self.assertTrue(any('pass: 2 candidates' in l for l in log))
+
+  def test_phase_one_probes_run_concurrently(self):
+    # 4 rows whose status probe blocks until all 4 are inside it: only a
+    # parallel phase 1 can finish (a serial one would time out the barrier).
+    import threading as _th
+    barrier = _th.Barrier(4, timeout=10.0)
+
+    class _Barrier:
+      def status(self, xid):
+        barrier.wait()
+        return RC.STATUS_TERMINAL
+
+    rows = self._rows(4)
+    _, log = RC.run_reroute(rows, now=700.0, probe=_Barrier(),
+                            submitter=_FakeSubmitter(), reroute_after_s=600.0,
+                            dry_run=False, sleep_fn=lambda _: None,
+                            history_file=self.hist, probe_workers=8)
+    self.assertTrue(all(e.state == R.JobState.FAILED for e in rows), log)
+
+  def test_a_probe_that_raises_is_never_actioned(self):
+    class _Boom:
+      def status(self, xid):
+        raise RuntimeError('rpc down')
+    rows = self._rows(1)
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(rows, now=700.0, probe=_Boom(), submitter=sub,
+                            reroute_after_s=600.0, dry_run=False,
+                            sleep_fn=lambda _: None, history_file=self.hist)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(rows[0].state, R.JobState.SUBMITTED)
+    self.assertTrue(any('observation FAILED' in l for l in log), log)
+
+  def test_brake_is_checked_before_each_cancel(self):
+    now = time.time()
+    with open(self.hist, 'w') as f:
+      json.dump([now - i for i in range(R.REROUTE_GLOBAL_MAX_PER_HOUR - 2)],
+                f)
+    rows = self._rows(5)
+    probe = _FakeProbe({e.xid: RC.STATUS_PENDING for e in rows})
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(rows, now=700.0, probe=probe, submitter=sub,
+                            reroute_after_s=600.0, dry_run=False,
+                            sleep_fn=lambda _: None, history_file=self.hist)
+    self.assertEqual(len(sub.cancels), 2)                 # stopped at the limit
+    self.assertEqual(sum('GLOBAL BRAKE ENGAGED mid-pass' in l for l in log), 1)
+
+
+def _gpu_free(cell, free, arch='h100'):
+  """CellAvail with metro '' (fails open in the storage gate, so synthetic
+  cells stay placeable)."""
+  return R.CellAvail(cell=cell, arch=arch, free_chips=free, oversold=False,
+                     price=4.0, metro='')
+
+
+class RerouteStageRulesTest(unittest.TestCase):
+  """Fix 3 end to end through run_reroute: rule a (STARTING held), rule b
+  (better placement via view_source), rule c (stage in every cancel line)."""
+
+  def setUp(self):
+    super().setUp()
+    fh = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
+    fh.write(b'[]')
+    fh.close()
+    self.hist = fh.name
+    self.addCleanup(os.unlink, self.hist)
+
+  def _run(self, rows, stages, *, view_source=None, starting_max_s=0.0,
+           status=RC.STATUS_PENDING, now=5000.0, dry_run=False):
+    probe = _FakeProbe({e.xid: status for e in rows})
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(
+        rows, now=now, probe=probe, submitter=sub, reroute_after_s=600.0,
+        cooldown_s=1800.0, dry_run=dry_run, output_probe=_FakeOutputProbe({}),
+        sleep_fn=lambda _: None, history_file=self.hist,
+        borg_probe=_StageProbe(stages), nominal_running_grace_s=600.0,
+        view_source=view_source, starting_max_s=starting_max_s)
+    return sub, log
+
+  def test_rule_a_starting_is_not_cancelled_then_is_past_the_bound(self):
+    e = _gpu_submitted('j1', 'gl', '111')
+    e.submitted_at = 0.0
+    sub, log = self._run([e], {'111': R.BorgStage(R.STAGE_STARTING, 4800.0)},
+                         starting_max_s=900.0)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertTrue(any('Borg is STARTING (200s < 900s)' in l for l in log))
+    sub, log = self._run([e], {'111': R.BorgStage(R.STAGE_STARTING, 3000.0)},
+                         starting_max_s=900.0)
+    self.assertEqual(sub.cancels, ['111'])
+
+  def test_rule_a_on_the_nominal_running_path(self):
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    sub, _ = self._run([e], {'111': R.BorgStage(R.STAGE_STARTING, 4800.0)},
+                       starting_max_s=900.0, status=RC.STATUS_RUNNING)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.RUNNING)
+
+  def test_rule_b_no_better_placement_keeps_the_gqm_position(self):
+    e = _gpu_submitted('j1', 'gl', '111')
+    e.submitted_at = 0.0
+    src = _FakeProvider({'gl|h100': _gpu_free('gl', 0)})
+    sub, log = self._run([e], {'111': R.BorgStage(R.STAGE_BORG_PENDING,
+                                                  1000.0)},
+                         view_source=src)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertTrue(any(
+        '[reroute] j1 (xid=111, gl, pending 5000s) past deadline but no '
+        'better placement (nothing placeable' in l
+        and ') -> keep its GQM queue position' in l for l in log), log)
+
+  def test_rule_b_better_placement_cancels_and_logs_the_stage(self):
+    e = _gpu_submitted('j1', 'gl', '111')
+    e.submitted_at = 0.0
+    src = _FakeProvider({'gl|h100': _gpu_free('gl', 0),
+                         'sh|h100': _gpu_free('sh', 16)})
+    sub, log = self._run([e], {'111': R.BorgStage(R.STAGE_BORG_PENDING,
+                                                  1000.0)},
+                         view_source=src)
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    line = [l for l in log if 'cancelled + re-queued' in l]
+    self.assertEqual(len(line), 1)
+    self.assertIn('stage=BORG_PENDING 4000s', line[0])      # rule c
+    self.assertIn('moving to h100-8@sh', line[0])
+
+  def test_rule_b_two_rows_do_not_chase_one_free_slice(self):
+    a = _gpu_submitted('j1', 'gl', '111')
+    b = _gpu_submitted('j2', 'gl', '222')
+    a.submitted_at = b.submitted_at = 0.0
+    src = _FakeProvider({'gl|h100': _gpu_free('gl', 0),
+                         'sh|h100': _gpu_free('sh', 8)})
+    stages = {x: R.BorgStage(R.STAGE_BORG_PENDING, 1000.0)
+              for x in ('111', '222')}
+    sub, _ = self._run([a, b], stages, view_source=src)
+    self.assertEqual(len(sub.cancels), 1)                 # one slice, one move
+
+  def test_rule_b_unreadable_availability_cancels_nothing(self):
+    class _Down:
+      def fetch(self):
+        raise RuntimeError('GetCellAvailability down')
+    e = _gpu_submitted('j1', 'gl', '111')
+    e.submitted_at = 0.0
+    sub, log = self._run([e], {}, view_source=_Down())
+    self.assertEqual(sub.cancels, [])
+    self.assertTrue(any('placement view FAILED' in l for l in log))
+
+  def test_rule_b_view_is_built_once_and_only_when_needed(self):
+    class _Counting(_FakeProvider):
+      n = 0
+      def fetch(self):
+        type(self).n += 1
+        return super().fetch()
+    rows = [_gpu_submitted(f'j{i}', 'gl', str(100 + i)) for i in range(3)]
+    for r in rows:
+      r.submitted_at = 0.0
+    src = _Counting({'gl|h100': _gpu_free('gl', 0)})
+    self._run(rows, {r.xid: R.BorgStage(R.STAGE_BORG_PENDING, 1.0)
+                     for r in rows}, view_source=src)
+    self.assertEqual(_Counting.n, 1)
+    _Counting.n = 0
+    self._run(rows, {}, view_source=src, status=RC.STATUS_TERMINAL)
+    self.assertEqual(_Counting.n, 0)               # nobody to cancel
+
+  def test_rule_c_every_cancel_kind_logs_the_stage(self):
+    # pending (unknown stage), nominal (BORG_PENDING), thrash (RUN).
+    e1 = _gpu_submitted('j1', 'gl', '111')
+    e1.submitted_at = 0.0
+    sub, log = self._run([e1], {})
+    self.assertTrue(any('cancelled + re-queued' in l and 'stage=unknown' in l
+                        for l in log), log)
+    e2 = _running('j2', '222', 'sj', submitted_at=0.0)
+    sub, log = self._run([e2], {'222': R.BorgStage(R.STAGE_BORG_PENDING,
+                                                   4000.0)},
+                         status=RC.STATUS_RUNNING)
+    self.assertTrue(any('nominally RUNNING' in l
+                        and 'stage=BORG_PENDING 1000s' in l for l in log), log)
+    e3 = _running('j3', '333', 'ej', submitted_at=0.0)
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(
+        [e3], now=4000.0, probe=_FakeProbe({'333': RC.STATUS_RUNNING}),
+        submitter=sub, cooldown_s=1800.0, dry_run=False,
+        output_probe=_FakeOutputProbe({'333': 3999.0}),
+        restart_probe=_FakeRestartProbe({'333': 5}),
+        borg_probe=_StageProbe({'333': R.BorgStage(R.STAGE_RUN, 3900.0)}),
+        nominal_running_grace_s=3600.0, history_file=self.hist,
+        sleep_fn=lambda _: None)
+    self.assertTrue(any('eviction strike recorded' in l
+                        and 'stage=RUN 100s' in l for l in log), log)
+
+  def test_decision_3_preempted_back_to_pending_ignores_old_output(self):
+    # Borg's LATEST stage is PENDING after a RUN: the pre-preemption write is
+    # history, so the row is re-routed (the old any-RUN-ever read shielded it).
+    e = _submitted('j1', '223', 'yutulpz', submitted_at=0.0)
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(
+        [e], now=700.0, probe=_FakeProbe({'223': RC.STATUS_PENDING}),
+        submitter=sub, reroute_after_s=300.0, dry_run=False,
+        output_probe=_FakeOutputProbe({'223': 640.0}),
+        borg_probe=_StageProbe({'223': R.parse_borg_stage(
+            'job {\n  vm_group_state_timestamps {\n'
+            '    state: VMGROUP_STATE_RUN\n'
+            '    max_last_state_transition_time {\n      seconds: 100\n'
+            '    }\n  }\n  vm_group_state_timestamps {\n'
+            '    state: VMGROUP_STATE_PENDING\n'
+            '    max_last_state_transition_time {\n      seconds: 600\n'
+            '    }\n  }\n}\n')}),
+        sleep_fn=lambda _: None, history_file=self.hist)
+    self.assertEqual(sub.cancels, ['223'])
 
 
 if __name__ == '__main__':

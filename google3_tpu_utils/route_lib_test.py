@@ -428,25 +428,44 @@ class RerouteTest(unittest.TestCase):
     self.assertTrue(R.output_is_fresh(latest_mtime=801.0, now=2000.0,
                                       fresh_within_s=1200.0))   # 1199s ago < window
 
+  # decide_reroute's guard order (2026-08-24) over the new observation shape:
+  # each guard can only turn a cancel OFF.
+  def _pend(self, **kw):
+    e = _entry(job_id='j1')
+    e.state = R.JobState.SUBMITTED
+    e.xid, e.cell, e.arch, e.chips, e.submitted_at = '111', 'c', 'v7', 32, 0.0
+    o = R.RerouteObs(xm1='PENDING', sampled2=True, xm2='PENDING', t2=700.0)
+    for k, v in kw.items():
+      setattr(o, k, v)
+    return R.decide_reroute(e, o, 700.0, R.RerouteParams()).kind
+
   def test_decide_reroute_both_pending_no_output_reroutes(self):
-    self.assertTrue(R.decide_reroute('PENDING', 'PENDING', output_fresh=False))
+    self.assertEqual(self._pend(), R.ACT_CANCEL)
 
   def test_decide_reroute_fresh_output_blocks(self):
-    self.assertFalse(R.decide_reroute('PENDING', 'PENDING', output_fresh=True))
+    self.assertEqual(self._pend(mtime1=640.0), R.ACT_ALIVE)
+    self.assertEqual(self._pend(mtime2=690.0), R.ACT_ALIVE)
 
   def test_decide_reroute_second_running_blocks(self):
-    self.assertFalse(R.decide_reroute('PENDING', 'RUNNING', output_fresh=False))
+    self.assertEqual(self._pend(xm2='RUNNING'), R.ACT_NOOP)
 
   def test_decide_reroute_second_unknown_blocks(self):
     # ambiguity protects: never cancel on a second UNKNOWN.
-    self.assertFalse(R.decide_reroute('PENDING', 'UNKNOWN', output_fresh=False))
+    self.assertEqual(self._pend(xm2='UNKNOWN'), R.ACT_NOOP)
 
   def test_decide_reroute_first_not_pending_never_reroutes(self):
-    self.assertFalse(R.decide_reroute('RUNNING', None, output_fresh=False))
-    self.assertFalse(R.decide_reroute('TERMINAL', None, output_fresh=False))
+    self.assertNotEqual(self._pend(xm1='TERMINAL'), R.ACT_CANCEL)
+    self.assertEqual(self._pend(xm1='UNKNOWN'), R.ACT_UNKNOWN)
 
   def test_decide_reroute_none_second_is_defensive_noop(self):
-    self.assertFalse(R.decide_reroute('PENDING', None, output_fresh=False))
+    self.assertEqual(self._pend(sampled2=False, xm2=None), R.ACT_NOOP)
+
+  def test_decide_reroute_failed_read_flags_never_cancels(self):
+    self.assertEqual(self._pend(out_err1='timeout'), R.ACT_FLAG_CNS)
+    self.assertEqual(self._pend(out_err2='timeout'), R.ACT_FLAG_CNS)
+
+  def test_decide_reroute_probe_exception_is_never_actioned(self):
+    self.assertEqual(self._pend(error='RuntimeError: boom'), R.ACT_UNKNOWN)
 
 
 class InplaceRerouteDecisionTest(unittest.TestCase):
@@ -3278,6 +3297,285 @@ class ChooseGroupTest(unittest.TestCase):
   def test_nothing_fits_returns_the_fallback(self):
     c = self._choose({}, fits={'5': False, '3': False, '9': False})
     self.assertEqual((c.group, c.pass_name), ('9', 'fallback'))
+
+
+# ---------------------------------------------------------------------------
+# C4: Borg stage + ONE reroute decision (Fix 3 rules a/b/c, Fix 5 inputs).
+# Fixtures: real `borg --borg=<cell> findjobs --name_re=qiaos_group_<xid>\..*`
+# output captured read-only 2026-10-01, trimmed to the job header and the
+# vm_group_state_timestamps blocks the parser reads.
+
+# sj b200 294884132: PENDING 22:33:49 -> ASSIGN/SETUP 22:34:50 -> RUN 22:37:03.
+_FJ_RUN = (
+    'job {\n  uid: 194067376809\n  state: "RUN"\n'
+    '  name: "qiaos_group_294884132.1.main/qiaos"\n'
+    '  vm_group_state_timestamps {\n    state: VMGROUP_STATE_PENDING\n'
+    '    max_last_state_transition_time {\n      seconds: 1790810282\n'
+    '      nanos: 93171857\n    }\n  }\n'
+    '  vm_group_state_timestamps {\n    state: VMGROUP_STATE_ASSIGN\n'
+    '    max_last_state_transition_time {\n      seconds: 1790810301\n'
+    '      nanos: 894516836\n    }\n  }\n'
+    '  vm_group_state_timestamps {\n    state: VMGROUP_STATE_SETUP\n'
+    '    max_last_state_transition_time {\n      seconds: 1790810301\n'
+    '      nanos: 894527536\n    }\n  }\n'
+    '  vm_group_state_timestamps {\n    state: VMGROUP_STATE_RUN\n'
+    '    max_last_state_transition_time {\n      seconds: 1790810393\n'
+    '      nanos: 679263854\n    }\n  }\n}\n\n')
+# sh h100 294917078: Borg job created, VM groups still PENDING.
+_FJ_BORG_PENDING = (
+    'job {\n  uid: 284370539187\n  state: "PENDING"\n'
+    '  name: "qiaos_group_294917078.1.main/qiaos"\n'
+    '  vm_group_state_timestamps {\n    state: VMGROUP_STATE_PENDING\n'
+    '    max_last_state_transition_time {\n      seconds: 1790816142\n'
+    '      nanos: 208397572\n    }\n  }\n}\n\n')
+# la 294907939: GQM-queued ("Queued (GQM auction short of chips)") -> stdout
+# was a single newline: no Borg job at all.
+_FJ_EMPTY = '\n'
+# STARTING: the RUN fixture as it read before its RUN transition.
+_FJ_STARTING = _FJ_RUN[:_FJ_RUN.index(
+    '  vm_group_state_timestamps {\n    state: VMGROUP_STATE_RUN')] + '}\n'
+
+
+class BorgStageParseTest(unittest.TestCase):
+
+  def test_run_fixture_is_run_since_its_latest_transition(self):
+    st = _ok(R.parse_borg_stage(_FJ_RUN))
+    self.assertEqual(st.stage, R.STAGE_RUN)
+    self.assertEqual(int(_ok(st.since)), 1790810393)
+
+  def test_borg_pending_fixture(self):
+    st = _ok(R.parse_borg_stage(_FJ_BORG_PENDING))
+    self.assertEqual((st.stage, int(_ok(st.since))),
+                     (R.STAGE_BORG_PENDING, 1790816142))
+
+  def test_starting_is_assign_or_setup_latest(self):
+    st = _ok(R.parse_borg_stage(_FJ_STARTING))
+    self.assertEqual((st.stage, int(_ok(st.since))),
+                     (R.STAGE_STARTING, 1790810301))
+
+  def test_empty_or_unparseable_is_none(self):
+    self.assertIsNone(R.parse_borg_stage(_FJ_EMPTY))
+    self.assertIsNone(R.parse_borg_stage(''))
+    self.assertIsNone(R.parse_borg_stage(None))
+    self.assertIsNone(R.parse_borg_stage('job {\n  state: "RUN"\n}\n'))
+
+  def test_latest_transition_wins_not_any_run_ever(self):
+    # Decision 3: a job preempted back to PENDING after a RUN reads PENDING.
+    # (The old has_running_vmgroup answered True here.)
+    preempted = _FJ_RUN.replace('}\n\n', '') + (
+        '  vm_group_state_timestamps {\n    state: VMGROUP_STATE_PENDING\n'
+        '    max_last_state_transition_time {\n      seconds: 1790812000\n'
+        '    }\n  }\n}\n')
+    # The PENDING block above re-states PENDING with a later time.
+    st = _ok(R.parse_borg_stage(preempted))
+    self.assertEqual(st.stage, R.STAGE_BORG_PENDING)
+    self.assertFalse(R.stage_vm_running(st))
+
+  def test_several_jobs_the_most_advanced_stage_wins(self):
+    st = _ok(R.parse_borg_stage(_FJ_BORG_PENDING + _FJ_RUN))
+    self.assertEqual(st.stage, R.STAGE_RUN)
+
+  def test_tri_state_and_note(self):
+    self.assertTrue(R.stage_vm_running(R.BorgStage(R.STAGE_RUN, 1.0)))
+    self.assertFalse(R.stage_vm_running(R.BorgStage(R.STAGE_STARTING, 1.0)))
+    self.assertIsNone(R.stage_vm_running(R.BorgStage(R.STAGE_NO_JOB)))
+    self.assertIsNone(R.stage_vm_running(None))
+    self.assertEqual(R.stage_note(R.BorgStage(R.STAGE_BORG_PENDING, 100.0),
+                                  1303.0), 'stage=BORG_PENDING 1203s')
+    self.assertEqual(R.stage_note(R.BorgStage(R.STAGE_NO_JOB), 5.0),
+                     'stage=NO_JOB')
+    self.assertEqual(R.stage_note(None, 5.0), 'stage=unknown')
+
+
+def _rr_row(xid='111', cell='gl', arch='h100', chips=8, state=None,
+            job_id='j1'):
+  e = _entry(job_id=job_id, power=f'{arch}-{chips}', archs=(arch,))
+  e.state = state or R.JobState.SUBMITTED
+  e.xid = xid          # opens a live submission (the row's GQM claim)
+  e.cell, e.arch, e.chips = cell, arch, chips
+  e.submitted_at = 0.0
+  return e
+
+
+def _pending_obs(stage=None, **kw):
+  o = R.RerouteObs(xm1='PENDING', stage1=stage, sampled2=True, stage2=stage,
+                   xm2='PENDING', t2=5000.0)
+  for k, v in kw.items():
+    setattr(o, k, v)
+  return o
+
+
+def _nominal_obs(stage):
+  return R.RerouteObs(xm1='RUNNING', stage1=stage)
+
+
+_NOW = 5000.0
+_STARTING_200S = R.BorgStage(R.STAGE_STARTING, _NOW - 200.0)
+_STARTING_1000S = R.BorgStage(R.STAGE_STARTING, _NOW - 1000.0)
+_BPENDING = R.BorgStage(R.STAGE_BORG_PENDING, _NOW - 3000.0)
+
+
+class RerouteRuleATest(unittest.TestCase):
+  """Rule a: STARTING (ASSIGN/SETUP latest) is not cancelled within
+  starting_max_s, on BOTH never-started paths; thrash is untouched."""
+
+  P = R.RerouteParams(starting_max_s=900.0, nominal_running_grace_s=600.0)
+
+  def test_pending_path_starting_is_deferred(self):
+    a = R.decide_reroute(_rr_row(), _pending_obs(_STARTING_200S), _NOW, self.P)
+    self.assertEqual(a.kind, R.ACT_DEFER)
+    self.assertIn('STARTING (200s < 900s)', a.log)
+
+  def test_nominal_path_starting_is_deferred(self):
+    e = _rr_row(state=R.JobState.RUNNING)
+    a = R.decide_reroute(e, _nominal_obs(_STARTING_200S), _NOW, self.P)
+    self.assertEqual(a.kind, R.ACT_DEFER)
+
+  def test_past_the_bound_falls_through_to_the_cancel(self):
+    a = R.decide_reroute(_rr_row(), _pending_obs(_STARTING_1000S), _NOW,
+                         self.P)
+    self.assertEqual((a.kind, a.end), (R.ACT_CANCEL, R.END_PENDING))
+    e = _rr_row(state=R.JobState.RUNNING)
+    a = R.decide_reroute(e, _nominal_obs(_STARTING_1000S), _NOW, self.P)
+    self.assertEqual((a.kind, a.end), (R.ACT_CANCEL, R.END_NOMINAL))
+
+  def test_borg_pending_and_off_switch_still_cancel(self):
+    a = R.decide_reroute(_rr_row(), _pending_obs(_BPENDING), _NOW, self.P)
+    self.assertEqual(a.kind, R.ACT_CANCEL)
+    off = R.RerouteParams(starting_max_s=0.0)
+    a = R.decide_reroute(_rr_row(), _pending_obs(_STARTING_200S), _NOW, off)
+    self.assertEqual(a.kind, R.ACT_CANCEL)
+
+  def test_thrash_is_untouched_by_rule_a(self):
+    e = _rr_row(state=R.JobState.RUNNING)
+    o = R.RerouteObs(xm1='RUNNING', stage1=_STARTING_200S, restarts_read=True,
+                     restarts=5)
+    a = R.decide_reroute(e, o, _NOW, self.P)
+    self.assertEqual((a.kind, a.end), (R.ACT_CANCEL, R.END_THRASH))
+
+
+class RerouteRuleBTest(unittest.TestCase):
+  """Rule b: a never-started cancel needs THE placement function, over the
+  view without the row's own claim and with its pair cooled, to land on a
+  DIFFERENT (cell, arch). Thrash does not ask."""
+
+  P = R.RerouteParams(require_better=True, cooldown_s=1800.0,
+                      nominal_running_grace_s=600.0)
+
+  def _view(self, rows, **free):
+    raw = {f'{c}|h100': _gpu_avail(c, n) for c, n in free.items()}
+    return R.PlacementView.build(raw, rows)
+
+  def test_needs_the_view_first(self):
+    a = R.decide_reroute(_rr_row(), _pending_obs(_BPENDING), _NOW, self.P)
+    self.assertEqual(a.kind, R.ACT_NEED_VIEW)
+
+  def test_nothing_else_free_keeps_the_gqm_position(self):
+    e = _rr_row()
+    a = R.decide_reroute(e, _pending_obs(_BPENDING), _NOW, self.P,
+                         self._view([e], gl=0))
+    self.assertEqual(a.kind, R.ACT_DEFER)
+    self.assertIn('no better placement (nothing placeable', a.log)
+    self.assertIn(') -> keep its GQM queue position', a.log)
+
+  def test_best_is_still_the_same_pair_keeps_the_gqm_position(self):
+    # gl itself has room once its own claim is given back, and nothing else
+    # does: the cooled pair is the fallback, i.e. the same (cell, arch).
+    e = _rr_row()
+    a = R.decide_reroute(e, _pending_obs(_BPENDING), _NOW, self.P,
+                         self._view([e], gl=8))
+    self.assertEqual(a.kind, R.ACT_DEFER)
+    self.assertIn('best is still gl|h100', a.log)
+
+  def test_a_different_cell_with_room_allows_the_cancel(self):
+    e = _rr_row()
+    a = R.decide_reroute(e, _pending_obs(_BPENDING), _NOW, self.P,
+                         self._view([e], gl=0, sh=16))
+    self.assertEqual(a.kind, R.ACT_CANCEL)
+    self.assertEqual(_ok(a.better).cell, 'sh')
+
+  def test_other_rows_claims_are_debited(self):
+    # sh shows 8 free but another SUBMITTED row of ours already claims it.
+    e = _rr_row()
+    other = _rr_row(xid='222', cell='sh', job_id='j2')
+    a = R.decide_reroute(e, _pending_obs(_BPENDING), _NOW, self.P,
+                         self._view([e, other], gl=0, sh=8))
+    self.assertEqual(a.kind, R.ACT_DEFER)
+
+  def test_nominal_path_is_gated_too(self):
+    e = _rr_row(state=R.JobState.RUNNING)
+    a = R.decide_reroute(e, _nominal_obs(_BPENDING), _NOW, self.P,
+                         self._view([e], gl=0))
+    self.assertEqual(a.kind, R.ACT_DEFER)
+
+  def test_unreadable_availability_keeps_the_position(self):
+    a = R.decide_reroute(_rr_row(), _pending_obs(_BPENDING), _NOW, self.P,
+                         None, 'RpcError: deadline')
+    self.assertEqual(a.kind, R.ACT_DEFER)
+    self.assertIn('availability is unreadable', a.log)
+
+  def test_thrash_never_asks_for_a_better_placement(self):
+    e = _rr_row(state=R.JobState.RUNNING)
+    o = R.RerouteObs(xm1='RUNNING', stage1=R.BorgStage(R.STAGE_RUN, 1.0),
+                     restarts_read=True, restarts=5)
+    a = R.decide_reroute(e, o, _NOW, self.P)
+    self.assertEqual((a.kind, a.end), (R.ACT_CANCEL, R.END_THRASH))
+
+  def test_fleet_records_never_force_a_cross_arch_move(self):
+    # ★CRITICAL (Fix 2): the row sits in sh|h100 (no room). gl|h100 has room
+    # but is struck fleet-wide; a100 has room too. The fleet record is a SOFT
+    # score only, so the better placement stays on the preferred arch (gl
+    # h100) -- it must never fall through to a100 on fleet memory alone.
+    e = _rr_row(cell='sh')
+    e.allowed_archs = ['h100', 'a100']
+    raw = {'sh|h100': _gpu_avail('sh', 0), 'gl|h100': _gpu_avail('gl', 8),
+           'la|a100': _gpu_avail('la', 8, arch='a100')}
+    fleet = {'gl|h100': {'strikes': 5, 'until': _NOW + 9999}}
+    view = R.PlacementView.build(raw, [e], fleet_pairs=fleet)
+    p, _ = R.better_placement(e, view, _NOW, 1800.0)
+    self.assertEqual((_ok(p).cell, _ok(p).arch), ('gl', 'h100'))
+
+
+class RerouteRuleCTest(unittest.TestCase):
+  """Rule c: every cancel carries `stage=<stage> <age>`."""
+
+  def test_every_cancel_carries_the_stage(self):
+    p = R.RerouteParams(nominal_running_grace_s=600.0)
+    a = R.decide_reroute(_rr_row(), _pending_obs(_BPENDING), _NOW, p)
+    self.assertEqual(a.stage, 'stage=BORG_PENDING 3000s')
+    a = R.decide_reroute(_rr_row(), _pending_obs(None), _NOW, p)
+    self.assertEqual(a.stage, 'stage=unknown')
+    a = R.decide_reroute(_rr_row(),
+                         _pending_obs(R.BorgStage(R.STAGE_NO_JOB)), _NOW, p)
+    self.assertEqual(a.stage, 'stage=NO_JOB')
+    e = _rr_row(state=R.JobState.RUNNING)
+    o = R.RerouteObs(xm1='RUNNING', stage1=R.BorgStage(R.STAGE_RUN, 4000.0),
+                     restarts_read=True, restarts=5)
+    self.assertEqual(R.decide_reroute(e, o, _NOW, p).stage,
+                     'stage=RUN 1000s')
+
+
+class SecondSampleTest(unittest.TestCase):
+
+  def test_only_clean_lifeless_pending_rows_get_a_second_sample(self):
+    p = R.RerouteParams()
+    e = _rr_row()
+    self.assertTrue(R.needs_second_sample(e, R.RerouteObs(xm1='PENDING'),
+                                          _NOW, p))
+    for o in (R.RerouteObs(xm1='RUNNING'),
+              R.RerouteObs(xm1='PENDING', mtime1=_NOW - 10),
+              R.RerouteObs(xm1='PENDING', out_err1='x'),
+              R.RerouteObs(xm1='PENDING', error='x')):
+      self.assertFalse(R.needs_second_sample(e, o, _NOW, p), o)
+
+  def test_no_vmgroup_run_skips_the_output_read(self):
+    p = R.RerouteParams()
+    e = _rr_row()
+    self.assertFalse(R.wants_output_read(
+        e, R.RerouteObs(xm1='PENDING', stage1=_BPENDING), _NOW, p))
+    self.assertTrue(R.wants_output_read(
+        e, R.RerouteObs(xm1='PENDING', stage1=R.BorgStage(R.STAGE_NO_JOB)),
+        _NOW, p))
 
 
 if __name__ == '__main__':

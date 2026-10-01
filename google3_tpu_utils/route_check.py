@@ -21,7 +21,9 @@ default is dry-run so a first live run shows the plan before touching XM.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
+import copy
 import dataclasses
 import fcntl
 import getpass
@@ -389,6 +391,17 @@ _CONFIRM_GAP_S = flags.DEFINE_float(
     'reroute_confirm_gap_s', 15.0, 'Before cancelling a PENDING job, wait this '
     'long and re-probe; only cancel if STILL pending. Clears BATCH shadow-WU '
     'gaps that momentarily read all-pending.')
+_REROUTE_STARTING_MAX_S = flags.DEFINE_float(
+    'reroute_starting_max_s', 900.0, 'Fix 3 rule a: a never-started row whose '
+    'Borg VM groups are STARTING (latest transition ASSIGN or SETUP -- Borg '
+    'has given it machines and is setting them up) is not cancelled for this '
+    'many seconds in that stage; past it, the usual checks apply. Applies to '
+    'the XM-PENDING deadline and the nominal-RUNNING paths, not to in-place '
+    'thrash. <= 0 disables the rule.')
+_REROUTE_PROBE_WORKERS = flags.DEFINE_integer(
+    'reroute_probe_workers', 8, 'Fix 5: reroute probes (XM status, borg '
+    'findjobs, fileutil) run on this many threads per sample; the confirm gap '
+    'is ONE shared sleep per pass. 1 = serial.')
 _FRESH_OUTPUT_S = flags.DEFINE_float(
     'reroute_fresh_output_s', 1200.0, 'A job whose output dir was written within '
     'this many seconds is judged ALIVE and never re-routed, whatever XManager '
@@ -1153,6 +1166,10 @@ class XManagerStatusProbe:
       self._client = xmanager_api.XManagerApi()
     return self._client
 
+  def warm(self) -> None:
+    """Build the client now, on the calling thread (run_reroute's pool)."""
+    self._get_client()
+
   def reason(self, xid: str) -> str:
     """Latest status/failure message observed for `xid` during `status(xid)`."""
     return self._reasons.get(str(xid), '')
@@ -1258,6 +1275,10 @@ class XManagerPlacementProbe:
       from google3.learning.deepmind.xmanager2.client import xmanager_api
       self._client = xmanager_api.XManagerApi()
     return self._client
+
+  def warm(self) -> None:
+    """Build the client now, on the calling thread (run_reroute's pool)."""
+    self._get_client()
 
   def placement_of(self, xid: str) -> Optional[tuple[str, str, int]]:
     try:
@@ -1455,16 +1476,19 @@ def _read_output_mtime(probe, entry) -> tuple[Optional[float], str]:
 
 
 class _BorgVmProbe(Protocol):
-  """Answers "is one of this job's Borg VM groups in RUN?".
+  """Answers "where are this job's Borg VM groups NOW?" as a
+  route_lib.BorgStage (RUN / STARTING / BORG_PENDING, from the LATEST
+  transition), BorgStage(NO_JOB) when Borg answered with nothing, or None
+  when it could not be asked or read.
 
-  Tri-state ON PURPOSE. True: a group is RUN. False: Borg answered and NONE of
-  the groups it printed is RUN. None: could not tell -- no cell pinned, the RPC
-  failed, or the output was empty. Only False is a verdict about the world;
-  None must never be actioned (AGENTS.md: an absence is the weakest reading).
+  Only a parsed non-RUN stage is a verdict about the world ("Borg answered and
+  the job is not running"); NO_JOB and None are never actioned (AGENTS.md: an
+  absence is the weakest reading). route_lib.stage_vm_running gives the
+  tri-state the decisions use.
   """
 
-  def has_running_vmgroup(self,
-                          entry: 'route_lib.QueueEntry') -> Optional[bool]:
+  def stage(self, entry: 'route_lib.QueueEntry'
+            ) -> 'Optional[route_lib.BorgStage]':
     ...
 
 
@@ -1477,20 +1501,24 @@ class BorgVmProbe:
   XManager reads RUNNING for a job whose groups never left PENDING. Same fix
   either way -- look at the groups.
 
-  An EMPTY result is None, never False. `findjobs` returns empty just as
-  readily for a wrong cell or a malformed --name_re as for a job that truly
-  does not exist, and an empty answer from a misaimed query is the classic
-  false negative. False is returned only when Borg printed at least one
-  VM-group state for this job and none of them was RUN.
-  """
+  ★LATEST STAGE, NOT "ANY RUN EVER" (operator decision 3, 2026-10-01). The
+  old reading returned True if any VM-group state printed was RUN, so a job
+  preempted back to PENDING still read RUN and its pre-preemption output
+  shielded it for 20 minutes. route_lib.parse_borg_stage takes the state with
+  the latest transition time.
 
-  _RUN_STATES = frozenset({'VMGROUP_STATE_RUN'})
+  An EMPTY result is NO_JOB -- a log label, never a verdict. `findjobs`
+  returns empty just as readily for a wrong cell or a malformed --name_re as
+  for a job that truly does not exist (measured 2026-10-01: GQM-queued rows
+  have no Borg job at all), and an empty answer from a misaimed query is the
+  classic false negative. Thread-safe (one subprocess per call, no state).
+  """
 
   def __init__(self, timeout_s: float = 45.0):
     self._timeout_s = timeout_s
 
-  def has_running_vmgroup(self,
-                          entry: 'route_lib.QueueEntry') -> Optional[bool]:
+  def stage(self, entry: 'route_lib.QueueEntry'
+            ) -> Optional[route_lib.BorgStage]:
     xid = getattr(entry, 'xid', None)
     cell = (getattr(entry, 'cell', None) or '').strip()
     if not xid or not cell:
@@ -1508,12 +1536,19 @@ class BorgVmProbe:
           capture_output=True, text=True, timeout=self._timeout_s)
     except (subprocess.TimeoutExpired, OSError):
       return None
-    if out.returncode != 0:
-      return None
-    states = re.findall(r'VMGROUP_STATE_[A-Z_]+', out.stdout or '')
-    if not states:
-      return None  # nothing readable -- not evidence of absence
-    return any(s in self._RUN_STATES for s in states)
+    return borg_stage_from_findjobs(out.returncode, out.stdout)
+
+
+def borg_stage_from_findjobs(returncode: int, stdout: Optional[str]
+                             ) -> Optional[route_lib.BorgStage]:
+  """A findjobs result as a stage: a failed call is None, an empty answer is
+  NO_JOB (log label only), anything else is what parse_borg_stage reads
+  (None when it printed no VM-group state at all)."""
+  if returncode != 0:
+    return None
+  if not (stdout or '').strip():
+    return route_lib.BorgStage(route_lib.STAGE_NO_JOB)
+  return route_lib.parse_borg_stage(stdout)
 
 
 # The launcher's own bucket rule, replayed (xm_launcher.py `_local_bucket` and
@@ -2539,7 +2574,7 @@ def _finish_move(
     fail_prefix: str,
     persist_fn: Optional[Callable[[], Optional[set]]] = None,
     fleet_log: Optional[FleetLog] = None,
-) -> None:
+) -> bool:
   """The I/O shell of a reroute MOVE (kind = END_PENDING / END_NOMINAL /
   END_THRASH): read the checkpoints, cancel, hand the ended attempt to
   route_lib.end_attempt (the same handler a reconcile death uses), record the
@@ -2548,13 +2583,15 @@ def _finish_move(
   ★READ THE CHECKPOINTS BEFORE CANCELLING, AND DO NOT CANCEL IF THE READ
   FAILED: a failed read is not "no checkpoint" (2026-09-29: a 40k-step run was
   requeued from step 0 on one). A move never draws on a resume budget
-  (operator decision 1); it resumes from the chain's newest checkpoint."""
+  (operator decision 1); it resumes from the chain's newest checkpoint.
+
+  Returns True when the attempt was ended (or, dry-run, would have been)."""
   ev = _gather_restart_evidence(e, restart_evidence)
   if ev[3]:
     _flag_cns_unreadable(e, f'{e.job_id} (xid={xid})', ev[3],
                          'reading its checkpoints before a cancel+requeue',
                          log, dry_run)
-    return
+    return False
   end = route_lib.AttemptEnd(kind=kind, found_checkpoint=ev[1],
                              code_bug=ev[0], trained=bool(ev[2]),
                              evidence_read=True)
@@ -2563,14 +2600,14 @@ def _finish_move(
     log.append(f'[DRY][reroute] would cancel + re-route {dry_reason}'
                + (f'; then WARM-restart from {d.checkpoint} ({d.why})'
                   if d.pointer == 'set' else ''))
-    return
+    return True
   if ev[1]:
     # Remember what was read even if the cancel below fails.
     route_lib.note_known_checkpoint(e, ev[1], at=now)
   ok, out = submitter.cancel(xid)
   if not ok:
     log.append(f'{fail_prefix} {_tail(out)}')
-    return
+    return False
   hist.append(time.time())
   _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
   _stamp_router_cancel(xid, log)
@@ -2586,9 +2623,138 @@ def _finish_move(
     log.append(ok_reason)
   _archive_after_persist([(e.job_id, xid)], persist_fn, log,
                          archived_by='reroute')
+  return True
 
 
 # --- the re-route sweep ---------------------------------------------------
+def _warm_probe(p) -> None:
+  """Build a probe's lazy client ONCE on this thread before the probe is
+  shared by the probe pool: two threads racing the first lazy google3 import
+  is how a long-lived loop gets pinned to a half-initialised module (see
+  avail_provider._looks_half_initialised). Best-effort."""
+  warm = getattr(p, 'warm', None)
+  if warm is None:
+    return
+  try:
+    warm()
+  except Exception:  # pylint: disable=broad-except
+    pass
+
+
+def _parallel(fn: Callable, items: Sequence, workers: int) -> list:
+  """[fn(x) for x in items] on up to `workers` threads, in order. `fn` must
+  not raise (the observers below turn every exception into obs.error)."""
+  items = list(items)
+  if workers <= 1 or len(items) <= 1:
+    return [fn(x) for x in items]
+  with concurrent.futures.ThreadPoolExecutor(
+      max_workers=min(int(workers), len(items))) as pool:
+    return list(pool.map(fn, items))
+
+
+def _probe_entry(e: route_lib.QueueEntry,
+                 obs: route_lib.RerouteObs) -> route_lib.QueueEntry:
+  """The row as the probes must see it: with a placement recovered from XM
+  this pass, on a COPY -- rows are only changed in the serial phase."""
+  if obs.recovered is None:
+    return e
+  pe = copy.copy(e)
+  pe.cell, pe.arch, pe.chips = obs.recovered
+  return pe
+
+
+def _observe_first(e: route_lib.QueueEntry, *, now: float, probe,
+                   borg_probe, output_probe, placement_probe, restart_probe,
+                   params: route_lib.RerouteParams) -> route_lib.RerouteObs:
+  """Sample 1 of one candidate (runs on a pool thread): XM status; for XM
+  RUNNING the lost-cell recovery and the restart count; the Borg stage; the
+  output mtime when the decision needs it (route_lib.wants_output_read)."""
+  obs = route_lib.RerouteObs()
+  try:
+    xid = e.xid
+    obs.xm1 = probe.status(xid) if xid else STATUS_UNKNOWN
+    if not xid or obs.xm1 not in (STATUS_PENDING, STATUS_RUNNING):
+      return obs
+    if obs.xm1 == STATUS_RUNNING:
+      if not (e.cell or '').strip() and placement_probe is not None:
+        obs.recovered = placement_probe.placement_of(xid)
+      if params.inplace_reroute and restart_probe is not None:
+        obs.restarts_read = True
+        obs.restarts, obs.restarts_err = _read_restarts(
+            restart_probe, _probe_entry(e, obs))
+    pe = _probe_entry(e, obs)
+    obs.stage1 = borg_probe.stage(pe) if borg_probe is not None else None
+    if route_lib.wants_output_read(pe, obs, now, params):
+      obs.mtime1, obs.out_err1 = _read_output_mtime(output_probe, pe)
+    elif obs.xm1 == STATUS_PENDING and output_probe is not None:
+      obs.out_skipped1 = True   # Borg says not RUN: old writes are history
+  except Exception as exc:  # pylint: disable=broad-except
+    obs.error = f'{type(exc).__name__}: {exc}'
+  return obs
+
+
+def _observe_second(e: route_lib.QueueEntry, obs: route_lib.RerouteObs, *,
+                    probe, borg_probe, output_probe,
+                    params: route_lib.RerouteParams) -> None:
+  """Sample 2 of a PENDING candidate, after the ONE shared confirm gap (runs
+  on a pool thread): Borg stage, a disk re-check, and -- only if that found
+  no life -- XM status again."""
+  try:
+    obs.sampled2 = True
+    obs.stage2 = borg_probe.stage(e) if borg_probe is not None else None
+    if route_lib.stage_vm_running(obs.stage2) is not False:
+      obs.mtime2, obs.out_err2 = _read_output_mtime(output_probe, e)
+    obs.t2 = time.time()
+    if route_lib.needs_second_status(obs, params):
+      obs.xm2 = probe.status(e.xid)
+  except Exception as exc:  # pylint: disable=broad-except
+    obs.error = f'{type(exc).__name__}: {exc}'
+
+
+def _build_reroute_view(source: '_Provider | ViewSource',
+                        entries: Sequence[route_lib.QueueEntry], now: float,
+                        log: list[str]
+                        ) -> tuple[Optional[route_lib.PlacementView], str]:
+  """The pass's ONE placement view for rule b, or (None, why) when the
+  availability fetch failed -- then no better placement can be shown and no
+  never-started row is cancelled this pass."""
+  try:
+    view = as_view_source(source).build(entries, now)
+  except Exception as exc:  # pylint: disable=broad-except
+    err = f'{type(exc).__name__}: {exc}'
+    log.append(f'[reroute] placement view FAILED ({err}); never-started rows '
+               f'keep their GQM queue position this pass')
+    return None, err
+  log.append(f'[reroute] placement view for the better-placement check: '
+             f'in-flight debit [{view.debit_note() or "none"}], fleet '
+             f'[{view.fleet_note() or "none"}]')
+  return view, ''
+
+
+def _move_texts(kind: str, tag: str, act: route_lib.RerouteAction,
+                cooled_s: int) -> tuple[str, str, str]:
+  """(dry_reason, ok_reason, fail_prefix) of one cancel. Every line carries
+  the Borg stage at cancel time (Fix 3 rule c)."""
+  b = act.better
+  better = f'; moving to {b.arch}-{b.chips}@{b.cell}' if b is not None else ''
+  if kind == route_lib.END_THRASH:
+    return (f'{tag}: {act.why}; {act.stage}',
+            f'[reroute] cancelled + re-queued {tag}: {act.why}; cell|arch '
+            f'cooled {cooled_s}s, eviction strike recorded; {act.stage}',
+            f'[reroute] cancel FAILED for thrashing {tag} ({act.stage}), left '
+            f'as-is.')
+  if kind == route_lib.END_NOMINAL:
+    return (f'{tag}: {act.why}; {act.stage}{better}',
+            f'[reroute] cancelled + re-queued {tag}: nominally RUNNING '
+            f'({act.why}); cell|arch cooled {cooled_s}s; {act.stage}{better}',
+            f'[reroute] cancel FAILED for nominally-RUNNING {tag} '
+            f'({act.stage}), left as-is.')
+  return (f'{tag}: {act.why}; {act.stage}{better}',
+          f'[reroute] cancelled + re-queued {tag}; cell|arch cooled '
+          f'{cooled_s}s; {act.stage}{better}',
+          f'[reroute] cancel FAILED for {tag} ({act.stage}), left SUBMITTED.')
+
+
 def run_reroute(
     entries: list[route_lib.QueueEntry],
     now: float,
@@ -2611,47 +2777,54 @@ def run_reroute(
     restart_evidence=None,
     persist_fn: Optional[Callable[[], Optional[set]]] = None,
     fleet_log: Optional[FleetLog] = None,
+    view_source: 'Optional[_Provider | ViewSource]' = None,
+    starting_max_s: float = 0.0,
+    probe_workers: int = 8,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
-  """Cancel SUBMITTED jobs stuck PENDING past the deadline and return them to
-  QUEUED for the next tick to re-place. Returns (entries, log_lines).
+  """Cancel SUBMITTED jobs stuck PENDING past the deadline (and RUNNING rows
+  that are not on hardware, or thrash in place) and requeue them IN PLACE for
+  the next tick to re-place. Returns (entries, log_lines).
 
-  The clock rule lives in route_lib.needs_reroute; here we add the live check
-  and the side effects (cancel + mark_reroute, which cools the stuck cell). A
-  job that has meanwhile started RUNNING is promoted; a terminal one is left for
-  infra_check to reconcile.
+  ★ONE DECISION OVER PARALLEL OBSERVATIONS (operator 2026-10-01). This
+  function is the I/O shell; route_lib.decide_reroute owns every verdict.
+    1. sample 1 of every candidate in parallel (`probe_workers` threads): XM
+       status, Borg stage, output mtime, restart count, lost-cell recovery;
+    2. ONE shared sleep_fn(confirm_gap_s) for every PENDING candidate that
+       needs a second sample (it was one sleep PER candidate: a 12.3 min pass
+       on 2026-09-30);
+    3. their second samples in parallel;
+    4. decisions and actions serially, the global brake checked before each
+       cancel; then `[reroute] pass: N candidates, probes Xs, total Ys`.
 
-  ★ONE ATTEMPT-END HANDLER. All three cancel sites (PENDING x2, nominally
-  RUNNING, in-place thrash) end the attempt through _finish_move ->
-  route_lib.end_attempt, the same handler a reconcile death uses: the row is
-  requeued IN PLACE, resuming from the chain's newest checkpoint when one
-  exists (read via `restart_evidence`; None = no CNS read, the row keeps its
-  last KNOWN checkpoint). A move never draws on a resume budget. The dead xid
-  is archived off the board only after persist_fn() has saved the row.
+  The guards (each can only turn a cancel OFF): fresh output on either sample
+  (unless Borg says no VM group is RUN -- a preempted job's last writes are
+  history), a second XM read that is not PENDING (the 2026-08-24 BATCH
+  shadow-WU gap), a failed CNS read, and since 2026-10-01:
+    * rule a (`starting_max_s` > 0): Borg STARTING (latest transition ASSIGN
+      or SETUP) is not cancelled for starting_max_s, on both never-started
+      paths (XM PENDING; XM RUNNING with nothing on hardware);
+    * rule b (`view_source` given): a never-started cancel needs a DIFFERENT
+      (cell, arch) from route_lib.place over the pass's view without the
+      row's own claim -- otherwise it keeps its GQM queue position. The view
+      is built at most once per pass, only when some row would be cancelled,
+      and each move draws it down so two rows never chase one free slice;
+    * rule c: every cancel logs `stage=<stage> <age in stage>`.
+  None / 0 for those two params is the pre-2026-10-01 behaviour.
 
-  HARDENING (2026-08-24, after xid 282605596 was wrongly re-routed): a single
-  PENDING snapshot is NOT enough to cancel -- a BATCH job's EMA shadow work
-  units run in segments, so XManager can read `all pending` in the gap between
-  two segments while the job is in fact training. Before cancelling a job the
-  first probe called PENDING, we now require BOTH:
-    (a) no fresh output on disk -- output_probe.latest_mtime within
-        fresh_output_s means it is writing NOW, so it is alive; AND
-    (b) a SECOND probe, taken confirm_gap_s later, also PENDING -- the shadow
-        gap clears on the second sample.
-  Only if both guards still say 'stuck' do we cancel (route_lib.decide_reroute
-  owns this pure decision). Every guard can only turn a would-be reroute OFF;
-  the reroute path is never widened. The RUNNING/TERMINAL/UNKNOWN branches --
-  including the zombie TERMINAL->FAILED cleanup -- are unchanged.
+  All cancels end the attempt through _finish_move -> route_lib.end_attempt,
+  the handler a reconcile death uses (in-place requeue from the newest
+  checkpoint; a move never draws on a resume budget; the dead xid is archived
+  only after persist_fn() saved the row). A job that is RUNNING is promoted; a
+  TERMINAL one is left for reconcile (auto-resume on) or marked FAILED.
   """
+  t0 = time.monotonic()
   log: list[str] = []
 
   candidates = [e for e in entries
                 if route_lib.needs_reroute(e, now, reroute_after_s)]
   # ★Rows already promoted to RUNNING are re-checked too, on their own longer
-  # clock. needs_reroute() selects SUBMITTED only, so without this the RUNNING
-  # branch below is reachable only on the single tick that promotes a row --
-  # and a row promoted on a stale XManager RUNNING would never be looked at
-  # again. Selection is not a verdict: the branch confirms against Borg and the
-  # disk before it touches anything, and promotes on any doubt.
+  # clock: a row promoted on a stale XManager RUNNING would otherwise never be
+  # looked at again. Selection is not a verdict.
   recheck = [e for e in entries
              if route_lib.needs_liveness_recheck(e, now,
                                                  nominal_running_grace_s)]
@@ -2679,239 +2852,112 @@ def run_reroute(
 
   sub = submitter or Submitter()
   policy = route_lib.ResumePolicy(cooldown_s=cooldown_s)
-  for e in candidates + [r for r in recheck if r not in candidates]:
-    if not dry_run and route_lib.global_reroute_brake(hist, time.time()):
-      n = len([t for t in hist if t >= time.time() - 3600.0])
-      log.append(
-          f'[reroute] ★GLOBAL BRAKE ENGAGED mid-pass ({n} re-routes in last '
-          f'hour, limit {route_lib.REROUTE_GLOBAL_MAX_PER_HOUR}); stopping '
-          f'further cancellations in this pass.')
-      break
-    # `or now` would read a submitted_at of 0.0 as "no timestamp" and report
-    # age 0 -- harmless while every real stamp is an epoch second, and wrong the
-    # moment anything (a test, a reset, a hand-edited row) carries a literal 0.
-    # The new liveness verdict below gates on this number, so say what is meant.
-    age = int(now - (e.submitted_at if e.submitted_at is not None else now))
+  params = route_lib.RerouteParams(
+      fresh_output_s=fresh_output_s,
+      nominal_running_grace_s=nominal_running_grace_s,
+      inplace_reroute=inplace_reroute,
+      inplace_restart_threshold=inplace_restart_threshold,
+      starting_max_s=starting_max_s,
+      require_better=view_source is not None,
+      terminal_to_reconcile=restart_evidence is not None,
+      cooldown_s=cooldown_s)
+  rows = candidates + [r for r in recheck if r not in candidates]
+
+  # Phases 1-3: observe (parallel), ONE shared gap, observe again (parallel).
+  for p in (probe, placement_probe):
+    _warm_probe(p)
+  obs = _parallel(
+      lambda e: _observe_first(
+          e, now=now, probe=probe, borg_probe=borg_probe,
+          output_probe=output_probe, placement_probe=placement_probe,
+          restart_probe=restart_probe, params=params),
+      rows, probe_workers)
+  probe_s = time.monotonic() - t0
+  second = [(e, o) for e, o in zip(rows, obs)
+            if route_lib.needs_second_sample(e, o, now, params)]
+  if second:
+    # (dry-run also takes it, so the log shows the true would-be decision.)
+    sleep_fn(confirm_gap_s)
+    t2 = time.monotonic()
+    _parallel(
+        lambda eo: _observe_second(
+            eo[0], eo[1], probe=probe, borg_probe=borg_probe,
+            output_probe=output_probe, params=params),
+        second, probe_workers)
+    probe_s += time.monotonic() - t2
+
+  # Phase 4: decide and act, serially.
+  view: Optional[route_lib.PlacementView] = None
+  view_error = ''
+  braked = False
+  for e, o in zip(rows, obs):
     xid = e.xid
-    state = probe.status(xid) if xid else STATUS_UNKNOWN
+    age = route_lib.reroute_age_s(e, now)
+    if o.recovered is not None:
+      # ★RECOVER A LOST CELL (adopt-escaped-build defect, xid 288485310 sat
+      # 16h cell-less): XM recorded the resolved placement in launch_args.
+      e.cell, e.arch, e.chips = o.recovered
     tag = f'{e.job_id} (xid={xid}, {e.cell}, pending {age}s)'
-    if state == STATUS_PENDING and xid:
-      # GUARD (a): disk evidence of life. A fresh write beats a PENDING snapshot
-      # ONLY when Borg does not explicitly confirm that zero VM groups are RUN.
-      # ★Bug 3 fix (2026-09-21): a RUNNING job that gets preempted back to
-      # PENDING wrote rank logs right before eviction; while `has_running_vmgroup`
-      # answers False, Borg has confirmed the slice is gone, so those CNS writes
-      # are pre-preemption history and must not stall rerouting for 20 minutes.
-      vm_running_now = borg_probe.has_running_vmgroup(e) if borg_probe else None
-      if vm_running_now is False and output_probe is not None:
-        log.append(f'[reroute] {tag}: no Borg VM group is RUN -> ignoring '
-                   f'pre-preemption CNS output freshness')
-      mtime, rerr = (_read_output_mtime(output_probe, e)
-                     if vm_running_now is not False else (None, ''))
-      if rerr:
-        # Could not see whether it is writing: that is not "not writing".
-        _flag_cns_unreadable(e, tag, rerr, 'checking a PENDING job for fresh '
-                             'output', log, dry_run)
+    if o.recovered is not None:
+      log.append(f'[reroute] {tag} was RUNNING with no cell -> recovered '
+                 f'{e.arch}-{e.chips}@{e.cell} from XM launch_args')
+    act = route_lib.decide_reroute(e, o, now, params, view, view_error)
+    if act.kind == route_lib.ACT_NEED_VIEW and view_source is not None:
+      view, view_error = _build_reroute_view(view_source, entries, now, log)
+      act = route_lib.decide_reroute(e, o, now, params, view, view_error)
+    for note in act.notes:
+      log.append(f'[reroute] {tag}: {note}')
+    if act.kind == route_lib.ACT_CANCEL and xid:
+      if not dry_run and route_lib.global_reroute_brake(hist, time.time()):
+        if not braked:
+          n = len([t for t in hist if t >= time.time() - 3600.0])
+          log.append(
+              f'[reroute] ★GLOBAL BRAKE ENGAGED mid-pass ({n} re-routes in '
+              f'last hour, limit {route_lib.REROUTE_GLOBAL_MAX_PER_HOUR}); '
+              f'stopping further cancellations in this pass.')
+          braked = True
         continue
-      out_fresh = route_lib.output_is_fresh(mtime, now, fresh_output_s)
-      if out_fresh:
-        age_out = int(now - mtime) if mtime else -1
-        _clear_cns_read_failure(e, dry_run)
-        e.last_reason = f'alive: output written {age_out}s ago (not re-routed)'
-        log.append(f'[reroute] {tag} has FRESH output ({age_out}s ago) '
-                   f'-> alive, no action')
-        continue
-      # GUARD (b): second sample after a gap -- the shadow gap clears on it.
-      # (dry-run also takes it, so the log shows the true would-be decision.)
-      sleep_fn(confirm_gap_s)
-      # A cheap disk re-check inside the window costs nothing and catches a
-      # write that landed during the gap (v26: time-staggered second sample).
-      vm_running_2 = borg_probe.has_running_vmgroup(e) if borg_probe else None
-      mtime2, rerr2 = (_read_output_mtime(output_probe, e)
-                       if vm_running_2 is not False else (None, ''))
-      if rerr2:
-        _flag_cns_unreadable(e, tag, rerr2, 're-checking a PENDING job for '
-                             'fresh output', log, dry_run)
-        continue
-      if route_lib.output_is_fresh(mtime2, time.time(), fresh_output_s):
-        age_out = int(time.time() - mtime2) if mtime2 else -1
-        _clear_cns_read_failure(e, dry_run)
-        e.last_reason = f'alive: output written {age_out}s ago (2nd check)'
-        log.append(f'[reroute] {tag} output FRESH on 2nd check '
-                   f'-> alive, no action')
-        continue
-      state2 = probe.status(xid)
-      if not route_lib.decide_reroute(state, state2, out_fresh):
-        log.append(f'[reroute] {tag} 2nd probe={state2} (not PENDING) '
-                   f'-> alive/ambiguous, no action')
-        continue
-      # Double-confirmed stuck: both probes PENDING and no fresh output.
-      _finish_move(
-          e, xid, now, route_lib.END_PENDING, entries=entries, submitter=sub,
+      dry_reason, ok_reason, fail_prefix = _move_texts(
+          act.end, tag, act,
+          int(route_lib.pair_cooldown_for(e.arch, cooldown_s)))
+      moved = _finish_move(
+          e, xid, now, act.end, entries=entries, submitter=sub,
           dry_run=dry_run, policy=policy, hist=hist,
           history_file=history_file, log=log,
-          restart_evidence=restart_evidence,
-          dry_reason=f'{tag}: PENDING x2, no fresh output',
-          ok_reason=(f'[reroute] cancelled + re-queued {tag}; cell|arch cooled '
-                     f'{int(route_lib.pair_cooldown_for(e.arch, cooldown_s))}s'),
-          fail_prefix=f'[reroute] cancel FAILED for {tag}, left SUBMITTED.',
+          restart_evidence=restart_evidence, dry_reason=dry_reason,
+          ok_reason=ok_reason, fail_prefix=fail_prefix,
           persist_fn=persist_fn, fleet_log=fleet_log)
-    elif state == STATUS_RUNNING:
-      # ★XM RUNNING IS NOT "HAS CHIPS", AND PROMOTING ON IT IS A ONE-WAY DOOR.
-      # needs_reroute() selects SUBMITTED rows only, so the moment RUNNING is
-      # written here the row leaves the re-router's jurisdiction permanently.
-      # A job whose Borg VM groups never leave PENDING reads RUNNING at the XM
-      # layer indefinitely: measured on xid 286573746, which sat 12 h in `sj`
-      # with every VM group PENDING, zero bytes in CNS and zero charged
-      # resources, while XManager, `tpu queue-status` and the queue file all
-      # said RUNNING -- and no mechanism existed that would ever move it. Its
-      # six-metro fallback list was useless because nothing consulted it.
-      # A second instance the same night (codi_unroll_loopdist_mm, xid
-      # 286454115) sat 32 h the same way, so this is the shape, not a one-off.
-      #
-      # So promote only when something INDEPENDENT of XManager agrees the job
-      # is on hardware. Any one of these promotes:
-      #   * Borg says a VM group is RUN -- the direct reading;
-      #   * the output dir has ever been written -- it got far enough to write;
-      #   * the Borg probe could not tell (None) -- an unreadable probe is not
-      #     a verdict, so FAIL OPEN to the old behaviour.
-      # Only the full conjunction withholds promotion: Borg ANSWERED, no group
-      # is RUN, nothing was ever written, and the grace period has passed. Then
-      # it is treated exactly like a stuck PENDING job -- same cancel, same
-      # mark_reroute, same global brake -- because that is what it is.
-      # ★RECOVER A LOST CELL FIRST. A RUNNING row with no cell is the
-      # adopt-escaped-build defect: the xid was set without apply_placement, so
-      # cell/arch/chips stayed None. Both liveness probes below need the cell --
-      # has_running_vmgroup builds `borg findjobs` on it, _bucket_for_entry
-      # resolves the output path from it -- so a cell-less row blinds BOTH, and
-      # the old code fell straight through to "promoted (borg unreadable)"
-      # forever (xid 288485310 sat 16h that way). XManager still records the
-      # resolved placement in launch_args, and the same XM API just answered
-      # STATUS_RUNNING so it is reachable; recover the cell here so this pass --
-      # and every future one, and the persisted row -- can actually see the job.
-      if not (e.cell or '').strip() and xid and placement_probe is not None:
-        pl = placement_probe.placement_of(xid)
-        if pl is not None:
-          e.cell, e.arch, e.chips = pl
-          tag = f'{e.job_id} (xid={xid}, {e.cell}, pending {age}s)'
-          log.append(f'[reroute] {tag} was RUNNING with no cell -> recovered '
-                     f'{e.arch}-{e.chips}@{e.cell} from XM launch_args')
-      # ★IN-PLACE PREEMPTION THRASH -- the gap the SUBMITTED and output-fresh
-      # guards structurally cannot see (route_lib.decide_inplace_reroute owns
-      # the pure decision). A gang Borg keeps restarting on the SAME slice never
-      # goes PENDING and keeps its output dir "fresh", so the branch below would
-      # promote it as alive every pass while it churns and the router never
-      # re-picks its cell. Count restarts since the newest checkpoint = restarts
-      # that made ZERO durable progress; a job that checkpoints between
-      # preemptions resets the count and is left alone no matter how often it is
-      # moved. Checked BEFORE the borg/promote logic because a thrashing job IS
-      # borg-RUNNING -- that is exactly why it slips through today.
-      if inplace_reroute and restart_probe is not None and xid:
-        rsp, terr = _read_restarts(restart_probe, e)
-        if terr:
-          # rsp is None, which decide_inplace_reroute never acts on; the
-          # liveness checks below still run (and flag a failed read there).
-          log.append(f'[reroute] {tag}: restart-count read FAILED ({terr}) '
-                     f'-> no thrash verdict this pass')
-        if route_lib.decide_inplace_reroute(
-            state, rsp, threshold=inplace_restart_threshold):
-          why = (f'in-place preemption thrash: {rsp} restart(s) on {e.cell} '
-                 f'since the last checkpoint '
-                 f'(>= {inplace_restart_threshold}), zero durable progress')
-          _finish_move(
-              e, xid, now, route_lib.END_THRASH, entries=entries,
-              submitter=sub, dry_run=dry_run, policy=policy, hist=hist,
-              history_file=history_file, log=log,
-              restart_evidence=restart_evidence,
-              dry_reason=f'{tag}: {why}',
-              ok_reason=(f'[reroute] cancelled + re-queued {tag}: {why}; cell|arch '
-                         f'cooled '
-                         f'{int(route_lib.pair_cooldown_for(e.arch, cooldown_s))}s'
-                         f', eviction strike recorded'),
-              fail_prefix=(f'[reroute] cancel FAILED for thrashing {tag}, left '
-                           f'as-is.'),
-              persist_fn=persist_fn, fleet_log=fleet_log)
-          continue
-      vm_running = borg_probe.has_running_vmgroup(e) if borg_probe else None
-      cell_known = bool((e.cell or '').strip())
-      nominal = False
-      # GPU rows get route_lib.GPU_PATIENCE_MULTIPLIER x the grace (they queue
-      # minutes in their pool before Borg creates the job); TPU rows 1x.
-      grace_s = route_lib.patience_s(e, nominal_running_grace_s)
-      if vm_running is False and age >= grace_s and xid:
-        # `latest_mtime` conflates "dir missing" with "lookup failed", so this
-        # asks the weaker question it can actually answer: has ANYTHING ever
-        # been written? A job holding chips writes rank logs within minutes.
-        # ★A FAILED read is not "nothing was ever written": that reading
-        # cancelled a run at step 40000 (2026-09-29). Only a read that WORKED
-        # and found nothing may make this row nominal.
-        mtime_ever, nerr = _read_output_mtime(output_probe, e)
-        if nerr:
-          _flag_cns_unreadable(e, tag, nerr, 'checking whether an XM-RUNNING '
-                               'job ever wrote output', log, dry_run)
-          continue
-        nominal = mtime_ever is None
-      elif not cell_known and age >= grace_s and xid:
-        # ★STRUCTURALLY UNVERIFIABLE, NOT MERELY UNREAD. The row is STILL
-        # cell-less after the recovery above (XM carried no usable placement, or
-        # no probe was supplied). has_running_vmgroup's None here means
-        # "unqueryable" -- there is no cell to form the query -- not the
-        # transient "the RPC failed" that the fail-open below was written to
-        # tolerate, and it will NEVER become queryable on its own. The output
-        # probe is equally blind (no bucket without a cell). So XM's RUNNING is
-        # the only signal left, and it is precisely the one this branch exists
-        # because it lies. A correctly placed job always carries a cell, so past
-        # grace a cell-less RUNNING row is the wedge, not a live run -- treat it
-        # as stuck rather than promoting it beyond reach forever.
-        nominal = True
-      # `or not xid` is redundant against the guards above (nominal can only be
-      # True when xid is truthy) and is written anyway: it is what narrows xid
-      # from `str | None` to `str` for the cancel call below, and a reader
-      # should not have to prove that invariant from two places at once.
-      if not nominal or not xid:
-        _clear_cns_read_failure(e, dry_run)
-        e.state = route_lib.JobState.RUNNING
-        route_lib.sync_current_submission(e, e.state)
-        e.last_reason = f'running in {e.cell} ({e.arch}-{e.chips})'
-        why = ('borg vmgroup RUN' if vm_running
-               else 'borg unreadable' if vm_running is None
-               else 'output written')
-        log.append(f'[reroute] {tag} is RUNNING now -> promoted ({why}), '
-                   f'no action')
-        continue
-      stuck_why = (
-          f'XM says RUNNING but the row has NO cell to verify against '
-          f'({age}s > {int(grace_s)}s grace; placement '
-          f'unrecoverable from XM)' if not cell_known
-          else f'XM says RUNNING but NO Borg VM group is RUN and nothing was '
-               f'ever written ({age}s > {int(grace_s)}s grace)')
-      _finish_move(
-          e, xid, now, route_lib.END_NOMINAL, entries=entries, submitter=sub,
-          dry_run=dry_run, policy=policy, hist=hist,
-          history_file=history_file, log=log,
-          restart_evidence=restart_evidence,
-          dry_reason=f'{tag}: {stuck_why}',
-          ok_reason=(f'[reroute] cancelled + re-queued {tag}: nominally RUNNING '
-                     f'({stuck_why}); cell|arch cooled '
-                     f'{int(route_lib.pair_cooldown_for(e.arch, cooldown_s))}s'),
-          fail_prefix=(f'[reroute] cancel FAILED for nominally-RUNNING {tag}, '
-                       f'left as-is.'),
-          persist_fn=persist_fn, fleet_log=fleet_log)
-    elif state == STATUS_TERMINAL:
-      if restart_evidence is not None:
-        # Auto-resume is on: the reconcile pass (next round) owns dead rows,
-        # because only it decides warm / cold / hold. Marking FAILED here took
-        # the row out of reconcile's reach, so it was never resumed at all.
-        log.append(f'[reroute] {tag} is TERMINAL -> left for the reconcile '
-                   f'pass (it decides the warm/cold restart)')
-        continue
+      if moved and view is not None:
+        # The moved row no longer claims its old cell; its new placement is
+        # drawn down so the next row does not chase the same free slice.
+        view = view.excluding(e.job_id)
+        if act.better is not None:
+          view.take(act.better)
+    elif act.kind == route_lib.ACT_FLAG_CNS:
+      _flag_cns_unreadable(e, tag, act.cns_err, act.cns_doing, log, dry_run)
+    elif act.kind == route_lib.ACT_ALIVE:
+      _clear_cns_read_failure(e, dry_run)
+      e.last_reason = act.reason
+      log.append(f'[reroute] {tag} {act.log}')
+    elif act.kind == route_lib.ACT_PROMOTE:
+      _clear_cns_read_failure(e, dry_run)
+      e.state = route_lib.JobState.RUNNING
+      route_lib.sync_current_submission(e, e.state)
+      e.last_reason = act.reason
+      log.append(f'[reroute] {tag} {act.log}')
+    elif act.kind == route_lib.ACT_MARK_FAILED:
       e.state = route_lib.JobState.FAILED
-      route_lib.sync_current_submission(
-          e, e.state, reason='terminal per XManager (failed/stopped)')
-      e.last_reason = 'terminal per XManager (failed/stopped)'
-      log.append(f'[reroute] {tag} is TERMINAL -> marked FAILED')
-    else:  # STATUS_UNKNOWN
-      log.append(f'[reroute] {tag} status UNKNOWN -> no action (never cancel blind)')
+      route_lib.sync_current_submission(e, e.state, reason=act.reason)
+      e.last_reason = act.reason
+      log.append(f'[reroute] {tag} {act.log}')
+    else:   # DEFER (rule a / b), NOOP, UNKNOWN
+      if act.reason:
+        e.last_reason = act.reason
+      log.append(f'[reroute] {tag} {act.log}')
+  log.append(f'[reroute] pass: {len(rows)} candidates, probes {probe_s:.1f}s, '
+             f'total {time.monotonic() - t0:.1f}s'
+             + (f' (one {confirm_gap_s:g}s confirm gap shared by '
+                f'{len(second)})' if second else ''))
   return entries, log
 
 
@@ -3988,6 +4034,14 @@ def run_dispatch_worker_loop(
     time.sleep(poll_s)
 
 
+def _reroute_view_source() -> ViewSource:
+  """The reroute pass's ViewSource (rule b): live availability for --group,
+  the fleet log, the --cooldown_s base -- the same view the dispatch worker
+  places through."""
+  return _view_source_factory(_GROUP.value, _FLEET_PAIR_EVENTS_FILE.value,
+                              _COOLDOWN_S.value)()
+
+
 def _view_source_factory(group: str, fleet_file: Optional[str],
                          cooldown_s: float) -> 'Callable[[], ViewSource]':
   """The production ViewSource factory for the worker loops: live
@@ -4135,7 +4189,12 @@ def main(argv):
                 (lambda _s=snap, _b=baseline: merge_and_save_touched(
                     _QUEUE_FILE.value, _s, baseline=_b))
                 if not _DRY_RUN.value else None),
-            fleet_log=FleetLog(_FLEET_PAIR_EVENTS_FILE.value))
+            fleet_log=FleetLog(_FLEET_PAIR_EVENTS_FILE.value),
+            # Rule b: a never-started row is cancelled only when THE placement
+            # function, over this pass's view, puts it somewhere else.
+            view_source=_reroute_view_source(),
+            starting_max_s=_REROUTE_STARTING_MAX_S.value,
+            probe_workers=_REROUTE_PROBE_WORKERS.value)
         for line in rr_log:
           print(f'  [reroute-loop:reroute] {line}', flush=True)
         if not _DRY_RUN.value:
@@ -4209,7 +4268,11 @@ def main(argv):
         inplace_restart_threshold=_INPLACE_RESTART_THRESHOLD.value,
         restart_evidence=(CnsRestartEvidence()
                           if _AUTO_RESUME_PRUNED.value else None),
-        persist_fn=persist)
+        persist_fn=persist,
+        # Reads the fleet log through the view; the loop stays its one writer.
+        view_source=_reroute_view_source(),
+        starting_max_s=_REROUTE_STARTING_MAX_S.value,
+        probe_workers=_REROUTE_PROBE_WORKERS.value)
   else:
     # Drain QUEUED jobs into the XM queue, trying groups IN PREFERENCE ORDER.
     # `--group_order=5,9` places what the free vqfree pool (g5) can take first
