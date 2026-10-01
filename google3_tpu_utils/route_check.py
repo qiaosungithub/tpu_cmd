@@ -424,20 +424,29 @@ _RECONCILE = flags.DEFINE_bool(
     'SUBMITTED to RUNNING. Fixes R3 (stale local state poisoning the route path). '
     'Read-only against XM; only local queue rows change. UNKNOWN never acts.')
 _AUTO_RESUME_PRUNED = flags.DEFINE_bool(
-    'auto_resume_pruned', False, 'In the reconcile pass, when a row is cleaned '
-    'up to FAILED, decide whether it was PRUNED/PREEMPTED (a healthy run killed '
-    'from outside: XM terminal + a surviving checkpoint + no code-bug signature '
-    'in the log tail + no live same-config sibling) and, if so, auto-append a '
-    'fresh QUEUED row that resumes it WARM from the last checkpoint. OFF by '
-    'default: turning it on makes reconcile SUBMIT work, so it must be an '
-    'explicit choice, and it honours --dry_run (logs the plan, appends nothing). '
-    'Every guard defaults to leaving the dead row alone; see '
-    'route_lib.plan_pruned_restart.')
+    'auto_resume_pruned', False, 'When XM reports an attempt dead, decide '
+    'whether it was a healthy run killed from outside (no code-bug signature, '
+    'no live same-config sibling, budget left) and, if so, requeue the SAME '
+    'row IN PLACE: warm from the chain\'s newest checkpoint, or a bounded cold '
+    'rerun when the chain has none. OFF by default (the row goes FAILED, '
+    'exactly as before): turning it on makes reconcile SUBMIT work, so it must '
+    'be an explicit choice. Honours --dry_run. Also lets the reroute pass read '
+    'checkpoints before a move. See route_lib.decide_end.')
 _AUTO_RESUME_MAX = flags.DEFINE_integer(
     'auto_resume_max', 3, 'Max automatic warm-restarts of one run before the '
     'reconcile pass stops and leaves it for a human (carried on the entry as '
     'auto_resumes). Guards against a run that dies for a non-pruner reason the '
     'code-bug scan missed looping on PROD budget.')
+_HARDWARE_RESUME_MAX = flags.DEFINE_integer(
+    'hardware_resume_max', route_lib.DEFAULT_HARDWARE_RESUME_MAX,
+    'Max automatic restarts after HARDWARE deaths (a host/device fault named '
+    'in the log), counted on the row as hardware_resumes and never against '
+    '--auto_resume_max (operator 2026-10-01 00:51Z). At the cap the row is '
+    'left FAILED for a human: that many bad hosts in a row is suspicious.')
+_SHOW_CHAIN = flags.DEFINE_string(
+    'show_chain', '', 'READ-ONLY: print the chain (checkpoint trunk + every '
+    'attempt as an edge or leaf) of the queue row named by this job_id / name '
+    '/ id suffix, and exit. Changes nothing.')
 _REROUTE_LOOP = flags.DEFINE_bool(
     'reroute_loop', False, 'Run as the STANDALONE tpu-reroute PROCESS: an own '
     'loop that each round does (A) an XM-truth reconcile pass then (B) a reroute '
@@ -640,9 +649,11 @@ def merge_and_save_touched(
     dropped_job_ids: Optional[set] = None,
     *,
     baseline: Optional[dict[str, dict]] = None,
-) -> None:
+) -> set:
   """Re-load the queue under the lock and write back only the entries this pass
-  actually changed, keyed by job_id, then persist atomically.
+  actually changed, keyed by job_id, then persist atomically. Returns the set
+  of job_ids whose copy from `touched` was COMMITTED (so a caller can act --
+  e.g. archive a dead xid -- only on rows the write actually saved).
 
   This is the write half of the route pass fix. The slow part of a tick (the
   RPCs in run_tick/run_reroute) runs on an in-memory snapshot WITHOUT the lock,
@@ -665,6 +676,7 @@ def merge_and_save_touched(
   """
   touched_by_id = {e.job_id: e for e in touched}
   dropped = dropped_job_ids or set()
+  committed: set = set()
   with with_queue_lock(path):
     live = load_queue(path)
     merged: list[route_lib.QueueEntry] = []
@@ -702,6 +714,7 @@ def merge_and_save_touched(
             and getattr(e, 'pin_group', None)):
           t.pin_group = e.pin_group
         merged.append(t)
+        committed.add(e.job_id)
       else:
         merged.append(e)
       seen.add(e.job_id)
@@ -710,7 +723,9 @@ def merge_and_save_touched(
       if (e.job_id not in seen and e.job_id not in dropped
           and (baseline is None or e.job_id not in baseline)):
         merged.append(e)
+        committed.add(e.job_id)
     save_queue(path, merged)
+  return committed
 
 
 def archive_finished_queue_rows(path: str, xids: set) -> dict:
@@ -1781,25 +1796,11 @@ class CnsRestartProbe:
     return sum(1 for m in mtimes if m > ckpt)
 
 
-# --- Pruned-restart evidence: the CNS I/O that feeds plan_pruned_restart -----
-# route_lib owns the DECISION (pure, unit-tested); everything here is the I/O
-# that gathers its inputs off CNS. Every failure path returns "no evidence"
-# (None), which route_lib.plan_pruned_restart reads as a reason to HOLD -- so a
-# broken read can only make auto-resume MORE cautious, never fire it wrongly.
-
-
-def _new_resume_job_id(power: str) -> str:
-  """A fresh opaque local job_id for a warm-restart row (§5.1).
-
-  Delegates to route_lib.mint_job_id so the resume path mints the SAME
-  collision-proof `YYYYmmddTHHMMSS-<10hex>` id the enqueue path does -- not the
-  old `{power}-{uuid[:6]}` shape, whose 6 hex digits had a real birthday-bound
-  collision risk against the archive. `power` is no longer part of the id (it is
-  a scheduling attribute, not identity); it is kept as a parameter so the one
-  call site is untouched.
-  """
-  del power  # identity is opaque now; power lives on the row, not in the id
-  return route_lib.mint_job_id()
+# --- Attempt-end evidence: the CNS I/O that feeds route_lib.end_attempt ------
+# route_lib owns the DECISION (decide_end: pure, unit-tested); everything here
+# is the I/O that gathers its inputs off CNS. A failed read is reported as a
+# read error, never as "no checkpoint", so a broken read can only make
+# auto-resume MORE cautious, never fire it wrongly.
 
 
 def _find_newest_rank0_log(bucket: str, xid: str,
@@ -1903,13 +1904,6 @@ def _latest_complete_checkpoint(out_dir: str,
   return best
 
 
-# ★COLD-RERUN MASTER SWITCH (Fix 2). Enabled so a healthy run preempted before
-# its first checkpoint (or rejected at creation by transient Borg
-# AFFINITY_GROUP_IN_USE / ICI_SECURITY_SETUP / TASK_ACTION_FISH) cold-reruns
-# within the auto_resume budget instead of stranding in FAILED.
-_ALLOW_COLD_RERUN = True
-
-
 def _summarize_xm_failure(xm_msg: str) -> str:
   """Concise human-readable failure cause from an XManager work-unit message."""
   if not xm_msg:
@@ -1932,36 +1926,11 @@ def _summarize_xm_failure(xm_msg: str) -> str:
   return ''
 
 
-def _termination_cause_of(entry: 'route_lib.QueueEntry') -> Optional[str]:
-  """Best-effort termination cause for a dead row, or None.
-
-  A clean preemption leaves NO cause in the job's own stdout, so this reads the
-  QUEUE ROW instead: an explicit preempt/evict/drain/reclaim word in
-  last_reason, or -- failing that -- the presence of any eviction STRIKE, which
-  the router stamps precisely when a cell evicts this job. Returns a lowercase
-  cause substring that route_lib._PREEMPTION_CAUSES matches, or None when there
-  is no positive signal (in which case the cold decision falls back to the
-  `trained` evidence). Never raises.
-  """
-  reason = (getattr(entry, 'last_reason', '') or '').lower()
-  for word in (
-      'preempt', 'evict', 'drain', 'reclaim', 'pruned', 'affinity', 'ici', 'fish'
-  ):
-    if word in reason:
-      return word
-  evictions = getattr(entry, 'evictions', None) or {}
-  try:
-    if any(int((v or {}).get('strikes', 0)) > 0 for v in evictions.values()):
-      return 'evict'
-  except (AttributeError, TypeError, ValueError):
-    pass
-  return None
-
-
 class CnsRestartEvidence:
-  """Gathers the two CNS facts plan_pruned_restart needs about a dead row: any
-  code-bug signature in the log tail, and the newest complete checkpoint. Held
-  as an injectable object so run_reconcile stays unit-testable with a fake.
+  """Gathers the CNS facts route_lib.decide_end needs about an ending attempt:
+  any code-bug or hardware-fault signature in the log tail, whether it
+  trained, and the newest complete checkpoint. Held as an injectable object so
+  run_reconcile / run_reroute stay unit-testable with a fake.
   """
 
   def __init__(self, timeout_s: float = CNS_READ_TIMEOUT_S,
@@ -2058,23 +2027,6 @@ def _hardware_fault_of(evidence, entry: 'route_lib.QueueEntry') -> Optional[str]
     return None
 
 
-def _steer_off_bad_host(new: 'route_lib.QueueEntry',
-                        dead: 'route_lib.QueueEntry', evidence, now: float,
-                        log: list[str], tag: str) -> None:
-  """If `dead` died of a hardware fault, carry a cooldown + eviction strike on
-  its (cell, arch) onto the restart row `new`, so it is not re-placed on the
-  broken host's cell."""
-  hw = _hardware_fault_of(evidence, dead)
-  if not hw:
-    return
-  keys = route_lib.carry_hardware_strike(new, dead, now)
-  if keys:
-    log.append(f'[auto-resume] {tag}: hardware fault ({hw}) -> restart '
-               f'{new.job_id} steered off {", ".join(keys)} '
-               f'(cooled {int(route_lib.HARDWARE_FAULT_COOLDOWN_S)}s + '
-               f'eviction strike)')
-
-
 def _gather_restart_evidence(dead: 'route_lib.QueueEntry', evidence):
   """(code_bug, found_checkpoint, trained, read_error) for a restart decision.
   Uses the evidence object's tri-state reader when it has one; an older/fake
@@ -2129,65 +2081,6 @@ def _flag_cns_unreadable(e: 'route_lib.QueueEntry', tag: str, err: str,
                f'-> no action this pass ({err})')
 
 
-def _restart_decision(dead: 'route_lib.QueueEntry',
-                      entries: list['route_lib.QueueEntry'],
-                      evidence, max_resumes: int,
-                      *, log: Optional[list] = None, tag: str = '',
-                      ev=None, allow_cold: Optional[bool] = None):
-  """(plan, checkpoint) for a just-failed row: gather CNS evidence, apply the
-  pure decision. plan is (verdict, why). Kept separate so both the dry-run and
-  the live branch of run_reconcile decide identically.
-
-  ★COLD-RERUN GATE. A row that is terminal with NO checkpoint but shows training
-  progress (or a preemption cause) is a healthy run killed before its first
-  save; the pure decision can return RESUME_COLD for it, but ONLY when
-  allow_cold is set. That switch is _ALLOW_COLD_RERUN, module-level and OFF in
-  phase 2a: the evidence is gathered and the shadow decision is logged, but the
-  live verdict stays exactly what it was before (HOLD). Phase 2b flips it on.
-  """
-  # `ev` lets a caller that already read the evidence (to check for a failed
-  # read before acting) pass it in instead of paying for a second CNS read.
-  cb, found, trained, read_err = (ev if ev is not None
-                                  else _gather_restart_evidence(dead, evidence))
-  if read_err:
-    # The dir could not be read: only a checkpoint this run was actually SEEN
-    # to write counts. The pointer it was started from may be days behind
-    # (a row started at step 40000 that reached 47000), so it is not used
-    # here; with nothing seen the caller HOLDs.
-    ckpt = (getattr(dead, 'last_known_checkpoint', '') or '') or None
-  else:
-    # The run's own checkpoint (just found, or recorded earlier), else the
-    # pointer it was started from; see route_lib.pick_restart_checkpoint.
-    ckpt = route_lib.pick_restart_checkpoint(dead, found) or None
-  allow = _ALLOW_COLD_RERUN if allow_cold is None else allow_cold
-  other = route_lib.has_live_config_sibling(dead, entries)
-  cause = _termination_cause_of(dead)
-  hw = _hardware_fault_of(evidence, dead)
-  if hw:
-    # A detected host/device fault is positive evidence the death was external
-    # to a healthy run (route_lib._PREEMPTION_CAUSES carries 'hardware').
-    cause = f'hardware: {hw}'
-  plan = route_lib.plan_pruned_restart(
-      dead, xm_terminal=True, code_bug=cb, checkpoint=ckpt,
-      other_live_writer=other, max_auto_resumes=max_resumes,
-      trained=trained, termination_cause=cause, allow_cold=allow)
-  # ★SHADOW (phase 2a). When the live gate is OFF, re-run the SAME pure decision
-  # with allow_cold=True and log what it WOULD have done -- without acting. This
-  # is how we watch, on the real reconcile stream, which no-checkpoint HOLDs the
-  # cold path would rescue, before ever changing behavior. No-op once
-  # _ALLOW_COLD_RERUN is True (the live plan already is the cold plan).
-  if log is not None and not allow:
-    shadow_verdict, shadow_why = route_lib.plan_pruned_restart(
-        dead, xm_terminal=True, code_bug=cb, checkpoint=ckpt,
-        other_live_writer=other, max_auto_resumes=max_resumes,
-        trained=trained, termination_cause=cause, allow_cold=True)
-    if shadow_verdict != plan[0]:
-      log.append(
-          f'[shadow][cold-rerun] {tag}: WOULD be {shadow_verdict} if enabled '
-          f'(trained={trained}, cause={cause!r}) -- {shadow_why}')
-  return plan, ckpt
-
-
 # --- Registry cancel lookup: a deliberate `tpu cancel` is not a crash --------
 # `tpu cancel <xid>` marks the registry row status=CANCELLED + cancelled_at, but
 # leaves the queue row holding that xid. run_reconcile asks this lookup before it
@@ -2202,18 +2095,21 @@ def _registry_cancelled_at_of(row) -> Optional[str]:
   cancel, else None.
 
   Both markers count, because the check daemon's board write-back can later
-  overwrite status=CANCELLED with FAILED while cancelled_at survives. A row the
-  router archived after its OWN reroute cancel (archived_by='reroute') does not
-  count: the router cancelled it only to move it, so if the queue row still
-  holds that xid the requeue was lost and the old recovery path (zombie ->
-  FAILED, auto-resume) is the right one.
+  overwrite status=CANCELLED with FAILED while cancelled_at survives. The
+  router's OWN cancels do not count -- a row it stamped cancelled_by='reroute'
+  right after cancelling it, or archived as a dead attempt of a chain
+  (archived_by 'reroute' / 'auto-resume'): the router cancelled it only to move
+  it, so if the queue row still holds that xid the requeue was lost and the
+  death path (requeue in place / HOLD) is the right one.
   """
   if not isinstance(row, dict):
     return None
   when = row.get('cancelled_at')
   if row.get('status') != 'CANCELLED' and not when:
     return None
-  if str(row.get('archived_by') or '') == 'reroute':
+  if str(row.get('archived_by') or '') in ('reroute', 'auto-resume'):
+    return None
+  if str(row.get('cancelled_by') or '') == 'reroute':
     return None
   return str(when or '')
 
@@ -2225,7 +2121,7 @@ def make_registry_cancelled_lookup(
   """The production `cancelled_lookup` for run_reconcile, or None when the
   kill-switch is set.
 
-  Files resolve like _archive_rerouted_xid (`TPU_JOBS_FILE` /
+  Files resolve like _registry_files (`TPU_JOBS_FILE` /
   `TPU_JOBS_LEGACY_FILE`, defaulting to ~/.tpu_jobs.json and
   ~/.tpu_jobs_legacy.json). The live file is consulted first and the legacy
   archive second; the first file that has the xid decides. Each file is read at
@@ -2297,45 +2193,55 @@ def run_reconcile(
     dry_run: bool = True,
     *,
     auto_resume_pruned: bool = False,
-    auto_resume_max: int = 3,
+    auto_resume_max: int = route_lib.DEFAULT_AUTO_RESUME_MAX,
+    hardware_resume_max: int = route_lib.DEFAULT_HARDWARE_RESUME_MAX,
     restart_evidence=None,
     cancelled_lookup: Optional[Callable[[str], Optional[str]]] = None,
     fleet_log: Optional[FleetLog] = None,
+    persist_fn: Optional[Callable[[], Optional[set]]] = None,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """Re-verify every non-terminal (RECONCILABLE_STATES) entry against XManager
   and clean up stale local state. Returns (entries, log_lines).
 
-  ★DELIBERATE CANCELS ARE NOT CRASHES. `cancelled_lookup(xid)` returns the
-  registry's cancelled_at string ('' when the row says CANCELLED with no
-  timestamp) for an xid that `tpu cancel` stopped, else None. When XM says a
-  row's xid is dead (TERMINAL / GONE) and the lookup says it was cancelled, the
-  row is retired through route_lib.mark_cancelled: row FAILED, current
-  submission CANCELLED, and NO auto-resume, because somebody stopped that job
-  on purpose. Without this the Local Queue said `FAILED ... zombie cleaned up`
-  next to a CANCELLED board row and auto-resume could restart the job. The
-  lookup is fail-safe: None, or any exception it raises, means the old path
-  runs unchanged; with cancelled_lookup=None (the default) this function is
-  byte-for-byte what it was.
+  The DECISION is pure (route_lib.decide_reconcile picks the transition,
+  route_lib.end_attempt handles every attempt that ENDED); here we only add the
+  live probe, the CNS evidence read and the log. An UNKNOWN probe NEVER acts.
+  In dry_run the decision is logged but nothing is mutated.
 
-  This is the reconcile half of the standalone tpu-reroute process. It fixes R3:
-  .tpu_local_queue.json keeps state=RUNNING/SUBMITTED for jobs XManager no longer
-  tracks (measured 2026-08-27: 13 local-RUNNING, 0 truly running on XM = ~21.7k
-  cr/hr phantom occupancy on the ROUTE path). Any headroom/reroute logic reading
-  local `state` is poisoned; this pass rewrites zombies to terminal so the route
-  path is clean too (the billing path is already XM-truth via budget_check).
+  An ended attempt goes through route_lib.end_attempt, the one handler every
+  attempt end uses (reroute moves too):
+    * XM COMPLETED -> DONE.
+    * A deliberate `tpu cancel` (cancelled_lookup says so) -> row FAILED,
+      submission CANCELLED, never auto-resumed. Fail-safe: no lookup, or any
+      exception, means "not cancelled".
+    * XM TERMINAL / GONE -> a death. With auto_resume_pruned OFF the row goes
+      FAILED exactly as it always did (no requeue, no archive; the npu loop
+      runs this way). With it ON the row is requeued IN PLACE -- warm from the
+      chain's newest checkpoint, or a bounded cold rerun when the chain has
+      none -- or retired FAILED (HOLD) for a human. A HARDWARE death draws on
+      hardware_resumes (cap hardware_resume_max), any other on auto_resumes.
+  The evidence is read BEFORE the row leaves reconcile's reach; a FAILED read
+  leaves the row as it is for CNS_READ_MAX_FAILURES passes, then resumes from
+  the last KNOWN checkpoint or HOLDs (HELD) -- never a cold rerun on a failed
+  read.
 
-  The DECISION is pure (route_lib.decide_reconcile); here we only add the live
-  probe and the log. Safety mirrors run_reroute: an UNKNOWN probe NEVER acts, so
-  a probe hiccup can never mark a live job dead. Only a definite XM verdict moves
-  an entry. In dry_run the decision is logged but the entry is not mutated.
+  ★Board: a requeued row's dead xid is archived off ~/.tpu_jobs.json ONLY
+  after persist_fn() has saved the requeued row (a crash between the two must
+  never leave an archived parent with no saved restart). persist_fn returns the
+  set of job_ids it committed, or None to mean all. Without a persist_fn
+  nothing is archived.
   """
   log: list[str] = []
   targets = [e for e in entries if e.state in route_lib.RECONCILABLE_STATES]
   if not targets:
     log.append('[reconcile] no non-terminal entries to reconcile.')
     return entries, log
+  policy = route_lib.ResumePolicy(
+      enabled=auto_resume_pruned, auto_resume_max=auto_resume_max,
+      hardware_resume_max=hardware_resume_max)
   n_zombie = n_promoted = n_unknown = n_noop = n_done = n_resumed = 0
   n_cancelled = 0
+  to_archive: list[tuple[str, str]] = []
   for e in targets:
     xid = e.xid
     if not xid:
@@ -2362,8 +2268,6 @@ def run_reconcile(
     prior_reason = e.last_reason or ''
     tag = f'{e.job_id} (xid={xid}, local {e.state.value}, XM {st})'
     # Age gates the GONE verdict only (a young row is legitimately 0-WU).
-    # submitted_at is None on a re-routed row, which reads as 'age unknown'
-    # and, like UNKNOWN, actions nothing.
     age_s = (now - e.submitted_at) if e.submitted_at else None
     new_state = route_lib.decide_reconcile(e.state, st, age_s=age_s)
     if new_state is None:
@@ -2372,31 +2276,47 @@ def run_reconcile(
       else:
         n_noop += 1
       continue
+    if new_state == route_lib.JobState.RUNNING:
+      n_promoted += 1
+      if dry_run:
+        log.append(f'[DRY][reconcile] would set {tag} -> RUNNING')
+      elif route_lib.reconcile_entry(e, st, age_s=age_s):
+        log.append(f'[reconcile] {tag} -> RUNNING (placement confirmed)')
+      continue
     cancelled_at = (
         _registry_cancel_verdict(cancelled_lookup, str(xid), log, tag)
         if new_state == route_lib.JobState.FAILED else None)
     if cancelled_at is not None:
-      # A deliberate `tpu cancel`: retire the row as CANCELLED and never
-      # auto-resume it (see the docstring). Counted apart from zombies.
       n_cancelled += 1
       at = f' at {cancelled_at}' if cancelled_at else ''
       if dry_run:
         log.append(f'[DRY][reconcile] would set {tag} -> CANCELLED '
                    f'(tpu cancel{at}; registry CANCELLED; no auto-resume)')
         continue
-      route_lib.mark_cancelled(e, when=cancelled_at)
+      route_lib.end_attempt(
+          e, route_lib.AttemptEnd(kind=route_lib.END_CANCELLED,
+                                  cancelled_when=cancelled_at), policy, now)
       log.append(f'[reconcile] {tag} -> CANCELLED (tpu cancel{at}; registry '
                  f'CANCELLED; not a crash, no auto-resume)')
       continue
-    # ★READ THE EVIDENCE BEFORE THE ROW LEAVES RECONCILE'S REACH. Once a row is
-    # FAILED it is never looked at again, so a restart decision taken on a
-    # FAILED read is final. Read first; if the read failed, leave the row as it
-    # is (still reconcilable) and try again next pass, up to
-    # CNS_READ_MAX_FAILURES; then resume from the lineage's last known
-    # checkpoint, or HOLD for a human. Never a cold rerun on a failed read.
+    if new_state == route_lib.JobState.DONE:
+      n_done += 1
+      if dry_run:
+        log.append(f'[DRY][reconcile] would set {tag} -> DONE')
+        continue
+      summary = _summarize_xm_failure(xm_reason)
+      route_lib.end_attempt(e, route_lib.AttemptEnd(
+          kind=route_lib.END_DONE, xm_status=st,
+          reason=(f'reconciled: XM reports terminal (was local '
+                  f'{e.state.value}; cause: {summary}); zombie cleaned up'
+                  if summary else '')), policy, now)
+      log.append(f'[reconcile] {tag} -> DONE (completed normally)')
+      continue
+    # ---- a death (XM TERMINAL, or GONE past its age gate) ----
+    # ★READ THE EVIDENCE BEFORE THE ROW LEAVES RECONCILE'S REACH, and on a
+    # FAILED read leave the row reconcilable and retry next pass.
     ev = None
-    if (new_state == route_lib.JobState.FAILED and auto_resume_pruned
-        and restart_evidence is not None):
+    if auto_resume_pruned and restart_evidence is not None:
       ev = _gather_restart_evidence(e, restart_evidence)
     read_err = ev[3] if ev is not None else ''
     if read_err:
@@ -2404,37 +2324,13 @@ def run_reconcile(
       if n_fail < route_lib.CNS_READ_MAX_FAILURES:
         n_unknown += 1
         # last_reason is deliberately NOT touched: it carries the termination
-        # cause (e.g. 'preempted out of sh') that the restart decision reads
-        # once a read works. The streak lives in cns_read_failures/_error.
+        # cause (e.g. 'preempted out of sh') that the decision reads once a
+        # read works. The streak lives in cns_read_failures/_error.
         log.append(f'[reconcile] {tag}: XM dead but CNS read FAILED '
                    f'({n_fail}/{route_lib.CNS_READ_MAX_FAILURES}) -> row left '
                    f'as is, restart decided next pass ({read_err})')
         continue
-    if dry_run:
-      log.append(f'[DRY][reconcile] would set {tag} -> {new_state.value}')
-      if new_state == route_lib.JobState.FAILED:
-        n_zombie += 1
-        if auto_resume_pruned:
-          e.last_reason = f'{prior_reason} {xm_reason}'.strip()
-          try:
-            (verdict, why), ckpt = _restart_decision(
-                e, entries, restart_evidence, auto_resume_max, log=log, tag=tag,
-                ev=ev, allow_cold=(False if read_err else None))
-          finally:
-            e.last_reason = prior_reason
-          if verdict == route_lib.RESUME_WARM:
-            log.append(f'[DRY][auto-resume] {tag}: would warm-restart from '
-                       f'{ckpt} ({why})')
-          elif verdict == route_lib.RESUME_COLD:
-            log.append(f'[DRY][auto-resume] {tag}: would COLD rerun ({why})')
-          else:
-            log.append(f'[DRY][auto-resume] {tag}: HOLD ({why})')
-      elif new_state == route_lib.JobState.DONE:
-        n_done += 1
-      else:
-        n_promoted += 1
-      continue
-    old_val = e.state.value
+    n_zombie += 1
     summary = _summarize_xm_failure(xm_reason) if st != STATUS_GONE else ''
     hw_seen = (_hardware_fault_of(restart_evidence, e)
                if ev is not None and st != STATUS_GONE else None)
@@ -2442,84 +2338,66 @@ def run_reconcile(
       # The CNS log names the host fault even when XM's message only carries
       # the RuntimeError it raised through our code.
       summary = f'HARDWARE: {hw_seen}'
-    reconcile_reason = (
-        f'reconciled: XM reports terminal (was local {old_val}; '
-        f'cause: {summary}); zombie cleaned up'
-        if summary else ''
-    )
-    changed = route_lib.reconcile_entry(
-        e, st, reason=reconcile_reason, age_s=age_s)
-    if changed:
-      if e.state == route_lib.JobState.FAILED:
-        n_zombie += 1
-        if hw_seen and fleet_log is not None:
-          # A broken host is fleet news whether or not this row restarts.
-          # reconcile_entry leaves e.cell / e.arch intact: they name the host.
-          fleet_log.record(route_lib.fleet_events_for(e, 'hardware', now), now,
-                           log, tag)
-        if st == STATUS_GONE:
-          log.append(f'[reconcile] {tag} -> FAILED '
-                     f'(experiment GONE: 0 work units, age {int(age_s or 0)}s)')
+    end = route_lib.AttemptEnd(
+        kind=route_lib.END_DEATH, xm_status=st,
+        reason=(f'reconciled: XM reports terminal (was local {e.state.value}; '
+                f'cause: {summary}); zombie cleaned up' if summary else ''),
+        cause_text=f'{prior_reason} {xm_reason}'.strip(),
+        found_checkpoint=ev[1] if ev is not None else None,
+        read_error=read_err, evidence_read=ev is not None,
+        code_bug=ev[0] if ev is not None else None,
+        trained=bool(ev[2]) if ev is not None else False,
+        hardware=hw_seen)
+    if dry_run:
+      log.append(f'[DRY][reconcile] would set {tag} -> FAILED')
+      if auto_resume_pruned:
+        d = route_lib.decide_end(e, end, policy, entries)
+        if d.verdict == route_lib.RESUME_WARM:
+          log.append(f'[DRY][auto-resume] {tag}: would warm-restart in place '
+                     f'from {d.checkpoint} ({d.why})')
+        elif d.verdict == route_lib.RESUME_COLD:
+          log.append(f'[DRY][auto-resume] {tag}: would COLD rerun in place '
+                     f'({d.why})')
         else:
-          log.append(f'[reconcile] {tag} -> FAILED (zombie cleaned up'
-                     f'{"; " + summary if summary else ""})')
-        if auto_resume_pruned:
-          if ev is not None and not read_err:
-            _clear_cns_read_failure(e, dry_run)
-            if ev[1]:
-              route_lib.note_known_checkpoint(e, ev[1])
-          saved_reconciled_reason = e.last_reason
-          e.last_reason = f'{prior_reason} {xm_reason}'.strip()
-          try:
-            # After CNS_READ_MAX_FAILURES failed reads, decide on what the
-            # row already knows: its recorded checkpoint or its resume pointer
-            # (pick_restart_checkpoint). No cold rerun on a failed read.
-            (verdict, why), ckpt = _restart_decision(
-                e, entries, restart_evidence, auto_resume_max, log=log, tag=tag,
-                ev=ev, allow_cold=(False if read_err else None))
-          finally:
-            e.last_reason = saved_reconciled_reason
-          if read_err and not (verdict == route_lib.RESUME_WARM and ckpt):
-            route_lib.hold_entry(
-                e, f'CNS unreadable on {e.cns_read_failures} consecutive '
-                   f'checks after XM reported the job dead, and no known '
-                   f'checkpoint to resume from ({why}). Check the run\'s '
-                   f'output dir by hand; `tpu requeue` restarts it AS IS '
-                   f'(cold unless it has a resume pointer). Last read error: '
-                   f'{read_err}')
-            log.append(f'[auto-resume] {tag}: HELD -- CNS read failed '
-                       f'{e.cns_read_failures}x and no known checkpoint '
-                       f'({read_err})')
-            continue
-          if verdict == route_lib.RESUME_WARM and ckpt and read_err:
-            why = (f'{why}; CNS unreadable {e.cns_read_failures}x, resuming '
-                   f'from the last KNOWN checkpoint')
-          if verdict == route_lib.RESUME_WARM and ckpt:
-            new = route_lib.build_warm_restart_entry(
-                e, ckpt, _new_resume_job_id(e.power))
-            entries.append(new)
-            n_resumed += 1
-            log.append(f'[auto-resume] {tag}: warm-restart queued as '
-                       f'{new.job_id} from {ckpt}')
-            _steer_off_bad_host(new, e, restart_evidence, now, log, tag)
-          elif verdict == route_lib.RESUME_COLD:
-            new = route_lib.build_cold_restart_entry(
-                e, _new_resume_job_id(e.power))
-            entries.append(new)
-            n_resumed += 1
-            log.append(f'[auto-resume] {tag}: COLD rerun queued as '
-                       f'{new.job_id} ({why})')
-            _steer_off_bad_host(new, e, restart_evidence, now, log, tag)
-          else:
-            if 'code bug (' in why and 'cause:' not in (e.last_reason or ''):
-              e.last_reason = f'{e.last_reason} [{why.split(";")[0]}]'
-            log.append(f'[auto-resume] {tag}: HOLD ({why})')
-      elif e.state == route_lib.JobState.DONE:
-        n_done += 1
-        log.append(f'[reconcile] {tag} -> DONE (completed normally)')
-      else:
-        n_promoted += 1
-        log.append(f'[reconcile] {tag} -> RUNNING (placement confirmed)')
+          log.append(f'[DRY][auto-resume] {tag}: HOLD ({d.why})')
+      continue
+    if st == STATUS_GONE:
+      log.append(f'[reconcile] {tag} -> FAILED '
+                 f'(experiment GONE: 0 work units, age {int(age_s or 0)}s)')
+    else:
+      log.append(f'[reconcile] {tag} -> FAILED (zombie cleaned up'
+                 f'{"; " + summary if summary else ""})')
+    res = route_lib.end_attempt(e, end, policy, now, entries)
+    if fleet_log is not None:
+      # A broken host is fleet news whether or not this row restarts.
+      fleet_log.record(res.fleet_events, now, log, tag)
+    if res.steered:
+      log.append(f'[auto-resume] {tag}: hardware fault ({hw_seen}) -> '
+                 f'steered off {", ".join(res.steered)} (cooled '
+                 f'{int(policy.hardware_cooldown_s)}s + eviction strike)')
+    if not auto_resume_pruned:
+      continue
+    budget = (f'hardware_resumes {e.hardware_resumes}/{hardware_resume_max}'
+              if res.budget == route_lib.BUDGET_HARDWARE
+              else f'auto_resumes {e.auto_resumes}/{auto_resume_max}')
+    if res.verdict == route_lib.RESUME_WARM:
+      n_resumed += 1
+      known = (f'; CNS unreadable {e.cns_read_failures}x, resuming from the '
+               f'last KNOWN checkpoint' if read_err else '')
+      log.append(f'[auto-resume] {tag}: warm-restart queued in place from '
+                 f'{res.checkpoint} ({res.why}{known}; {budget})')
+    elif res.verdict == route_lib.RESUME_COLD:
+      n_resumed += 1
+      log.append(f'[auto-resume] {tag}: COLD rerun queued in place '
+                 f'({res.why}; {budget})')
+    elif res.verdict == route_lib.HELD:
+      log.append(f'[auto-resume] {tag}: HELD -- CNS read failed '
+                 f'{e.cns_read_failures}x and no known checkpoint '
+                 f'({read_err})')
+    else:
+      log.append(f'[auto-resume] {tag}: HOLD ({res.why})')
+    if res.archive_xid:
+      to_archive.append((e.job_id, res.archive_xid))
   log.append(
       f'[reconcile] {len(targets)} checked: {n_zombie} zombie->FAILED, '
       + (f'{n_cancelled} cancelled (tpu cancel; no auto-resume), '
@@ -2527,184 +2405,187 @@ def run_reconcile(
       + f'{n_done} completed->DONE, '
       f'{n_promoted} promoted->RUNNING, {n_unknown} UNKNOWN (left alone), '
       f'{n_noop} already-correct'
-      + (f', {n_resumed} auto restart(s) queued (warm/cold).'
+      + (f', {n_resumed} auto restart(s) queued in place (warm/cold).'
          if auto_resume_pruned else '.'))
+  if to_archive:
+    _archive_after_persist(to_archive, persist_fn, log,
+                           archived_by='auto-resume')
   return entries, log
 
 
-def _archive_rerouted_xid(xid: Optional[str], log: list[str]) -> None:
-  """Move a just-cancelled reroute XID off the live board into the legacy archive.
+_ARCHIVE_KILL_SWITCH = 'TPU_REROUTE_NO_ARCHIVE'
 
-  ★WHY. A reroute cancels the old XID (Submitter.cancel -> `tpu cancel`, which
-  writes registry[xid].status=CANCELLED) and re-queues the SAME local job_id on a
-  new cell. The dead XID then piles up on the `tpu check` board as a CANCELLED
-  shell that a human had to `tpu clear`. Archiving it here, the instant it is
-  superseded, keeps the board clean with no manual step and no separate janitor.
 
-  SAFE BY CONSTRUCTION:
-    * It only ever touches the REGISTRY board file (~/.tpu_jobs.json), never the
-      queue. The queue row is the router's live handle on the job (same job_id,
-      old xid pushed to prior_xids) and is being re-queued right now -- archiving
-      it would strand the work, exactly what `tpu clear`/`tpu dequeue` refuse.
-    * It archives ONE named XID -- the one we just cancelled and superseded --
-      not a scan, so it can never sweep a live job.
-    * MOVE, not delete: the row goes to ~/.tpu_jobs_legacy.json (the only map
-      from an XID back to its checkpoint bucket / stagedir / launch log),
-      recoverable exactly like `tpu clear`.
-    * Idempotent: a missing/absent row is a no-op.
-    * FAIL-SAFE: the whole body is wrapped so a guard/telemetry step can NEVER
-      raise into the reroute loop (engineering.md). On any error it logs and
-      returns.
-    * KILL-SWITCH: `TPU_REROUTE_NO_ARCHIVE` (read at call time) disables it with
-      no rebuild -- set it in the loop env and restart the loop to roll back.
+def _registry_files() -> tuple[str, str]:
+  """(jobs, legacy) registry paths from the same env as infra_check / the
+  wrapper, so a tpu-scoped loop uses the tpu registry and an npu one npu's."""
+  return (os.path.expanduser(
+              os.environ.get('TPU_JOBS_FILE') or '~/.tpu_jobs.json'),
+          os.path.expanduser(
+              os.environ.get('TPU_JOBS_LEGACY_FILE')
+              or '~/.tpu_jobs_legacy.json'))
 
-  Files resolve from the same env as infra_check / the wrapper
-  (`TPU_JOBS_FILE` / `TPU_JOBS_LEGACY_FILE`), so a tpu-scoped loop archives into
-  the tpu registry and an npu-scoped one into npu's, automatically.
+
+def _archive_board_xid(xid: Optional[str], log: list[str], *,
+                       archived_by: str = 'reroute') -> None:
+  """Move one dead XID of a chain off the live board into the legacy archive.
+
+  ★WHY. A chain is one job: at most one of its xids belongs on the `tpu
+  check` board (operator 2026-10-01 01:18Z). When the router ends an attempt
+  and requeues the SAME row -- a reroute move (archived_by='reroute') or an
+  in-place auto-resume after a death (archived_by='auto-resume') -- the dead
+  XID would otherwise pile up as a CANCELLED/FAILED shell a human had to `tpu
+  clear`, and read as a failed job needing rescue.
+
+  ONLY call it after the queue write that persists the requeued row has
+  succeeded (_archive_after_persist). SAFE BY CONSTRUCTION:
+    * touches only the REGISTRY board file, never the queue;
+    * archives ONE named XID, never a scan;
+    * MOVE, not delete (~/.tpu_jobs_legacy.json keeps the checkpoint bucket /
+      stagedir / launch log), recoverable like `tpu clear`;
+    * idempotent: an absent row is a no-op;
+    * FAIL-SAFE: never raises into the loop; on any error it logs and returns;
+    * KILL-SWITCH: TPU_REROUTE_NO_ARCHIVE (read at call time) disables it.
   """
-  if os.environ.get('TPU_REROUTE_NO_ARCHIVE'):
+  if os.environ.get(_ARCHIVE_KILL_SWITCH):
     return
   if not xid:
     return
   xid = str(xid)
+  tag = '[auto-resume]' if archived_by == 'auto-resume' else '[reroute]'
   try:
-    jobs_file = os.path.expanduser(
-        os.environ.get('TPU_JOBS_FILE') or '~/.tpu_jobs.json')
-    legacy_file = os.path.expanduser(
-        os.environ.get('TPU_JOBS_LEGACY_FILE') or '~/.tpu_jobs_legacy.json')
+    jobs_file, legacy_file = _registry_files()
     if not os.path.exists(jobs_file):
       return
     # Through registry_store, the registry's one write path: the lock is held
     # across the whole move, the archive is written first, and an unreadable
-    # registry or archive raises (caught below) instead of reading as empty --
-    # the old copy of this code read a half-written archive as {} and would
-    # have written back a one-entry archive.
-    out = registry_store.archive([xid], who='reroute loop', archived_by='reroute',
+    # registry or archive raises (caught below) instead of reading as empty.
+    out = registry_store.archive([xid], who='reroute loop',
+                                 archived_by=archived_by,
                                  path=jobs_file, legacy=legacy_file)
     if out['moved']:
-      log.append(f'[reroute] archived superseded xid {xid} off the board '
-                 f'-> {legacy_file}')
+      what = ('dead parent xid' if archived_by == 'auto-resume'
+              else 'superseded xid')
+      log.append(f'{tag} archived {what} {xid} off the board -> {legacy_file}')
   except Exception as exc:  # pylint: disable=broad-except
-    # Guards must never kill the loop: a failed archive just leaves the CANCELLED
-    # shell on the board (the pre-change behaviour), never interrupts reroute.
-    log.append(f'[reroute] archive of xid {xid} FAILED (non-fatal): {exc!r}')
+    log.append(f'{tag} archive of xid {xid} FAILED (non-fatal): {exc!r}')
 
 
-def _reroute_requeue_after_cancel(
+def _archive_after_persist(pairs: Sequence[tuple[str, str]],
+                           persist_fn: Optional[Callable[[], Optional[set]]],
+                           log: list[str], *, archived_by: str) -> None:
+  """PERSIST, THEN ARCHIVE (operator 2026-10-01 02:15Z, decision 4). Save the
+  requeued rows first; archive each (job_id, xid) only if that write committed
+  the row. A failed or conflicting write leaves the xid on the board, which is
+  the safe direction: the next pass re-evaluates the row."""
+  tag = '[auto-resume]' if archived_by == 'auto-resume' else '[reroute]'
+  if persist_fn is None:
+    for _, x in pairs:
+      log.append(f'{tag} xid {x} left on the board: no persist hook, and an '
+                 f'archive only ever follows a saved queue write')
+    return
+  try:
+    committed = persist_fn()
+  except Exception as exc:  # pylint: disable=broad-except
+    log.append(f'{tag} queue write FAILED (non-fatal): {exc!r}; xid(s) '
+               f'{", ".join(x for _, x in pairs)} left on the board')
+    return
+  for jid, x in pairs:
+    if committed is not None and jid not in committed:
+      log.append(f'{tag} queue write did not commit {jid} (another writer '
+                 f'changed it); xid {x} left on the board')
+      continue
+    _archive_board_xid(x, log, archived_by=archived_by)
+
+
+def _stamp_router_cancel(xid: str, log: list[str]) -> None:
+  """Mark a registry row the router just cancelled to MOVE it
+  (cancelled_by='reroute'), so reconcile never reads the router's own cancel
+  as a human `tpu cancel` -- which would retire the job with no resume if the
+  queue write after the cancel were lost. Existing rows only; fail-safe."""
+  try:
+    jobs_file, _ = _registry_files()
+    if not os.path.exists(jobs_file):
+      return
+
+    def _do(data: dict) -> None:
+      row = data.get(str(xid))
+      if isinstance(row, dict):
+        row['cancelled_by'] = 'reroute'
+
+    registry_store.mutate(_do, who='reroute loop', path=jobs_file,
+                          create=False)
+  except Exception as exc:  # pylint: disable=broad-except
+    log.append(f'[reroute] could not mark xid {xid} as a router cancel '
+               f'(non-fatal): {exc!r}')
+
+
+def _finish_move(
     e: route_lib.QueueEntry,
     xid: str,
     now: float,
+    kind: str,
     *,
     entries: list[route_lib.QueueEntry],
     submitter: '_Submitter',
     dry_run: bool,
-    cooldown_s: float,
+    policy: route_lib.ResumePolicy,
     hist: list[float],
     history_file: Optional[str],
     log: list[str],
     restart_evidence,
-    auto_resume_max: int,
-    record_evict: bool,
     dry_reason: str,
     ok_reason: str,
     fail_prefix: str,
-    persist_fn: Optional[Callable[[], None]] = None,
+    persist_fn: Optional[Callable[[], Optional[set]]] = None,
     fleet_log: Optional[FleetLog] = None,
-    fleet_kind: str = 'pending',
 ) -> None:
-  """The shared tail of all THREE reroute cancel sites (a: in-place thrash,
-  b: PENDING x2, c: nominally-RUNNING): once the decision to cancel+requeue is
-  made, honour dry_run, cancel, and on success reset the row to QUEUED --
-  resuming WARM from a surviving checkpoint when one exists, else COLD via a
-  bare mark_reroute exactly as before.
+  """The I/O shell of a reroute MOVE (kind = END_PENDING / END_NOMINAL /
+  END_THRASH): read the checkpoints, cancel, hand the ended attempt to
+  route_lib.end_attempt (the same handler a reconcile death uses), record the
+  fleet events, persist, then archive the dead xid.
 
-  ★RECONCILE/REROUTE PARITY -- THE DATA-LOSS FIX. Before this, all three sites
-  called mark_reroute alone, which returns the row to QUEUED carrying NO resume
-  pointer -- so a job with a complete checkpoint on CNS COLD-STARTED from step 0
-  after a reroute, throwing away every step of durable progress. run_reconcile
-  already preserved a dead job's checkpoint on the FAILED path (CnsRestartEvidence
-  -> plan_pruned_restart -> a warm-restart entry); this threads the SAME
-  machinery into the reroute cancel paths via `restart_evidence`. With
-  restart_evidence=None (the default, and every existing test/call site) the plan
-  is always HOLD, so the requeue is a bare cold start -- behaviour UNCHANGED.
-
-  We KEEP the row (same job_id, same reroute counter, and the cell
-  cooldown + eviction strike just stamped on it) and resume it warm IN PLACE
-  (route_lib.apply_warm_restart_in_place) rather than appending a fresh row as
-  reconcile does: build_warm_restart_entry carries none of those penalties
-  forward, so a substituted fresh row would re-land on the very cell it was just
-  evicted from. The layout-correct resume wiring (ELT restart_from vs torch
-  load_from) is shared with reconcile through route_lib._apply_resume_pointer.
-  """
-  # Plan the warm restart BEFORE any mutation: the checkpoint lookup reads
-  # e.xid and e.cell, and mark_reroute below clears BOTH. No complete checkpoint
-  # (the common h100 case -- the job never survived to its first checkpoint)
-  # yields HOLD, i.e. an unchanged cold requeue. _restart_decision is the exact
-  # same evidence+verdict helper run_reconcile uses, so the two paths agree.
-  # ★Do not let `auto_resumes >= auto_resume_max` suppress checkpoint updates on
-  # a reroute: unlike reconcile (where HOLD leaves a dead row terminal),
-  # mark_reroute below ALWAYS re-queues the row, so returning HOLD on budget
-  # would re-queue it WITHOUT its newest checkpoint (rolling back progress).
-  effective_max_resumes = max(
-      auto_resume_max, int(getattr(e, 'auto_resumes', 0) or 0) + 1)
-  # ★READ THE CHECKPOINTS BEFORE CANCELLING, AND DO NOT CANCEL IF THE READ
-  # FAILED. A failed read is not "no checkpoint"; acting on it is what requeued
-  # a 40k-step run from step 0 (2026-09-29). Leave the job exactly as it is,
-  # count the failure, and re-check next pass.
+  ★READ THE CHECKPOINTS BEFORE CANCELLING, AND DO NOT CANCEL IF THE READ
+  FAILED: a failed read is not "no checkpoint" (2026-09-29: a 40k-step run was
+  requeued from step 0 on one). A move never draws on a resume budget
+  (operator decision 1); it resumes from the chain's newest checkpoint."""
   ev = _gather_restart_evidence(e, restart_evidence)
   if ev[3]:
     _flag_cns_unreadable(e, f'{e.job_id} (xid={xid})', ev[3],
                          'reading its checkpoints before a cancel+requeue',
                          log, dry_run)
     return
-  if ev[1] and not dry_run:
-    route_lib.note_known_checkpoint(e, ev[1])
-  (verdict, warm_why), ckpt = _restart_decision(
-      e, entries, restart_evidence, effective_max_resumes, ev=ev)
-  warm = verdict == route_lib.RESUME_WARM and bool(ckpt)
+  end = route_lib.AttemptEnd(kind=kind, found_checkpoint=ev[1],
+                             code_bug=ev[0], trained=bool(ev[2]),
+                             evidence_read=True)
   if dry_run:
+    d = route_lib.decide_end(e, end, policy, entries)
     log.append(f'[DRY][reroute] would cancel + re-route {dry_reason}'
-               + (f'; then WARM-restart from {ckpt} ({warm_why})' if warm
-                  else ''))
+               + (f'; then WARM-restart from {d.checkpoint} ({d.why})'
+                  if d.pointer == 'set' else ''))
     return
+  if ev[1]:
+    # Remember what was read even if the cancel below fails.
+    route_lib.note_known_checkpoint(e, ev[1], at=now)
   ok, out = submitter.cancel(xid)
   if not ok:
     log.append(f'{fail_prefix} {_tail(out)}')
     return
   hist.append(time.time())
   _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
-  # ★FLEET MEMORY: tell every FUTURE row this (cell, arch) just failed one of
-  # ours. Read e.cell / e.arch BEFORE mark_reroute clears them.
+  _stamp_router_cancel(xid, log)
+  res = route_lib.end_attempt(e, end, policy, now, entries)
   if fleet_log is not None:
-    fleet_log.record(route_lib.fleet_events_for(e, fleet_kind, now), now, log,
-                     f'{e.job_id} (xid={xid})')
-  if record_evict:
-    # ★record_eviction BEFORE mark_reroute: the latter clears e.cell, and the
-    # strike must land on the cell that did the evicting -- that is what makes
-    # the NEXT placement avoid it (evict_penalty in cell_score).
-    route_lib.record_eviction(e, now)
-  route_lib.mark_reroute(e, now, cooldown_s)
-  if warm:
-    # Wire the surviving checkpoint into the SAME (now QUEUED) row so the next
-    # placement resumes warm instead of cold-starting. mark_reroute already
-    # superseded the dead xid into prior_xids and cleared cell/arch/chips.
-    route_lib.apply_warm_restart_in_place(e, ckpt)
-    log.append(f'{ok_reason}; WARM-restart from {ckpt} ({warm_why})')
-  elif route_lib.advance_resume_pointer(e):
-    # Not a warm restart (e.g. a live same-config sibling), but the row already
-    # resumes from somewhere: never let it resume from an OLDER step than the
-    # run is known to have reached.
+    fleet_log.record(res.fleet_events, now, log, f'{e.job_id} (xid={xid})')
+  if res.pointer == 'set':
+    log.append(f'{ok_reason}; WARM-restart from {res.checkpoint} ({res.why})')
+  elif res.pointer == 'advance' and res.pointer_moved:
     log.append(f'{ok_reason}; resume pointer advanced to '
-               f'{e.last_known_checkpoint} ({warm_why})')
+               f'{e.last_known_checkpoint} ({res.why})')
   else:
     log.append(ok_reason)
-  _clear_cns_read_failure(e, dry_run)
-  _archive_rerouted_xid(xid, log)
-  if persist_fn is not None:
-    try:
-      persist_fn()
-    except Exception as exc:  # pylint: disable=broad-except
-      log.append(f'[reroute] inline persist after cancel of {xid} failed (non-fatal): {exc!r}')
+  _archive_after_persist([(e.job_id, xid)], persist_fn, log,
+                         archived_by='reroute')
 
 
 # --- the re-route sweep ---------------------------------------------------
@@ -2728,8 +2609,7 @@ def run_reroute(
     inplace_reroute: bool = True,
     inplace_restart_threshold: int = 3,
     restart_evidence=None,
-    auto_resume_max: int = 3,
-    persist_fn: Optional[Callable[[], None]] = None,
+    persist_fn: Optional[Callable[[], Optional[set]]] = None,
     fleet_log: Optional[FleetLog] = None,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """Cancel SUBMITTED jobs stuck PENDING past the deadline and return them to
@@ -2740,14 +2620,13 @@ def run_reroute(
   job that has meanwhile started RUNNING is promoted; a terminal one is left for
   infra_check to reconcile.
 
-  ★CHECKPOINT PRESERVATION (reconcile/reroute parity): when a cancelled row has
-  a complete checkpoint in its lineage, the requeue resumes WARM from it instead
-  of cold-starting from step 0 -- the same CnsRestartEvidence +
-  plan_pruned_restart + warm-restart machinery run_reconcile uses on the FAILED
-  path, threaded here via `restart_evidence` and shared across all three cancel
-  sites by _reroute_requeue_after_cancel. Default None => an unchanged cold
-  requeue, so every existing test and call site is untouched. `auto_resume_max`
-  is the shared warm-restart budget (same flag as reconcile).
+  ★ONE ATTEMPT-END HANDLER. All three cancel sites (PENDING x2, nominally
+  RUNNING, in-place thrash) end the attempt through _finish_move ->
+  route_lib.end_attempt, the same handler a reconcile death uses: the row is
+  requeued IN PLACE, resuming from the chain's newest checkpoint when one
+  exists (read via `restart_evidence`; None = no CNS read, the row keeps its
+  last KNOWN checkpoint). A move never draws on a resume budget. The dead xid
+  is archived off the board only after persist_fn() has saved the row.
 
   HARDENING (2026-08-24, after xid 282605596 was wrongly re-routed): a single
   PENDING snapshot is NOT enough to cancel -- a BATCH job's EMA shadow work
@@ -2799,6 +2678,7 @@ def run_reroute(
     return entries, log
 
   sub = submitter or Submitter()
+  policy = route_lib.ResumePolicy(cooldown_s=cooldown_s)
   for e in candidates + [r for r in recheck if r not in candidates]:
     if not dry_run and route_lib.global_reroute_brake(hist, time.time()):
       n = len([t for t in hist if t >= time.time() - 3600.0])
@@ -2866,16 +2746,16 @@ def run_reroute(
                    f'-> alive/ambiguous, no action')
         continue
       # Double-confirmed stuck: both probes PENDING and no fresh output.
-      _reroute_requeue_after_cancel(
-          e, xid, now, entries=entries, submitter=sub, dry_run=dry_run,
-          cooldown_s=cooldown_s, hist=hist, history_file=history_file, log=log,
-          restart_evidence=restart_evidence, auto_resume_max=auto_resume_max,
-          record_evict=False,
+      _finish_move(
+          e, xid, now, route_lib.END_PENDING, entries=entries, submitter=sub,
+          dry_run=dry_run, policy=policy, hist=hist,
+          history_file=history_file, log=log,
+          restart_evidence=restart_evidence,
           dry_reason=f'{tag}: PENDING x2, no fresh output',
           ok_reason=(f'[reroute] cancelled + re-queued {tag}; cell|arch cooled '
                      f'{int(route_lib.pair_cooldown_for(e.arch, cooldown_s))}s'),
           fail_prefix=f'[reroute] cancel FAILED for {tag}, left SUBMITTED.',
-          persist_fn=persist_fn, fleet_log=fleet_log, fleet_kind='pending')
+          persist_fn=persist_fn, fleet_log=fleet_log)
     elif state == STATUS_RUNNING:
       # ★XM RUNNING IS NOT "HAS CHIPS", AND PROMOTING ON IT IS A ONE-WAY DOOR.
       # needs_reroute() selects SUBMITTED rows only, so the moment RUNNING is
@@ -2938,12 +2818,11 @@ def run_reroute(
           why = (f'in-place preemption thrash: {rsp} restart(s) on {e.cell} '
                  f'since the last checkpoint '
                  f'(>= {inplace_restart_threshold}), zero durable progress')
-          _reroute_requeue_after_cancel(
-              e, xid, now, entries=entries, submitter=sub, dry_run=dry_run,
-              cooldown_s=cooldown_s, hist=hist, history_file=history_file,
-              log=log, restart_evidence=restart_evidence,
-              auto_resume_max=auto_resume_max,
-              record_evict=True,  # thrash: blame the cell that evicted it
+          _finish_move(
+              e, xid, now, route_lib.END_THRASH, entries=entries,
+              submitter=sub, dry_run=dry_run, policy=policy, hist=hist,
+              history_file=history_file, log=log,
+              restart_evidence=restart_evidence,
               dry_reason=f'{tag}: {why}',
               ok_reason=(f'[reroute] cancelled + re-queued {tag}: {why}; cell|arch '
                          f'cooled '
@@ -2951,7 +2830,7 @@ def run_reroute(
                          f', eviction strike recorded'),
               fail_prefix=(f'[reroute] cancel FAILED for thrashing {tag}, left '
                            f'as-is.'),
-              persist_fn=persist_fn, fleet_log=fleet_log, fleet_kind='thrash')
+              persist_fn=persist_fn, fleet_log=fleet_log)
           continue
       vm_running = borg_probe.has_running_vmgroup(e) if borg_probe else None
       cell_known = bool((e.cell or '').strip())
@@ -3006,18 +2885,18 @@ def run_reroute(
           f'unrecoverable from XM)' if not cell_known
           else f'XM says RUNNING but NO Borg VM group is RUN and nothing was '
                f'ever written ({age}s > {int(grace_s)}s grace)')
-      _reroute_requeue_after_cancel(
-          e, xid, now, entries=entries, submitter=sub, dry_run=dry_run,
-          cooldown_s=cooldown_s, hist=hist, history_file=history_file, log=log,
-          restart_evidence=restart_evidence, auto_resume_max=auto_resume_max,
-          record_evict=False,
+      _finish_move(
+          e, xid, now, route_lib.END_NOMINAL, entries=entries, submitter=sub,
+          dry_run=dry_run, policy=policy, hist=hist,
+          history_file=history_file, log=log,
+          restart_evidence=restart_evidence,
           dry_reason=f'{tag}: {stuck_why}',
           ok_reason=(f'[reroute] cancelled + re-queued {tag}: nominally RUNNING '
                      f'({stuck_why}); cell|arch cooled '
                      f'{int(route_lib.pair_cooldown_for(e.arch, cooldown_s))}s'),
           fail_prefix=(f'[reroute] cancel FAILED for nominally-RUNNING {tag}, '
                        f'left as-is.'),
-          persist_fn=persist_fn, fleet_log=fleet_log, fleet_kind='pending')
+          persist_fn=persist_fn, fleet_log=fleet_log)
     elif state == STATUS_TERMINAL:
       if restart_evidence is not None:
         # Auto-resume is on: the reconcile pass (next round) owns dead rows,
@@ -3077,6 +2956,42 @@ def run_checkpoint_census(
     if route_lib.note_known_checkpoint(e, ckpt, now=now):
       log.append(f'[census] {tag}: last known checkpoint -> {ckpt}')
   return entries, log
+
+
+# --- chain invariant audit (read-only) -------------------------------------
+def read_board_xids(jobs_file: Optional[str] = None) -> Optional[set]:
+  """The xids on the `tpu check` board (~/.tpu_jobs.json keys), or None when
+  it cannot be read. Read-only, no lock (registry_store.read takes a shared
+  lock and retries a half-written file)."""
+  try:
+    path = jobs_file or _registry_files()[0]
+    return {str(k) for k in registry_store.read(path)}
+  except Exception:  # pylint: disable=broad-except
+    return None
+
+
+def run_chain_audit(entries: Sequence[route_lib.QueueEntry],
+                    board_xids: Optional[set]) -> list[str]:
+  """Fix 7's read-only invariant: at most one xid of a router-made chain on
+  the board. Logs `[invariant] chain <job_id> has N xids on the board: ...`
+  per violation; never acts."""
+  if board_xids is None:
+    return ['[invariant] board unreadable; chain audit skipped this pass']
+  return [f'[invariant] chain {jid} has {len(xs)} xids on the board: '
+          f'{", ".join(xs)}'
+          for jid, xs in route_lib.chain_board_violations(entries, board_xids)]
+
+
+def show_chain(entries: Sequence[route_lib.QueueEntry], ref: str) -> list[str]:
+  """`--show_chain=<ref>`: the chain tree of the one row `ref` resolves to
+  (job_id, name, or id suffix; fail-closed on ambiguity). Read-only."""
+  ids, errors = route_lib.resolve_job_refs(entries, [ref])
+  if errors or len(ids) != 1:
+    return [f'[show_chain] {e}' for e in errors] or [
+        f'[show_chain] {ref!r} matched no row']
+  jid = next(iter(ids))
+  row = next(e for e in entries if e.job_id == jid)
+  return route_lib.chain_tree_lines(row)
 
 
 # --- the tick -------------------------------------------------------------
@@ -4086,6 +4001,11 @@ def _view_source_factory(group: str, fleet_file: Optional[str],
 def main(argv):
   del argv
 
+  if _SHOW_CHAIN.value:
+    for line in show_chain(load_queue(_QUEUE_FILE.value), _SHOW_CHAIN.value):
+      print(line)
+    return
+
   if _WORKER.value:
     # SERIAL BUILD-WORKER loop. One build at a time, forever. This is the cure
     # for concurrent-build failures (found[] zombies + CitC token exhaustion).
@@ -4170,12 +4090,19 @@ def main(argv):
             dry_run=_DRY_RUN.value,
             auto_resume_pruned=_AUTO_RESUME_PRUNED.value,
             auto_resume_max=_AUTO_RESUME_MAX.value,
+            hardware_resume_max=_HARDWARE_RESUME_MAX.value,
             restart_evidence=(CnsRestartEvidence()
                               if _AUTO_RESUME_PRUNED.value else None),
             # Fresh per pass: the lookup caches each registry file once.
             cancelled_lookup=make_registry_cancelled_lookup(),
             # The reroute loop is the ONE writer of the fleet log.
-            fleet_log=FleetLog(_FLEET_PAIR_EVENTS_FILE.value))
+            fleet_log=FleetLog(_FLEET_PAIR_EVENTS_FILE.value),
+            # Persist-then-archive: dead parents leave the board only after
+            # this write saved their requeued rows.
+            persist_fn=(
+                (lambda _s=snap, _b=baseline: merge_and_save_touched(
+                    _QUEUE_FILE.value, _s, baseline=_b))
+                if not _DRY_RUN.value else None))
         for line in rc_log:
           print(f'  [reroute-loop:reconcile] {line}', flush=True)
         if not _DRY_RUN.value:
@@ -4204,7 +4131,6 @@ def main(argv):
             # flag so warm-restart is one opt-in choice across both passes.
             restart_evidence=(CnsRestartEvidence()
                               if _AUTO_RESUME_PRUNED.value else None),
-            auto_resume_max=_AUTO_RESUME_MAX.value,
             persist_fn=(
                 (lambda _s=snap, _b=baseline: merge_and_save_touched(
                     _QUEUE_FILE.value, _s, baseline=_b))
@@ -4228,7 +4154,7 @@ def main(argv):
               dry_run=_DRY_RUN.value,
               min_interval_s=_CENSUS_INTERVAL_S.value,
               max_per_pass=_CENSUS_MAX_PER_PASS.value)
-          for line in cs_log:
+          for line in cs_log + run_chain_audit(snap, read_board_xids()):
             print(f'  [reroute-loop:census] {line}', flush=True)
           if not _DRY_RUN.value:
             merge_and_save_touched(_QUEUE_FILE.value, cs_entries,
@@ -4248,16 +4174,25 @@ def main(argv):
   entries = load_queue(_QUEUE_FILE.value)
   baseline = {e.job_id: e.to_dict() for e in entries}
 
+  # A one-shot pass persists through the same merge-write the final save
+  # uses; the archive of a dead xid follows that write (persist-then-archive).
+  persist = ((lambda: merge_and_save_touched(_QUEUE_FILE.value, entries,
+                                             baseline=baseline))
+             if not _DRY_RUN.value else None)
   if _RECONCILE.value:
     # One-shot XM-truth reconcile pass (Step2). Clean zombies off the route path.
+    # (The npu reconcile loop runs exactly this, without --auto_resume_pruned:
+    # a death then goes FAILED with no requeue and no archive, as before.)
     updated, log = run_reconcile(
         entries, now=time.time(), probe=XManagerStatusProbe(),
         dry_run=_DRY_RUN.value,
         auto_resume_pruned=_AUTO_RESUME_PRUNED.value,
         auto_resume_max=_AUTO_RESUME_MAX.value,
+        hardware_resume_max=_HARDWARE_RESUME_MAX.value,
         restart_evidence=(CnsRestartEvidence()
                           if _AUTO_RESUME_PRUNED.value else None),
-        cancelled_lookup=make_registry_cancelled_lookup())
+        cancelled_lookup=make_registry_cancelled_lookup(),
+        persist_fn=persist)
   elif _REROUTE.value:
     # Sweep SUBMITTED jobs stuck PENDING; cancel + return to QUEUED.
     updated, log = run_reroute(
@@ -4274,7 +4209,7 @@ def main(argv):
         inplace_restart_threshold=_INPLACE_RESTART_THRESHOLD.value,
         restart_evidence=(CnsRestartEvidence()
                           if _AUTO_RESUME_PRUNED.value else None),
-        auto_resume_max=_AUTO_RESUME_MAX.value)
+        persist_fn=persist)
   else:
     # Drain QUEUED jobs into the XM queue, trying groups IN PREFERENCE ORDER.
     # `--group_order=5,9` places what the free vqfree pool (g5) can take first

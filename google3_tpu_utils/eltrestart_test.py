@@ -2,8 +2,8 @@ r"""Negative-controlled proof that auto warm-restart picks the RIGHT resume
 mechanism per checkpoint layout -- restart_from+restart_step for ELT, load_from
 for everyone else.
 
-★WHY THIS TEST EXISTS. route_lib.build_warm_restart_entry is the live
-translation point (route_check.run_reconcile calls it once plan_pruned_restart
+★WHY THIS TEST EXISTS. route_lib.requeue_in_place (via end_attempt) is the live
+translation point (route_check.run_reconcile calls it once decide_end
 returns RESUME_WARM) that turns a surviving checkpoint into a new queue row's
 launch_kwargs. ELT/EqR-jax training MUST resume via restart_from(=workdir)+
 restart_step(=N); handed $LOAD_FROM instead, main_eqr does `workdir = LOAD_FROM`
@@ -47,6 +47,13 @@ def _dead(**lk):
       xid="288109183", auto_resumes=0)
 
 
+def _warm(dead, ckpt, _unused_job_id=None):
+  """The in-place warm restart (Fix 8): the SAME row, requeued with the
+  layout-correct resume pointer. Returns the row for the checks below."""
+  R.requeue_in_place(dead, R.RESUME_WARM, ckpt)
+  return dead
+
+
 def check_inverse_parser():
   """_elt_restart_from_checkpoint recognises ONLY the ELT bare-int leaf."""
   assert R._elt_restart_from_checkpoint(_ELT_LEAF) == (_ELT_WORKDIR, 456000)
@@ -59,7 +66,7 @@ def check_inverse_parser():
 
 def check_elt_training_gets_restart_from():
   """ELT leaf -> restart_from+restart_step, and any stale load_from is dropped."""
-  new = R.build_warm_restart_entry(
+  new = _warm(
       _dead(config="prod_train_persite2_dw1", exp_name="elt_unroll_dw1",
             load_from="STALE_MUST_BE_DROPPED"),
       _ELT_LEAF, "v7-32-new")
@@ -72,7 +79,7 @@ def check_elt_training_gets_restart_from():
 
 def check_non_elt_gets_load_from():
   """A torch leaf -> load_from; any stale restart_* is dropped."""
-  new = R.build_warm_restart_entry(
+  new = _warm(
       _dead(config="configs/unroll_right.yml", exp_name="parcae",
             restart_from="STALE", restart_step="9"),
       _TORCH_LEAF, "h100-new")
@@ -88,7 +95,7 @@ def check_mutual_exclusion_invariant():
   Prove neither branch can ever emit both, across both layouts.
   """
   for ckpt in (_ELT_LEAF, _TORCH_LEAF, _PALI_LEAF):
-    lk = R.build_warm_restart_entry(_dead(config="prod_train"), ckpt, "j").launch_kwargs
+    lk = _warm(_dead(config="prod_train"), ckpt, "j").launch_kwargs
     both = ("load_from" in lk) and ("restart_from" in lk or "restart_step" in lk)
     assert not both, (ckpt, lk)
   print("  [4] mutual exclusion: never load_from AND restart_* together          OK")
@@ -98,13 +105,14 @@ def check_common_fields_preserved():
   """The restart is the SAME run: config/exp_name/workdir/prior_xids/budget."""
   dead = _dead(config="prod_train_8n4l_persite4_dw1", exp_name="elt_x")
   dead.workdir = "/some/checkout"
-  new = R.build_warm_restart_entry(dead, _ELT_LEAF, "v7-32-new")
+  new = _warm(dead, _ELT_LEAF, "v7-32-new")
   assert new.launch_kwargs.get("config") == "prod_train_8n4l_persite4_dw1"
   assert new.workdir == "/some/checkout"
   assert new.auto_resumes == 1                     # budget incremented
-  assert "288109183" in new.prior_xids             # dead xid recorded
+  assert "288109183" in new.prior_xids             # dead xid kept in history
+  assert new.job_id == "v7-32-dead"                # SAME row (in place)
   assert new.state == R.JobState.QUEUED
-  print("  [5] clone preserves config/workdir, bumps budget, records prior xid   OK")
+  print("  [5] in place keeps config/workdir/job_id, bumps budget, keeps xid     OK")
 
 
 def check_negative_control_parser_not_constant():
@@ -152,12 +160,12 @@ def check_elt_checkpoint_leaf_step():
 def check_evidence_to_restart_roundtrip():
   """★The closed loop: the leaf the evidence layer returns is exactly what the
   restart builder inverts. _latest_complete_checkpoint hands back
-  `<out_dir>/checkpoints/<N>`; feeding THAT into build_warm_restart_entry must
+  `<out_dir>/checkpoints/<N>`; feeding THAT into requeue_in_place must
   yield restart_from=<out_dir> + restart_step=N. If these two ever drift apart,
   ELT auto-resume silently falls back to load_from -- the original bug.
   """
   leaf = _ELT_WORKDIR + "/checkpoints/461000"
-  lk = R.build_warm_restart_entry(
+  lk = _warm(
       _dead(config="prod_train", exp_name="elt_x"), leaf, "v7-32-new").launch_kwargs
   assert lk.get("restart_from") == _ELT_WORKDIR, lk
   assert lk.get("restart_step") == "461000", lk

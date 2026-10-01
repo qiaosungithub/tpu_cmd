@@ -12,6 +12,7 @@ from unittest import mock
 
 from google3.experimental.users.qiaos.tpu_utils import avail_provider as AP
 from google3.experimental.users.qiaos.tpu_utils import route_check as RC
+from google3.experimental.users.qiaos.tpu_utils import registry_store
 from google3.experimental.users.qiaos.tpu_utils import route_lib as R
 
 
@@ -1792,14 +1793,12 @@ class RunReconcileTest(unittest.TestCase):
         auto_resume_pruned=True, restart_evidence=self._evidence(),
         cancelled_lookup=lookup)
     self.assertEqual(lookup.calls, ['901'])
-    self.assertEqual(e.state, R.JobState.FAILED)
-    self.assertEqual(_cur_sub(e).state, 'FAILED')
+    self.assertEqual(e.state, R.JobState.QUEUED)          # requeued in place
+    self.assertEqual(_cur_sub(e).state, 'SUPERSEDED')
     self.assertIn('zombie', e.last_reason)
-    new = [x for x in out if x.state == R.JobState.QUEUED]
-    self.assertEqual(len(new), 1)
-    self.assertEqual(new[0].launch_kwargs['load_from'],
-                     '/cns/x/steps/step_1024.pt')
-    self.assertTrue(any('warm-restart queued' in l for l in log))
+    self.assertEqual(len(out), 1)
+    self.assertEqual(e.launch_kwargs['load_from'], '/cns/x/steps/step_1024.pt')
+    self.assertTrue(any('warm-restart queued in place' in l for l in log))
     self.assertFalse(any('-> CANCELLED' in l for l in log))
 
   def test_lookup_raising_falls_back_to_old_path(self):
@@ -1811,10 +1810,9 @@ class RunReconcileTest(unittest.TestCase):
         [e], now=100.0, probe=probe, dry_run=False,
         auto_resume_pruned=True, restart_evidence=self._evidence(),
         cancelled_lookup=boom)
-    self.assertEqual(e.state, R.JobState.FAILED)
-    self.assertEqual(_cur_sub(e).state, 'FAILED')
+    self.assertEqual(e.state, R.JobState.QUEUED)          # death path ran
     self.assertIn('zombie', e.last_reason)
-    self.assertEqual(len([x for x in out if x.state == R.JobState.QUEUED]), 1)
+    self.assertEqual(len(out), 1)
     self.assertTrue(any('registry cancel lookup failed' in l for l in log))
 
   def test_lookup_non_string_answer_is_not_cancelled(self):
@@ -1887,7 +1885,8 @@ class RunReconcileTest(unittest.TestCase):
     self.assertNotIn('cancelled', summary)
     self.assertEqual(a.to_dict(), b.to_dict())
     self.assertEqual(len(out_a), len(out_b))
-    self.assertEqual(len(out_a), 2)                      # zombie + warm restart
+    self.assertEqual(len(out_a), 1)              # requeued in place (Fix 8)
+    self.assertEqual(a.state, R.JobState.QUEUED)
 
 
 class RunReconcileColdRerunTest(unittest.TestCase):
@@ -1902,9 +1901,6 @@ class RunReconcileColdRerunTest(unittest.TestCase):
     # OFF). The negative controls below then prove the guards hold EVEN WITH the
     # switch on -- not merely because the switch is off.
     super().setUp()
-    p = mock.patch.object(RC, '_ALLOW_COLD_RERUN', True)
-    p.start()
-    self.addCleanup(p.stop)
 
   def _dead_preempted(self, job_id='c1', xid='111'):
     e = _submitted(job_id, xid, 'yulpptr', submitted_at=0.0,
@@ -1924,13 +1920,15 @@ class RunReconcileColdRerunTest(unittest.TestCase):
     out, log = RC.run_reconcile(entries, now=100.0, probe=probe, dry_run=False,
                                 auto_resume_pruned=True, restart_evidence=ev,
                                 auto_resume_max=3)
-    self.assertEqual(e.state, R.JobState.FAILED)          # dead row cleaned up
-    new = [x for x in out if x.state == R.JobState.QUEUED]
-    self.assertEqual(len(new), 1)                          # one cold rerun queued
-    self.assertEqual(new[0].auto_resumes, 1)
-    self.assertNotIn('load_from', new[0].launch_kwargs)    # COLD: no resume ptr
-    self.assertIn('111', new[0].prior_xids)
-    self.assertTrue(any('COLD rerun queued' in l for l in log))
+    # Fix 8: the SAME row is requeued in place (no second row).
+    self.assertEqual(len(out), 1)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.job_id, 'c1')
+    self.assertEqual(e.auto_resumes, 1)
+    self.assertNotIn('load_from', e.launch_kwargs)         # COLD: no resume ptr
+    self.assertIn('111', e.prior_xids)
+    self.assertEqual(e.submissions[-1].outcome, 'preempted')
+    self.assertTrue(any('COLD rerun queued in place' in l for l in log))
 
   def test_affinity_group_in_use_untrained_cold_reruns(self):
     # Regression (2026-09-22): reconcile_entry used to overwrite e.last_reason
@@ -1956,10 +1954,9 @@ class RunReconcileColdRerunTest(unittest.TestCase):
     out, log = RC.run_reconcile(entries, now=100.0, probe=probe, dry_run=False,
                                 auto_resume_pruned=True, restart_evidence=ev,
                                 auto_resume_max=3)
-    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(e.state, R.JobState.QUEUED)            # cold, in place
     self.assertIn('AFFINITY_GROUP_IN_USE', e.last_reason)
-    new = [x for x in out if x.state == R.JobState.QUEUED]
-    self.assertEqual(len(new), 1)
+    self.assertEqual(len(out), 1)
 
   def test_never_trained_no_cause_holds(self):
     # NEGATIVE CONTROL: crashed on startup (no training, no preempt cause) ->
@@ -2013,11 +2010,10 @@ class RunReconcileColdRerunTest(unittest.TestCase):
     out, log = RC.run_reconcile(entries, now=100.0, probe=probe, dry_run=False,
                                auto_resume_pruned=True, restart_evidence=ev,
                                auto_resume_max=3)
-    new = [x for x in out if x.state == R.JobState.QUEUED]
-    self.assertEqual(len(new), 1)
-    self.assertEqual(new[0].launch_kwargs['load_from'],
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['load_from'],
                      '/cns/x/steps/step_1024.pt')  # WARM, not cold
-    self.assertTrue(any('warm-restart queued' in l for l in log))
+    self.assertTrue(any('warm-restart queued in place' in l for l in log))
 
 
 class _HwEvidence:
@@ -2044,9 +2040,6 @@ class ReconcileHardwareFaultTest(unittest.TestCase):
 
   def setUp(self):
     super().setUp()
-    p = mock.patch.object(RC, '_ALLOW_COLD_RERUN', True)
-    p.start()
-    self.addCleanup(p.stop)
 
   def _dead(self, job_id, xid):
     e = _submitted(job_id, xid, 'ga', submitted_at=0.0,
@@ -2069,13 +2062,13 @@ class ReconcileHardwareFaultTest(unittest.TestCase):
     ev = _HwEvidence({'901': (None, None, False)},
                      {'901': 'NVLink P2P disabled (bad GPU host): GPUs 6<->0'})
     out, log = self._run(e, ev)
-    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(len(out), 1)
+    self.assertEqual(e.state, R.JobState.QUEUED)            # cold, in place
     self.assertIn('HARDWARE', e.last_reason)
     self.assertNotIn('CODE BUG', e.last_reason)
-    new = [x for x in out if x.state == R.JobState.QUEUED]
-    self.assertEqual(len(new), 1)
-    self.assertNotIn('load_from', new[0].launch_kwargs)
-    self.assertTrue(R.pair_is_cooling(new[0], 'ga', 'h100', now=101.0))
+    self.assertNotIn('load_from', e.launch_kwargs)
+    self.assertEqual((e.hardware_resumes, e.auto_resumes), (1, 0))
+    self.assertTrue(R.pair_is_cooling(e, 'ga', 'h100', now=101.0))
     self.assertTrue(any('steered off ga|h100' in l for l in log))
 
   def test_hw_fault_with_ckpt_warm_restarts_off_bad_pair(self):
@@ -2083,11 +2076,30 @@ class ReconcileHardwareFaultTest(unittest.TestCase):
     ev = _HwEvidence({'902': (None, '/cns/x/steps/step_1000.pt', True)},
                      {'902': 'NVLink P2P disabled (bad GPU host)'})
     out, log = self._run(e, ev)
-    new = [x for x in out if x.state == R.JobState.QUEUED]
-    self.assertEqual(len(new), 1)
-    self.assertEqual(new[0].launch_kwargs['load_from'],
-                     '/cns/x/steps/step_1000.pt')
-    self.assertTrue(R.pair_is_cooling(new[0], 'ga', 'h100', now=101.0))
+    self.assertEqual(len(out), 1)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['load_from'], '/cns/x/steps/step_1000.pt')
+    self.assertTrue(R.pair_is_cooling(e, 'ga', 'h100', now=101.0))
+
+  def test_fix6_hardware_death_past_the_auto_budget_still_resumes(self):
+    # xid 294889693: auto_resumes 3/3 (preemptions), then an NVLink fault.
+    e = self._dead('h5', '905')
+    e.auto_resumes = 3
+    ev = _HwEvidence({'905': (None, '/cns/x/steps/step_1000.pt', True)},
+                     {'905': 'NVLink P2P disabled (bad GPU host)'})
+    _, log = self._run(e, ev)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual((e.hardware_resumes, e.auto_resumes), (1, 3))
+    self.assertTrue(any('hardware_resumes 1/3' in l for l in log))
+    # At the hardware cap it HOLDs (FAILED, left for a human).
+    e2 = self._dead('h6', '906')
+    e2.hardware_resumes = 3
+    ev2 = _HwEvidence({'906': (None, '/cns/x/steps/step_1000.pt', True)},
+                      {'906': 'NVLink P2P disabled (bad GPU host)'})
+    _, log2 = self._run(e2, ev2)
+    self.assertEqual(e2.state, R.JobState.FAILED)
+    self.assertTrue(any('hardware-resume budget spent (3/3)' in l
+                        for l in log2))
 
   def test_same_death_without_hw_signal_still_holds(self):
     # NEGATIVE CONTROL: identical row, never trained, no checkpoint, and NO
@@ -2553,7 +2565,7 @@ class ArchiveFinishedQueueRowsTest(unittest.TestCase):
 
 
 class ArchiveReroutedXidTest(unittest.TestCase):
-  """_archive_rerouted_xid: move a just-cancelled reroute XID off the registry
+  """_archive_board_xid: move a just-cancelled reroute XID off the registry
   board into the legacy archive. Negative controls come first -- it must NEVER
   raise into the loop, and must touch ONLY the named XID's registry row."""
 
@@ -2602,7 +2614,7 @@ class ArchiveReroutedXidTest(unittest.TestCase):
     self._write_jobs({'111': {'exp_name': 'foo', 'bucket_cp_path': '/cns/x'},
                       '222': {'exp_name': 'bar'}})
     log = []
-    RC._archive_rerouted_xid('111', log)
+    RC._archive_board_xid('111', log)
     self.assertNotIn('111', self._read_jobs())            # gone from the board
     self.assertIn('222', self._read_jobs())               # sibling untouched
     leg = self._read_legacy()
@@ -2616,41 +2628,41 @@ class ArchiveReroutedXidTest(unittest.TestCase):
     os.environ['TPU_REROUTE_NO_ARCHIVE'] = '1'
     self._write_jobs({'111': {'exp_name': 'foo'}})
     log = []
-    RC._archive_rerouted_xid('111', log)
+    RC._archive_board_xid('111', log)
     self.assertIn('111', self._read_jobs())               # still on the board
     self.assertEqual(self._read_legacy(), {})
 
   def test_absent_xid_is_idempotent_noop(self):
     self._write_jobs({'222': {'exp_name': 'bar'}})
     log = []
-    RC._archive_rerouted_xid('111', log)                  # 111 never on board
+    RC._archive_board_xid('111', log)                  # 111 never on board
     self.assertEqual(self._read_jobs(), {'222': {'exp_name': 'bar'}})
     self.assertEqual(self._read_legacy(), {})
 
   def test_double_archive_is_idempotent(self):
     self._write_jobs({'111': {'exp_name': 'foo'}})
-    RC._archive_rerouted_xid('111', [])
-    RC._archive_rerouted_xid('111', [])                   # second call: no-op, no raise
+    RC._archive_board_xid('111', [])
+    RC._archive_board_xid('111', [])                   # second call: no-op, no raise
     self.assertNotIn('111', self._read_jobs())
     self.assertIn('111', self._read_legacy())
 
   def test_missing_registry_file_is_failsafe(self):
     os.unlink(self.jobs)                                  # no registry at all
     log = []
-    RC._archive_rerouted_xid('111', log)                 # must not raise
+    RC._archive_board_xid('111', log)                 # must not raise
     self.assertFalse(os.path.exists(self.jobs))
 
   def test_empty_xid_is_a_noop(self):
     self._write_jobs({'111': {'exp_name': 'foo'}})
-    RC._archive_rerouted_xid('', [])
-    RC._archive_rerouted_xid(None, [])
+    RC._archive_board_xid('', [])
+    RC._archive_board_xid(None, [])
     self.assertIn('111', self._read_jobs())
 
   def test_corrupt_registry_is_failsafe(self):
     with open(self.jobs, 'w') as f:
       f.write('{ this is not valid json')
     log = []
-    RC._archive_rerouted_xid('111', log)                 # must not raise
+    RC._archive_board_xid('111', log)                 # must not raise
     # a half-written registry is left for the daemon, never partially rewritten
 
   def test_reroute_end_to_end_leaves_no_board_shell(self):
@@ -2659,13 +2671,43 @@ class ArchiveReroutedXidTest(unittest.TestCase):
     e = _submitted('j1', '111', 'yulpptr', submitted_at=0.0)
     probe = _FakeProbe({'111': RC.STATUS_PENDING})
     sub = _FakeSubmitter()
+    saved = []
     RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
                    reroute_after_s=600.0, cooldown_s=1800.0, dry_run=False,
-                   sleep_fn=lambda _: None)
+                   sleep_fn=lambda _: None,
+                   persist_fn=lambda: saved.append(e.state) or None)
     self.assertEqual(sub.cancels, ['111'])               # it did cancel
     self.assertEqual(e.state, R.JobState.QUEUED)         # and re-queue
+    self.assertEqual(saved, [R.JobState.QUEUED])         # persisted first
     self.assertNotIn('111', self._read_jobs())           # AND archive the shell
     self.assertIn('111', self._read_legacy())
+
+  def test_reroute_archives_only_after_a_committed_persist(self):
+    # Persist-then-archive (operator decision 4): no persist hook, a failing
+    # write, or a write that did not commit this row -> the xid stays.
+    for persist in (None, mock.Mock(side_effect=OSError('disk full')),
+                    mock.Mock(return_value=set())):
+      self._write_jobs({'111': {'exp_name': 'j1', 'status': 'SUBMITTED'}})
+      e = _submitted('j1', '111', 'yulpptr', submitted_at=0.0)
+      sub = _FakeSubmitter()
+      _, log = RC.run_reroute(
+          [e], now=700.0, probe=_FakeProbe({'111': RC.STATUS_PENDING}),
+          submitter=sub, reroute_after_s=600.0, dry_run=False,
+          sleep_fn=lambda _: None, persist_fn=persist)
+      self.assertEqual(sub.cancels, ['111'])
+      self.assertIn('111', self._read_jobs(), persist)   # still on the board
+      self.assertTrue(any('left on the board' in l for l in log), log)
+      # ...and the router's own cancel is stamped, so reconcile never reads
+      # it as a human `tpu cancel` (which would retire the job unresumed).
+      self.assertEqual(self._read_jobs()['111'].get('cancelled_by'), 'reroute')
+    # Negative control: a write that committed j1 -> archived.
+    self._write_jobs({'111': {'exp_name': 'j1', 'status': 'SUBMITTED'}})
+    e = _submitted('j1', '111', 'yulpptr', submitted_at=0.0)
+    RC.run_reroute([e], now=700.0, probe=_FakeProbe({'111': RC.STATUS_PENDING}),
+                   submitter=_FakeSubmitter(), reroute_after_s=600.0,
+                   dry_run=False, sleep_fn=lambda _: None,
+                   persist_fn=lambda: {'j1'})
+    self.assertNotIn('111', self._read_jobs())
 
   def test_dry_run_reroute_archives_nothing(self):
     self._write_jobs({'111': {'exp_name': 'j1', 'status': 'SUBMITTED'}})
@@ -2784,6 +2826,21 @@ class RegistryCancelledLookupTest(unittest.TestCase):
     self._write(self.legacy, {'1': {'status': 'CANCELLED',
                                     'archived_by': 'reroute'}})
     self.assertIsNone(self._mk()('1'))
+
+  def test_router_cancels_are_never_user_cancels(self):
+    # A dead parent the auto-resume archived, and a reroute cancel stamped
+    # cancelled_by=reroute but NOT archived (its queue write was lost).
+    self._write(self.jobs, {'2': {'status': 'CANCELLED', 'cancelled_at': 't',
+                                  'cancelled_by': 'reroute'}})
+    self._write(self.legacy, {'1': {'status': 'FAILED',
+                                    'cancelled_at': 't',
+                                    'archived_by': 'auto-resume'}})
+    lookup = self._mk()
+    self.assertIsNone(lookup('1'))
+    self.assertIsNone(lookup('2'))
+    # Negative control: the same row without the router's marker IS a cancel.
+    self._write(self.jobs, {'2': {'status': 'CANCELLED', 'cancelled_at': 't'}})
+    self.assertEqual(self._mk()('2'), 't')
 
   def test_missing_and_corrupt_files_fail_safe(self):
     os.unlink(self.jobs)
@@ -2915,7 +2972,7 @@ class RerouteWarmRestartTest(unittest.TestCase):
         cooldown_s=1800.0, dry_run=dry_run,
         output_probe=_FakeOutputProbe({'111': None}), confirm_gap_s=15.0,
         sleep_fn=self._no_sleep, history_file=self._hist,
-        restart_evidence=evidence, auto_resume_max=3)
+        restart_evidence=evidence)
     return e, sub, log
 
   # ---- site (a): in-place preemption thrash ----
@@ -2930,7 +2987,7 @@ class RerouteWarmRestartTest(unittest.TestCase):
         restart_probe=_FakeRestartProbe({'111': 5}), inplace_reroute=True,
         inplace_restart_threshold=3, nominal_running_grace_s=3600.0,
         history_file=self._hist, sleep_fn=self._no_sleep,
-        restart_evidence=evidence, auto_resume_max=3)
+        restart_evidence=evidence)
     return e, sub, log
 
   # ---- site (c): nominally RUNNING (XM RUNNING, no Borg RUN, nothing written) ----
@@ -2944,8 +3001,7 @@ class RerouteWarmRestartTest(unittest.TestCase):
         cooldown_s=1800.0, dry_run=dry_run,
         output_probe=_FakeOutputProbe({'111': None}), sleep_fn=self._no_sleep,
         history_file=self._hist, borg_probe=_FakeBorgProbe(False),
-        nominal_running_grace_s=3600.0, restart_evidence=evidence,
-        auto_resume_max=3)
+        nominal_running_grace_s=3600.0, restart_evidence=evidence)
     return e, sub, log
 
   # ===== THE NEGATIVE-CONTROL FLIP (prove the test can fail) =====
@@ -2971,7 +3027,7 @@ class RerouteWarmRestartTest(unittest.TestCase):
     self.assertEqual(e.state, R.JobState.QUEUED)         # still re-queued
     self.assertIsNone(e.xid)                             # dead xid superseded
     self.assertEqual(e.launch_kwargs['load_from'], self._TORCH_CKPT)
-    self.assertEqual(e.auto_resumes, 1)                 # budget consumed
+    self.assertEqual(e.auto_resumes, 0)        # a move never draws the budget
     self.assertGreater(e.cooldown_pairs.get('yutulpz|v7', {}).get('until', 0), 700.0)  # cell cooled
 
   def test_pending_no_checkpoint_cold_starts(self):
@@ -3080,15 +3136,14 @@ class RerouteWarmRestartTest(unittest.TestCase):
     self.assertFalse(any('WARM-restart' in l for l in log))
 
   def test_reroute_past_auto_resume_max_still_preserves_checkpoint(self):
-    # Regression (2026-09-21 elt_sitxl2): unlike run_reconcile (where HOLD stops
-    # a dead row from respawning), a reroute ALWAYS re-queues the row via
-    # mark_reroute(e). Refusing to wire the surviving checkpoint when
-    # auto_resumes >= auto_resume_max rolled the job back to an older step!
+    # Regression (2026-09-21 elt_sitxl2): a reroute ALWAYS re-queues the row,
+    # so a spent budget must never stop it carrying its newest checkpoint.
+    # Operator decision 1 (2026-10-01): a move does not draw the budget at all.
     e, sub, log = self._run_pending(
         _FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}), auto_resumes=3)
     self.assertEqual(e.state, R.JobState.QUEUED)         # re-routed
     self.assertEqual(e.launch_kwargs.get('load_from'), self._TORCH_CKPT)
-    self.assertEqual(e.auto_resumes, 4)
+    self.assertEqual(e.auto_resumes, 3)
     self.assertTrue(any('WARM-restart' in l for l in log))
 
   def test_live_config_sibling_holds_cold_start(self):
@@ -3105,8 +3160,7 @@ class RerouteWarmRestartTest(unittest.TestCase):
         cooldown_s=1800.0, dry_run=False,
         output_probe=_FakeOutputProbe({'111': None}), confirm_gap_s=15.0,
         sleep_fn=self._no_sleep, history_file=self._hist,
-        restart_evidence=_FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}),
-        auto_resume_max=3)
+        restart_evidence=_FakeRestartEvidence({'111': (None, self._TORCH_CKPT)}))
     self.assertEqual(sub.cancels, ['111'])              # e still re-routed
     self.assertEqual(e.state, R.JobState.QUEUED)
     self.assertNotIn('load_from', e.launch_kwargs)      # but cold: sibling live
@@ -3889,7 +3943,7 @@ class RerouteCnsReadFailureTest(_IsolatedRegistryTest):
         submitter=sub, reroute_after_s=600.0, cooldown_s=1800.0, dry_run=False,
         output_probe=output, sleep_fn=lambda _: None, history_file=self._hist,
         borg_probe=_FakeBorgProbe(False), nominal_running_grace_s=3600.0,
-        restart_evidence=evidence, auto_resume_max=3)
+        restart_evidence=evidence)
     return sub, log
 
   def _row(self, **lk):
@@ -4002,9 +4056,6 @@ class ReconcileCnsReadFailureTest(unittest.TestCase):
 
   def setUp(self):
     super().setUp()
-    p = mock.patch.object(RC, '_ALLOW_COLD_RERUN', True)
-    p.start()
-    self.addCleanup(p.stop)
 
   def _dead(self, **lk):
     e = _running('d1', '111', 'sj', submitted_at=0.0,
@@ -4030,12 +4081,10 @@ class ReconcileCnsReadFailureTest(unittest.TestCase):
       self.assertEqual(e.cns_read_failures, n)
       self.assertIn('preempted', e.last_reason)        # cause kept for later
     entries, log = self._pass(entries, ev)
-    self.assertEqual(e.state, R.JobState.FAILED)
-    new = [x for x in entries if x.state == R.JobState.QUEUED]
-    self.assertEqual(len(new), 1)
-    self.assertEqual(new[0].launch_kwargs['load_from'],
-                     '/cns/y/steps/step_41500.pt')
-    self.assertEqual(new[0].last_known_checkpoint, '/cns/y/steps/step_41500.pt')
+    self.assertEqual(len(entries), 1)                  # in place, no new row
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['load_from'], '/cns/y/steps/step_41500.pt')
+    self.assertEqual(e.last_known_checkpoint, '/cns/y/steps/step_41500.pt')
 
   def test_third_failure_with_nothing_known_holds_not_cold(self):
     # trained + preemption cause would earn a COLD rerun on a read that worked;
@@ -4052,8 +4101,8 @@ class ReconcileCnsReadFailureTest(unittest.TestCase):
     # Negative control: the SAME evidence with a working read -> COLD rerun.
     e2 = self._dead()
     out, _ = self._pass([e2], _TriEvidence({'111': [(None, None, True, '')]}))
-    self.assertEqual(e2.state, R.JobState.FAILED)
-    self.assertEqual(len([x for x in out if x.state == R.JobState.QUEUED]), 1)
+    self.assertEqual(e2.state, R.JobState.QUEUED)       # cold, in place
+    self.assertEqual(len(out), 1)
 
   def test_failed_read_ignores_a_stale_start_pointer(self):
     # Started from step_40000, reached who-knows-where, dir unreadable, never
@@ -4075,9 +4124,8 @@ class ReconcileCnsReadFailureTest(unittest.TestCase):
     entries, _ = self._pass(entries, ev)
     self.assertEqual(e.cns_read_failures, 0)
     self.assertEqual(e.last_known_checkpoint, '/cns/y/steps/step_42000.pt')
-    new = [x for x in entries if x.state == R.JobState.QUEUED]
-    self.assertEqual(new[0].launch_kwargs['load_from'],
-                     '/cns/y/steps/step_42000.pt')
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['load_from'], '/cns/y/steps/step_42000.pt')
 
   def test_dry_run_defers_without_counting(self):
     e = self._dead()
@@ -4405,6 +4453,147 @@ class FleetEventWriteTest(unittest.TestCase):
   def test_non_hardware_death_records_nothing(self):
     self._reconcile(self._hw_dead(auto_resumes=0), hw=False)
     self.assertFalse(os.path.exists(self.ev))
+
+
+class ReconcileChainTest(_IsolatedRegistryTest):
+  """C3 through run_reconcile: one row per job, the dead parent archived off
+  the board only AFTER the requeued row was persisted (Fixes 7 + 8), and the
+  npu loop's auto-resume-OFF reconcile unchanged (NPU constraint a)."""
+
+  _CKPT = '/cns/x/steps/step_1024.pt'
+
+  def _dead(self, job_id='d1', xid='111'):
+    e = _running(job_id, xid, 'sj', submitted_at=0.0,
+                 launch_kwargs={'config': f'cfg-{job_id}', 'exp_name': 'etd'})
+    e.last_reason = 'guarantee reclaim: preempted out of sj'
+    return e
+
+  def _board(self, *xids):
+    with open(self._jobs, 'w') as f:
+      json.dump({x: {'exp_name': 'etd', 'status': 'FAILED'} for x in xids}, f)
+
+  def _on_board(self):
+    with open(self._jobs) as f:
+      return set(json.load(f))
+
+  def _pass(self, entries, ev, persist_fn, auto=True):
+    return RC.run_reconcile(
+        entries, now=100.0,
+        probe=_FakeProbe({e.xid: RC.STATUS_TERMINAL for e in entries}),
+        dry_run=False, auto_resume_pruned=auto,
+        restart_evidence=ev if auto else None, persist_fn=persist_fn)
+
+  def test_warm_and_cold_archive_the_parent_after_persist(self):
+    self._board('111', '222')
+    warm, cold = self._dead('w', '111'), self._dead('c', '222')
+    ev = _TriEvidence({'111': [(None, self._CKPT, True, '')],
+                       '222': [(None, None, True, '')]})
+    seen = []
+
+    def persist():
+      seen.append((warm.state, cold.state, self._on_board()))
+      return {'w', 'c'}
+
+    out, log = self._pass([warm, cold], ev, persist)
+    self.assertEqual(len(out), 2)                          # no new rows
+    self.assertEqual((warm.state, cold.state),
+                     (R.JobState.QUEUED, R.JobState.QUEUED))
+    # The write saw both rows requeued while both xids were STILL on the board.
+    self.assertEqual(seen, [(R.JobState.QUEUED, R.JobState.QUEUED,
+                             {'111', '222'})])
+    self.assertEqual(self._on_board(), set())             # then archived
+    self.assertTrue(any('[auto-resume] archived dead parent xid 111 off the '
+                        'board' in l for l in log))
+    with open(self._legacy) as f:
+      self.assertEqual(json.load(f)['111']['archived_by'], 'auto-resume')
+
+  def test_hold_is_not_archived(self):
+    self._board('111')
+    e = self._dead()
+    ev = _TriEvidence({'111': [('CODE BUG: segfault (SIGSEGV)', self._CKPT,
+                                True, '')]})
+    persist = mock.Mock(return_value={'d1'})
+    _, log = self._pass([e], ev, persist)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(self._on_board(), {'111'})           # stays for a human
+    persist.assert_not_called()
+    self.assertTrue(any('HOLD' in l for l in log))
+
+  def test_uncommitted_or_failed_write_leaves_the_parent(self):
+    for persist in (None, mock.Mock(return_value=set()),
+                    mock.Mock(side_effect=OSError('x'))):
+      self._board('111')
+      e = self._dead()
+      _, log = self._pass([e], _TriEvidence({'111': [(None, self._CKPT, True,
+                                                      '')]}), persist)
+      self.assertEqual(e.state, R.JobState.QUEUED)
+      self.assertEqual(self._on_board(), {'111'}, persist)
+      self.assertTrue(any('left on the board' in l for l in log))
+
+  def test_kill_switch(self):
+    os.environ['TPU_REROUTE_NO_ARCHIVE'] = '1'
+    self._board('111')
+    e = self._dead()
+    self._pass([e], _TriEvidence({'111': [(None, self._CKPT, True, '')]}),
+               lambda: {'d1'})
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(self._on_board(), {'111'})
+
+  def test_npu_auto_resume_off_is_exactly_as_before(self):
+    # NPU constraint (a): the npu loop runs `--reconcile` WITHOUT
+    # --auto_resume_pruned. A dead row goes FAILED: no requeue, no archive,
+    # no budget, no evidence read, no new row.
+    self._board('111')
+    e = self._dead()
+    persist = mock.Mock(return_value={'d1'})
+    out, log = self._pass([e], None, persist, auto=False)
+    self.assertEqual(len(out), 1)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(e.submissions[-1].state, 'FAILED')
+    self.assertEqual(e.xid, '111')
+    self.assertEqual(e.last_reason,
+                     'reconciled: XM reports terminal (was local RUNNING); '
+                     'zombie cleaned up')
+    self.assertEqual((e.auto_resumes, e.hardware_resumes), (0, 0))
+    self.assertEqual(self._on_board(), {'111'})
+    persist.assert_not_called()
+    self.assertFalse(any('[auto-resume]' in l for l in log))
+    self.assertIn('1 zombie->FAILED', log[-1])
+    self.assertTrue(log[-1].endswith('already-correct.'))
+
+
+class ChainAuditTest(unittest.TestCase):
+  """Fix 7's read-only invariant audit, and the read-only --show_chain."""
+
+  def test_audit_flags_a_two_xid_chain_and_nothing_else(self):
+    two = _running('a', '2', 'sj', submitted_at=0.0)
+    two.prior_xids = ['1']
+    one = _running('b', '5', 'sj', submitted_at=0.0)
+    lines = RC.run_chain_audit([two, one], {'1', '2', '5'})
+    self.assertEqual(lines,
+                     ['[invariant] chain a has 2 xids on the board: 1, 2'])
+    self.assertEqual(RC.run_chain_audit([two, one], {'2', '5'}), [])
+    self.assertIn('unreadable', RC.run_chain_audit([two], None)[0])
+
+  def test_read_board_xids(self):
+    p = tempfile.mkstemp(suffix='.jobs.json')[1]
+    self.addCleanup(os.unlink, p)
+    with open(p, 'w') as f:
+      json.dump({'7': {}, '8': {}}, f)
+    self.assertEqual(RC.read_board_xids(p), {'7', '8'})
+    self.assertEqual(RC.read_board_xids(p + '.missing'), set())  # no board
+    with open(p, 'w') as f:
+      f.write('{half-written')
+    with mock.patch.object(registry_store.time, 'sleep'):
+      self.assertIsNone(RC.read_board_xids(p))         # unreadable != empty
+
+  def test_show_chain(self):
+    e = _running('20260930T135726-9d081b5922', '1', 'ga', submitted_at=0.0)
+    e.name = 'pc-h'
+    lines = RC.show_chain([e, _entry('other')], 'pc-h')
+    self.assertTrue(lines[0].startswith('chain 20260930T135726-9d081b5922'))
+    self.assertIn('[live]', lines[-1])
+    self.assertIn('matched no job', RC.show_chain([e], 'nope')[0])
 
 
 if __name__ == '__main__':

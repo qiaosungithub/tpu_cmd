@@ -326,6 +326,7 @@ pytype_strict_contrib_test(
     srcs = ["route_check_test.py"],
     deps = [
         ":avail_provider",
+        ":registry_store",
         ":route_check_lib",
         ":route_lib",
     ],

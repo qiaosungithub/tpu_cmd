@@ -1616,140 +1616,6 @@ class CheckpointStepTest(unittest.TestCase):
     self.assertEqual(R.checkpoint_step('/cns/x/step_0.pt'), 0)
 
 
-class PlanPrunedRestartTest(unittest.TestCase):
-  """The checkpoint-as-evidence path. Every guard must default to HOLD; only a
-  healthy run killed from outside, with a surviving checkpoint, resumes warm."""
-
-  def _e(self, **kw):
-    return _entry(**kw)
-
-  def test_pruned_healthy_run_resumes_warm(self):
-    # the dw case: terminal, no code bug, checkpoint survived, sole writer
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug=None,
-        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False)
-    self.assertEqual(verdict, R.RESUME_WARM)
-    self.assertIn('step 1024', why)
-
-  def test_not_terminal_holds(self):
-    verdict, _ = R.plan_pruned_restart(
-        self._e(), xm_terminal=False, code_bug=None,
-        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False)
-    self.assertEqual(verdict, R.HOLD)
-
-  def test_code_bug_holds_even_with_checkpoint(self):
-    # NEGATIVE CONTROL: a segfault must NOT auto-resume, or we replay the bug
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True,
-        code_bug='CODE BUG: segfault (SIGSEGV)',
-        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False)
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('code bug', why)
-
-  def test_no_checkpoint_holds(self):
-    # NEGATIVE CONTROL: no checkpoint -> a warm restart is a cold start
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug=None,
-        checkpoint=None, other_live_writer=False)
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('cold start', why)
-
-  def test_other_live_writer_holds(self):
-    # NEGATIVE CONTROL: the 2026-09-10 double-write -- never add a 2nd writer
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug=None,
-        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=True)
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('SECOND writer', why)
-
-  def test_budget_spent_holds(self):
-    # NEGATIVE CONTROL: after N auto-resumes, stop and let a human look
-    verdict, why = R.plan_pruned_restart(
-        self._e(auto_resumes=3), xm_terminal=True, code_bug=None,
-        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False,
-        max_auto_resumes=3)
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('budget', why)
-
-  def test_budget_one_below_cap_still_resumes(self):
-    verdict, _ = R.plan_pruned_restart(
-        self._e(auto_resumes=2), xm_terminal=True, code_bug=None,
-        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False,
-        max_auto_resumes=3)
-    self.assertEqual(verdict, R.RESUME_WARM)
-
-  # --- RESUME_COLD: preempted-before-first-checkpoint (Fix 2, gated) --------
-  # allow_cold defaults OFF, so all the tests above exercise the UNCHANGED
-  # behavior. These pass allow_cold=True to exercise the new branch.
-
-  def test_no_ckpt_default_still_holds_when_cold_disabled(self):
-    # GUARD: with allow_cold defaulting False, no-checkpoint is STILL an
-    # unconditional hold -- byte-for-byte the pre-Fix2 behavior, even for a
-    # clearly-preempted, clearly-trained run.
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
-        other_live_writer=False, trained=True, termination_cause='preempted')
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('cold start', why)
-
-  def test_cold_preempted_no_ckpt_reruns(self):
-    # THE FIX: terminal, no code bug, no checkpoint, but a preemption cause.
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
-        other_live_writer=False, termination_cause='preempted', allow_cold=True)
-    self.assertEqual(verdict, R.RESUME_COLD)
-
-  def test_cold_trained_no_cause_no_ckpt_reruns(self):
-    # THE 4-JOB CASE: clean preemption leaves NO cause in stdout, but the log
-    # shows training progress -> cold rerun.
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
-        other_live_writer=False, trained=True, allow_cold=True)
-    self.assertEqual(verdict, R.RESUME_COLD)
-
-  def test_cold_never_trained_unknown_cause_holds(self):
-    # NEGATIVE CONTROL: crashed on startup (never trained, no preempt cause) ->
-    # still HOLD even with allow_cold, or we loop replaying a startup crash.
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
-        other_live_writer=False, trained=False, termination_cause=None,
-        allow_cold=True)
-    self.assertEqual(verdict, R.HOLD)
-
-  def test_cold_still_blocked_by_code_bug(self):
-    # NEGATIVE CONTROL: a real crash signature outranks cold rerun.
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug='segfault (SIGSEGV)',
-        checkpoint=None, other_live_writer=False, trained=True, allow_cold=True)
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('code bug', why)
-
-  def test_cold_still_blocked_by_live_writer(self):
-    # NEGATIVE CONTROL: never add a 2nd writer, cold path included.
-    verdict, why = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug=None, checkpoint=None,
-        other_live_writer=True, trained=True, allow_cold=True)
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('SECOND writer', why)
-
-  def test_cold_still_bounded_by_budget(self):
-    # NEGATIVE CONTROL: the anti-loop budget caps cold reruns too.
-    verdict, why = R.plan_pruned_restart(
-        self._e(auto_resumes=3), xm_terminal=True, code_bug=None,
-        checkpoint=None, other_live_writer=False, trained=True,
-        termination_cause='preempted', allow_cold=True, max_auto_resumes=3)
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('budget', why)
-
-  def test_cold_prefers_warm_when_ckpt_exists(self):
-    # When a checkpoint DOES exist, we still warm-resume (cold is only the
-    # no-checkpoint fallback), even with allow_cold on.
-    verdict, _ = R.plan_pruned_restart(
-        self._e(), xm_terminal=True, code_bug=None,
-        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False,
-        trained=True, termination_cause='preempted', allow_cold=True)
-    self.assertEqual(verdict, R.RESUME_WARM)
-
 class LooksLikeCodeBugTest(unittest.TestCase):
   """The code-bug gate: crashes in the TAIL flag, a healthy pruned tail does not,
   and the benign boot-banner ModuleNotFoundError must NOT be read as a bug."""
@@ -1940,43 +1806,6 @@ class HardwareFaultTest(unittest.TestCase):
         '[parcae-torch] step 100 loss 4.2'))
     self.assertIsNone(R.looks_like_hardware_fault(''))
 
-  def test_hardware_cause_gives_bounded_cold_rerun(self):
-    # No checkpoint + a hardware cause -> RESUME_COLD even if it never trained
-    # (died in NCCL init), and the why names the hardware.
-    e = _entry(auto_resumes=0)
-    verdict, why = R.plan_pruned_restart(
-        e, xm_terminal=True, code_bug=None, checkpoint=None,
-        other_live_writer=False, trained=False,
-        termination_cause='hardware: NVLink P2P disabled', allow_cold=True)
-    self.assertEqual(verdict, R.RESUME_COLD)
-    self.assertIn('hardware fault', why)
-
-  def test_hardware_cold_rerun_still_budgeted(self):
-    # NEGATIVE CONTROL: a bad host cannot loop forever -- same budget.
-    e = _entry(auto_resumes=3)
-    verdict, _ = R.plan_pruned_restart(
-        e, xm_terminal=True, code_bug=None, checkpoint=None,
-        other_live_writer=False, trained=False,
-        termination_cause='hardware: x', allow_cold=True, max_auto_resumes=3)
-    self.assertEqual(verdict, R.HOLD)
-
-  def test_carry_hardware_strike_cools_dead_pair_on_new_row(self):
-    dead = _entry('d', power='h100-8', archs=('h100', 'b200'))
-    dead.cell, dead.arch = 'ga', 'h100'
-    new = _entry('n', power='h100-8', archs=('h100', 'b200'))
-    keys = R.carry_hardware_strike(new, dead, now=1000.0)
-    self.assertEqual(keys, ['ga|h100'])
-    self.assertTrue(R.pair_is_cooling(new, 'ga', 'h100', now=1001.0))
-    self.assertFalse(R.pair_is_cooling(new, 'ga', 'b200', now=1001.0))
-    self.assertEqual(new.evictions['ga|h100']['strikes'], 1)
-
-  def test_carry_hardware_strike_no_cell_is_noop(self):
-    new = _entry('n')
-    self.assertEqual(R.carry_hardware_strike(new, _entry('d'), now=1.0), [])
-    self.assertFalse(new.evictions)
-
-
-
 class OutDirFromLogTest(unittest.TestCase):
 
   def test_post_locality_line_wins(self):
@@ -2022,107 +1851,6 @@ class LiveConfigSiblingTest(unittest.TestCase):
     dead = _entry(job_id='a', launch_kwargs={}, state=R.JobState.FAILED)
     live = self._c('b', 'cfgX', R.JobState.RUNNING)
     self.assertFalse(R.has_live_config_sibling(dead, [dead, live]))
-
-
-class BuildWarmRestartEntryTest(unittest.TestCase):
-
-  def _dead(self, **kw):
-    base = dict(
-        job_id='h100-8-dead', power='h100-8', archs=('h100',),
-        tier='PROD', allowed_metros=['sin', 'cbf'], state=R.JobState.FAILED,
-        xid='288098495', auto_resumes=0,
-        launch_kwargs={'config': 'cfgX', 'exp_name': 'parcae-dw', 'group': '9'})
-    base.update(kw)
-    return _entry(**base)
-
-  def test_clones_spec_and_sets_load_from(self):
-    e = R.build_warm_restart_entry(
-        self._dead(), '/cns/si-d/x/steps/step_1024.pt', 'h100-8-new01')
-    self.assertEqual(e.job_id, 'h100-8-new01')
-    self.assertEqual(e.power, 'h100-8')
-    self.assertEqual(e.allowed_archs, ['h100'])
-    self.assertEqual(e.tier, 'PROD')
-    self.assertEqual(e.allowed_metros, ['sin', 'cbf'])
-    self.assertEqual(e.state, R.JobState.QUEUED)
-    self.assertEqual(e.launch_kwargs['load_from'],
-                     '/cns/si-d/x/steps/step_1024.pt')
-    self.assertEqual(e.launch_kwargs['config'], 'cfgX')  # same run
-
-  def test_increments_auto_resumes_and_names_attempt(self):
-    e = R.build_warm_restart_entry(
-        self._dead(auto_resumes=1), '/cns/x/steps/step_1024.pt', 'j2')
-    self.assertEqual(e.auto_resumes, 2)
-    self.assertEqual(e.launch_kwargs['exp_name'], 'parcae-dw-r2')
-
-  def test_suffix_does_not_stack(self):
-    dead = self._dead(auto_resumes=2,
-                      launch_kwargs={'config': 'cfgX', 'exp_name': 'parcae-dw-r2'})
-    e = R.build_warm_restart_entry(dead, '/cns/x/steps/step_1024.pt', 'j3')
-    self.assertEqual(e.launch_kwargs['exp_name'], 'parcae-dw-r3')
-
-  def test_records_prior_xid(self):
-    e = R.build_warm_restart_entry(
-        self._dead(), '/cns/x/steps/step_1024.pt', 'j2')
-    self.assertIn('288098495', e.prior_xids)
-
-  def test_does_not_mutate_dead_entry(self):
-    dead = self._dead()
-    R.build_warm_restart_entry(dead, '/cns/x/steps/step_1024.pt', 'j2')
-    self.assertEqual(dead.auto_resumes, 0)
-    self.assertNotIn('load_from', dead.launch_kwargs)
-
-
-class BuildColdRestartEntryTest(unittest.TestCase):
-  """The COLD twin: a healthy run preempted before its first checkpoint reruns
-  from step 0 -- clones the spec, wires NO resume pointer, still bounded by the
-  auto_resume budget."""
-
-  def _dead(self, **kw):
-    base = dict(
-        job_id='h100-8-dead', power='h100-8', archs=('h100',),
-        tier='PROD', allowed_metros=['sin', 'cbf'], state=R.JobState.FAILED,
-        xid='288098495', auto_resumes=0,
-        launch_kwargs={'config': 'cfgX', 'exp_name': 'parcae-dw', 'group': '9'})
-    base.update(kw)
-    return _entry(**base)
-
-  def test_clones_spec_and_sets_no_resume_pointer(self):
-    e = R.build_cold_restart_entry(self._dead(), 'h100-8-new01')
-    self.assertEqual(e.job_id, 'h100-8-new01')
-    self.assertEqual(e.power, 'h100-8')
-    self.assertEqual(e.allowed_archs, ['h100'])
-    self.assertEqual(e.tier, 'PROD')
-    self.assertEqual(e.allowed_metros, ['sin', 'cbf'])
-    self.assertEqual(e.state, R.JobState.QUEUED)
-    self.assertEqual(e.launch_kwargs['config'], 'cfgX')  # same run
-    # THE POINT: cold means NO resume pointer of any kind.
-    self.assertNotIn('load_from', e.launch_kwargs)
-    self.assertNotIn('restart_from', e.launch_kwargs)
-    self.assertNotIn('restart_step', e.launch_kwargs)
-
-  def test_strips_stale_resume_pointer_from_cloned_spec(self):
-    # If the dead row somehow carried a resume pointer, cold must drop it.
-    dead = self._dead(launch_kwargs={
-        'config': 'cfgX', 'exp_name': 'parcae-dw', 'load_from': '/cns/old/step_1.pt',
-        'restart_from': '/cns/old', 'restart_step': '5'})
-    e = R.build_cold_restart_entry(dead, 'j2')
-    self.assertNotIn('load_from', e.launch_kwargs)
-    self.assertNotIn('restart_from', e.launch_kwargs)
-    self.assertNotIn('restart_step', e.launch_kwargs)
-
-  def test_increments_auto_resumes_and_names_attempt(self):
-    e = R.build_cold_restart_entry(self._dead(auto_resumes=1), 'j2')
-    self.assertEqual(e.auto_resumes, 2)
-    self.assertEqual(e.launch_kwargs['exp_name'], 'parcae-dw-r2')
-
-  def test_records_prior_xid(self):
-    e = R.build_cold_restart_entry(self._dead(), 'j2')
-    self.assertIn('288098495', e.prior_xids)
-
-  def test_does_not_mutate_dead_entry(self):
-    dead = self._dead()
-    R.build_cold_restart_entry(dead, 'j2')
-    self.assertEqual(dead.auto_resumes, 0)
 
 
 class PackageDirTest(unittest.TestCase):
@@ -2366,122 +2094,6 @@ class ResolveJobRefsTest(unittest.TestCase):
     matched, errs = R.resolve_job_refs(rows, ['', '  ', 'eqr-run'])
     self.assertEqual(matched, {'20260916T140000-abcabcabca'})
     self.assertEqual(errs, [])
-
-
-class ApplyWarmRestartInPlaceTest(unittest.TestCase):
-  """The IN-PLACE warm-restart the reroute path uses: the SAME row is kept
-  (job_id, reroute counter, cooldowns), and only the resume pointer is wired in,
-  layout-correctly (ELT restart_from vs torch load_from). The twin of
-  build_warm_restart_entry (which mints a fresh row for the reconcile path); both
-  share _apply_resume_pointer, so the silently-destructive layout trap is decided
-  in one place."""
-
-  def _row(self, **kw):
-    base = dict(
-        job_id='j-keep', power='h100-8', archs=('h100',),
-        tier='PROD', state=R.JobState.QUEUED, auto_resumes=0,
-        launch_kwargs={'config': 'cfgX', 'exp_name': 'parcae-dw'})
-    base.update(kw)
-    return _entry(**base)
-
-  def test_torch_layout_sets_load_from_and_clears_restart(self):
-    # A torch `step_<N>.pt` leaf resumes via $LOAD_FROM; any stale ELT keys must
-    # be cleared (both set trips main_eqr's guard).
-    e = self._row(launch_kwargs={'config': 'cfgX', 'exp_name': 'dw',
-                                 'restart_from': '/old/wd', 'restart_step': '10'})
-    R.apply_warm_restart_in_place(e, '/cns/x/steps/step_2048.pt')
-    self.assertEqual(e.launch_kwargs['load_from'], '/cns/x/steps/step_2048.pt')
-    self.assertNotIn('restart_from', e.launch_kwargs)
-    self.assertNotIn('restart_step', e.launch_kwargs)
-
-  def test_elt_layout_sets_restart_from_step_and_clears_load_from(self):
-    # NEGATIVE CONTROL for the destructive trap: an ELT checkpoints/<int> leaf
-    # must resume via restart_from+restart_step and NEVER via load_from (which
-    # would make orbax prune the checkpoints it resumed from).
-    e = self._row(launch_kwargs={'config': 'cfgX', 'exp_name': 'dw',
-                                 'load_from': '/stale/leaf'})
-    R.apply_warm_restart_in_place(e, '/cns/x/wd/checkpoints/1536')
-    self.assertEqual(e.launch_kwargs['restart_from'], '/cns/x/wd')
-    self.assertEqual(e.launch_kwargs['restart_step'], '1536')
-    self.assertNotIn('load_from', e.launch_kwargs)
-
-  def test_keeps_row_identity_and_bumps_auto_resumes(self):
-    e = self._row(auto_resumes=1)
-    R.apply_warm_restart_in_place(e, '/cns/x/steps/step_1.pt')
-    self.assertEqual(e.job_id, 'j-keep')     # SAME row, not a fresh one
-    self.assertEqual(e.power, 'h100-8')
-    self.assertEqual(e.auto_resumes, 2)      # shared budget bumped
-
-  def test_exp_name_suffix_does_not_stack(self):
-    e = self._row(auto_resumes=2, launch_kwargs={'exp_name': 'dw-r2'})
-    R.apply_warm_restart_in_place(e, '/cns/x/steps/step_1.pt')
-    self.assertEqual(e.launch_kwargs['exp_name'], 'dw-r3')
-
-  def test_exp_name_falls_back_to_name_then_job_id(self):
-    e = self._row(job_id='jx', launch_kwargs={})
-    e.name = 'readable-name'
-    R.apply_warm_restart_in_place(e, '/cns/x/steps/step_1.pt')
-    self.assertEqual(e.launch_kwargs['exp_name'], 'readable-name-r1')
-
-  def test_elt_layout_does_not_rollback_higher_restart_step(self):
-    e = self._row(launch_kwargs={
-        'config': 'cfgX', 'exp_name': 'dw-r3',
-        'restart_from': '/cns/newer/wd', 'restart_step': '35000',
-    })
-    R.apply_warm_restart_in_place(e, '/cns/older/wd/checkpoints/25001')
-    self.assertEqual(e.launch_kwargs['restart_from'], '/cns/newer/wd')
-    self.assertEqual(e.launch_kwargs['restart_step'], '35000')
-
-
-class ClassifyFailureTest(unittest.TestCase):
-  """Tests for the AUTO-RESUME RULE SET in route_lib.classify_failure."""
-
-  def test_affinity_group_in_use_resumes(self):
-    verdict, why = R.classify_failure(
-        'FAILED_PRECONDITION: AffinityGroup name: "nk_qiaos.1/qiaos" is still in'
-        ' use... { error: AFFINITY_GROUP_IN_USE }'
-    )
-    self.assertEqual(verdict, R.RESUME_XID)
-    self.assertIn('affinity group', why.lower())
-
-  def test_affinity_group_verdict_phrase_resumes(self):
-    verdict, why = R.classify_failure(
-        'Borg AffinityGroup in use (transient conflict; retry/reroute)'
-    )
-    self.assertEqual(verdict, R.RESUME_XID)
-    self.assertIn('affinity group', why.lower())
-
-  def test_task_action_fish_ici_resumes(self):
-    verdict, why = R.classify_failure(
-        'Borg task failed: TASK_ACTION_FISH_ICI_SECURITY_SETUP'
-    )
-    self.assertEqual(verdict, R.RESUME_XID)
-    self.assertIn('ici', why.lower())
-
-  def test_ici_setup_failure_phrase_resumes(self):
-    verdict, why = R.classify_failure(
-        'TPU ICI setup failure (hardware/bad node; reroute)'
-    )
-    self.assertEqual(verdict, R.RESUME_XID)
-    self.assertIn('ici', why.lower())
-
-  def test_zero_work_unit_holds(self):
-    verdict, why = R.classify_failure(
-        'reconciled: XM resolves the id but reports ZERO work units; experiment'
-        ' is gone'
-    )
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('work unit', why.lower())
-
-  def test_unrecognised_reason_defaults_to_hold(self):
-    verdict, why = R.classify_failure('some random unrecognised error')
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('unrecognised', why.lower())
-
-  def test_empty_reason_defaults_to_hold(self):
-    verdict, why = R.classify_failure('')
-    self.assertEqual(verdict, R.HOLD)
-    self.assertIn('cannot classify', why.lower())
 
 
 class PlanOneWhyNotTest(unittest.TestCase):
@@ -2909,40 +2521,425 @@ class LineageCheckpointTest(unittest.TestCase):
     self.assertTrue(R.note_known_checkpoint(e, '/cns/x/steps/step_1500.pt'))
     self.assertEqual(e.last_known_checkpoint, '/cns/x/steps/step_1500.pt')
 
-  def test_advance_moves_a_stale_pointer_forward(self):
-    # 2026-09-29: row at step 41500 requeued still pointing at step_40000.
-    e = _entry(launch_kwargs={'load_from': '/cns/x/steps/step_40000.pt'})
-    e.last_known_checkpoint = '/cns/y/steps/step_41500.pt'
-    self.assertTrue(R.advance_resume_pointer(e))
-    self.assertEqual(e.launch_kwargs['load_from'], '/cns/y/steps/step_41500.pt')
-    self.assertEqual(e.auto_resumes, 0)              # not a restart attempt
-    self.assertFalse(R.advance_resume_pointer(e))    # already there
+# ---------------------------------------------------------------------------
+# C3: ONE attempt-end handler, one chain per row (Fixes 6, 7, 8).
+# ---------------------------------------------------------------------------
+_TORCH_CKPT = '/cns/x/steps/step_1024.pt'
+_ELT_CKPT = '/cns/x/wd/checkpoints/1536'
+_ON = R.ResumePolicy(enabled=True, auto_resume_max=3, hardware_resume_max=3,
+                     cooldown_s=1800.0)
 
-  def test_advance_elt_layout(self):
-    e = _entry(launch_kwargs={'restart_from': '/cns/x/wd', 'restart_step': '96'})
-    e.last_known_checkpoint = '/cns/x/wd/checkpoints/192'
-    self.assertTrue(R.advance_resume_pointer(e))
-    self.assertEqual(e.launch_kwargs['restart_step'], '192')
+
+def _live(job_id='d1', xid='111', cell='ga', arch='h100', chips=8, **kw):
+  """A RUNNING GPU row on (cell, arch) with a live submission."""
+  lk = kw.pop('launch_kwargs', {'config': 'cfgX', 'exp_name': 'dw'})
+  e = _entry(job_id, power=f'{arch}-{chips}', archs=(arch,),
+             launch_kwargs=lk, **kw)
+  e.state = R.JobState.RUNNING
+  e.xid = xid
+  e.submissions[-1].state = 'RUNNING'
+  e.submissions[-1].cell, e.submissions[-1].arch = cell, arch
+  e.cell, e.arch, e.chips = cell, arch, chips
+  e.submitted_at = 0.0
+  return e
+
+
+def _death(**kw):
+  return R.AttemptEnd(kind=R.END_DEATH, evidence_read=True, **kw)
+
+
+class DecideEndTest(unittest.TestCase):
+  """The pure decision (the former plan_pruned_restart guards, now one
+  function for every attempt end). Every guard defaults to HOLD."""
+
+  def _v(self, e, end, policy=_ON, entries=()):
+    return R.decide_end(e, end, policy, entries)
+
+  def test_healthy_death_with_checkpoint_resumes_warm(self):
+    d = self._v(_live(), _death(found_checkpoint=_TORCH_CKPT))
+    self.assertEqual(d.verdict, R.RESUME_WARM)
+    self.assertEqual(d.checkpoint, _TORCH_CKPT)
+    self.assertEqual(d.budget, R.BUDGET_AUTO)
+    self.assertIn('step 1024', d.why)
+
+  def test_code_bug_holds_even_with_checkpoint(self):
+    d = self._v(_live(), _death(found_checkpoint=_TORCH_CKPT,
+                                code_bug='CODE BUG: segfault (SIGSEGV)'))
+    self.assertEqual(d.verdict, R.HOLD)
+    self.assertIn('code bug', d.why)
+
+  def test_no_checkpoint_no_signal_holds(self):
+    d = self._v(_live(), _death())
+    self.assertEqual(d.verdict, R.HOLD)
+    self.assertIn('cold start', d.why)
+
+  def test_live_same_config_sibling_holds(self):
+    e = _live()
+    sib = _live('d2', xid='222', launch_kwargs={'config': 'cfgX'})
+    d = self._v(e, _death(found_checkpoint=_TORCH_CKPT), entries=[e, sib])
+    self.assertEqual(d.verdict, R.HOLD)
+    self.assertIn('SECOND writer', d.why)
+
+  def test_auto_budget_spent_holds_one_below_resumes(self):
+    self.assertEqual(self._v(_live(auto_resumes=3),
+                             _death(found_checkpoint=_TORCH_CKPT)).verdict,
+                     R.HOLD)
+    self.assertIn('budget', self._v(_live(auto_resumes=3),
+                                    _death(found_checkpoint=_TORCH_CKPT)).why)
+    self.assertEqual(self._v(_live(auto_resumes=2),
+                             _death(found_checkpoint=_TORCH_CKPT)).verdict,
+                     R.RESUME_WARM)
+
+  def test_cold_rerun_needs_a_preemption_or_training_signal(self):
+    self.assertEqual(self._v(_live(), _death(cause_text='preempted out of ga')
+                             ).verdict, R.RESUME_COLD)
+    self.assertEqual(self._v(_live(), _death(trained=True)).verdict,
+                     R.RESUME_COLD)
+    # NEGATIVE CONTROL: never trained, no cause -> a startup crash -> HOLD.
+    self.assertEqual(self._v(_live(), _death(trained=False)).verdict, R.HOLD)
+
+  def test_cold_is_still_guarded(self):
+    e = _live()
+    sib = _live('d2', xid='222', launch_kwargs={'config': 'cfgX'})
+    self.assertEqual(self._v(e, _death(trained=True, code_bug='segfault')
+                             ).verdict, R.HOLD)
+    self.assertEqual(self._v(e, _death(trained=True), entries=[e, sib]
+                             ).verdict, R.HOLD)
+    self.assertEqual(self._v(_live(auto_resumes=3), _death(trained=True)
+                             ).verdict, R.HOLD)
+
+  # ---- Fix 6: a HARDWARE death has its own budget -------------------------
+  def test_fix6_hardware_death_past_auto_budget_resumes_warm(self):
+    # xid 294889693: auto_resumes 3/3 from preemptions, then an NVLink fault.
+    e = _live(auto_resumes=3)
+    res = R.end_attempt(e, _death(found_checkpoint=_TORCH_CKPT,
+                                  hardware='NVLink P2P disabled'), _ON, 100.0)
+    self.assertEqual(res.verdict, R.RESUME_WARM)
+    self.assertEqual(res.budget, R.BUDGET_HARDWARE)
+    self.assertEqual(e.hardware_resumes, 1)
+    self.assertEqual(e.auto_resumes, 3)               # untouched
+    self.assertEqual(e.launch_kwargs['load_from'], _TORCH_CKPT)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+
+  def test_fix6_hardware_budget_spent_holds(self):
+    d = self._v(_live(hardware_resumes=3),
+                _death(found_checkpoint=_TORCH_CKPT, hardware='GPU lost'))
+    self.assertEqual(d.verdict, R.HOLD)
+    self.assertIn('hardware-resume budget spent (3/3)', d.why)
+
+  def test_fix6_negative_control_preemption_keeps_the_auto_budget(self):
+    d = self._v(_live(auto_resumes=3),
+                _death(found_checkpoint=_TORCH_CKPT, cause_text='preempted'))
+    self.assertEqual(d.verdict, R.HOLD)
+    self.assertIn('auto-resume budget spent (3/3)', d.why)
+
+  def test_hardware_without_checkpoint_is_a_bounded_cold_rerun(self):
+    d = self._v(_live(), _death(hardware='NVLink P2P disabled'))
+    self.assertEqual(d.verdict, R.RESUME_COLD)
+    self.assertEqual(d.budget, R.BUDGET_HARDWARE)
+    self.assertIn('hardware fault', d.why)
+    self.assertEqual(self._v(_live(hardware_resumes=3),
+                             _death(hardware='x')).verdict, R.HOLD)
+
+  # ---- Fix 8 rule 2: a rerun never discards progress ----------------------
+  def test_fix8_earlier_node_resumes_warm_not_cold(self):
+    # The chain reached step 1024 on an earlier attempt; the attempt that just
+    # died (preempted) saved nothing. Warm from the node, never cold.
+    e = _live()
+    e.last_known_checkpoint = _TORCH_CKPT
+    d = self._v(e, _death(found_checkpoint=None, cause_text='preempted',
+                          trained=True))
+    self.assertEqual(d.verdict, R.RESUME_WARM)
+    self.assertEqual(d.checkpoint, _TORCH_CKPT)
+
+  def test_failed_read_uses_only_a_seen_checkpoint(self):
+    e = _live(launch_kwargs={'config': 'c', 'load_from': '/cns/x/steps/step_8.pt'})
+    # The start pointer is not evidence of where the run got to -> HELD.
+    self.assertEqual(self._v(e, _death(read_error='timeout', trained=True,
+                                       cause_text='preempted')).verdict,
+                     R.HELD)
+    e.last_known_checkpoint = _TORCH_CKPT
+    d = self._v(e, _death(read_error='timeout'))
+    self.assertEqual((d.verdict, d.checkpoint), (R.RESUME_WARM, _TORCH_CKPT))
+
+  def test_auto_resume_off_is_plain_failed(self):
+    d = self._v(_live(), _death(found_checkpoint=_TORCH_CKPT),
+                policy=R.ResumePolicy(enabled=False))
+    self.assertEqual(d.verdict, R.FAILED)
+
+  def test_moves_never_draw_a_budget(self):
+    # Operator decision 1: a reroute move never bumps auto_resumes, even at
+    # 3/3, and still resumes from the chain's newest checkpoint.
+    e = _live(auto_resumes=3)
+    d = self._v(e, R.AttemptEnd(kind=R.END_PENDING,
+                                found_checkpoint=_TORCH_CKPT))
+    self.assertEqual((d.verdict, d.pointer, d.budget), (R.REQUEUE, 'set', ''))
+    self.assertEqual(self._v(_live(), R.AttemptEnd(kind=R.END_NOMINAL)).pointer,
+                     '')
+    self.assertEqual(self._v(e, R.AttemptEnd(
+        kind=R.END_THRASH, found_checkpoint=_TORCH_CKPT, code_bug='x')).pointer,
+                     'advance')
+
+
+class EndAttemptTest(unittest.TestCase):
+  """end_attempt applies the decision IN PLACE: one row for the job's life."""
+
+  def _row(self, **kw):
+    e = _live(**kw)
+    e.name = 'readable'
+    e.snapshot_dir = '/snap/d1'
+    e.group = '5'
+    e.reroutes = 2
+    e.cooldown_pairs = {'gl|h100': {'until': 500.0, 'strikes': 1}}
+    e.evictions = {'gl|h100': {'strikes': 1, 'last': 1.0}}
+    return e
+
+  def test_fix8_in_place_warm(self):
+    e = self._row()
+    res = R.end_attempt(e, _death(found_checkpoint=_TORCH_CKPT,
+                                  cause_text='preempted'), _ON, 100.0)
+    self.assertEqual(res.verdict, R.RESUME_WARM)
+    self.assertEqual(e.job_id, 'd1')                      # SAME row
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['load_from'], _TORCH_CKPT)
+    self.assertEqual(e.launch_kwargs['exp_name'], 'dw-r1')
+    self.assertEqual(e.auto_resumes, 1)
+    self.assertEqual((e.snapshot_dir, e.group, e.reroutes, e.name),
+                     ('/snap/d1', '5', 2, 'readable'))
+    self.assertIn('gl|h100', e.cooldown_pairs)            # memory kept
+    self.assertIn('gl|h100', e.evictions)
+    self.assertIsNone(e.cell)
+    self.assertIsNone(e.xid)                              # attempt closed
+    sub = e.submissions[-1]
+    self.assertEqual((sub.xid, sub.state, sub.outcome, sub.ended_at),
+                     ('111', 'SUPERSEDED', 'preempted', 100.0))
+    self.assertEqual(sub.end_step, 1024)                  # produced node
+    self.assertEqual(res.archive_xid, '111')
+
+  def test_fix8_in_place_cold(self):
+    e = self._row()
+    res = R.end_attempt(e, _death(trained=True), _ON, 100.0)
+    self.assertEqual(res.verdict, R.RESUME_COLD)
+    self.assertEqual(e.job_id, 'd1')
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    for k in ('load_from', 'restart_from', 'restart_step'):
+      self.assertNotIn(k, e.launch_kwargs)
+    self.assertIsNone(e.submissions[-1].end_step)          # a leaf
+    self.assertEqual(res.archive_xid, '111')
+
+  def test_layout_trap_both_directions(self):
+    elt = self._row()
+    R.end_attempt(elt, _death(found_checkpoint=_ELT_CKPT), _ON, 1.0)
+    self.assertEqual(elt.launch_kwargs['restart_from'], '/cns/x/wd')
+    self.assertEqual(elt.launch_kwargs['restart_step'], '1536')
+    self.assertNotIn('load_from', elt.launch_kwargs)
+    torch = self._row(launch_kwargs={'config': 'c', 'exp_name': 'x',
+                                     'restart_from': '/old', 'restart_step': '9'})
+    R.end_attempt(torch, _death(found_checkpoint=_TORCH_CKPT), _ON, 1.0)
+    self.assertEqual(torch.launch_kwargs['load_from'], _TORCH_CKPT)
+    self.assertNotIn('restart_from', torch.launch_kwargs)
+
+  def test_hold_goes_failed_and_is_not_archived(self):
+    e = self._row()
+    res = R.end_attempt(e, _death(code_bug='CODE BUG: segfault'), _ON, 1.0)
+    self.assertEqual(res.verdict, R.HOLD)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertEqual(e.submissions[-1].state, 'FAILED')
+    self.assertEqual(e.submissions[-1].outcome, 'code-bug')
+    self.assertIsNone(res.archive_xid)
+    self.assertEqual(e.auto_resumes, 0)
+
+  def test_failed_read_with_nothing_known_is_held_not_archived(self):
+    e = self._row()
+    e.cns_read_failures = 3
+    res = R.end_attempt(e, _death(read_error='timeout', trained=True), _ON, 1.0)
+    self.assertEqual(res.verdict, R.HELD)
+    self.assertEqual(e.state, R.JobState.HELD)
+    self.assertIn('CNS unreadable', e.last_reason)
+    self.assertIsNone(res.archive_xid)
+
+  def test_auto_resume_off_retires_exactly_as_before(self):
+    e = self._row()
+    res = R.end_attempt(e, _death(found_checkpoint=_TORCH_CKPT),
+                        R.ResumePolicy(enabled=False), 1.0)
+    self.assertEqual(res.verdict, R.FAILED)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertIn('zombie cleaned up', e.last_reason)
+    self.assertIsNone(res.archive_xid)
+    self.assertEqual(e.auto_resumes, 0)
     self.assertNotIn('load_from', e.launch_kwargs)
 
-  def test_advance_never_adds_or_rewinds(self):
-    cold = _entry(launch_kwargs={'config': 'c'})
-    cold.last_known_checkpoint = '/cns/x/steps/step_41500.pt'
-    self.assertFalse(R.advance_resume_pointer(cold))
-    self.assertNotIn('load_from', cold.launch_kwargs)
-    ahead = _entry(launch_kwargs={'load_from': '/cns/x/steps/step_50000.pt'})
-    ahead.last_known_checkpoint = '/cns/x/steps/step_41500.pt'
-    self.assertFalse(R.advance_resume_pointer(ahead))
-    self.assertEqual(ahead.launch_kwargs['load_from'],
-                     '/cns/x/steps/step_50000.pt')
+  def test_hardware_death_strikes_the_bad_host_on_the_same_row(self):
+    e = self._row()
+    res = R.end_attempt(e, _death(found_checkpoint=_TORCH_CKPT,
+                                  hardware='NVLink P2P disabled'), _ON, 1000.0)
+    self.assertEqual(res.steered, ['ga|h100'])
+    self.assertTrue(R.pair_is_cooling(e, 'ga', 'h100', now=1001.0))
+    self.assertEqual(e.evictions['ga|h100']['strikes'], 1)
+    self.assertEqual([ev['kind'] for ev in res.fleet_events], ['hardware'])
+    self.assertEqual(e.submissions[-1].outcome, 'hardware')
 
-  def test_warm_restart_entry_carries_last_known(self):
-    dead = _entry(state=R.JobState.FAILED, xid='1',
-                  launch_kwargs={'config': 'c', 'exp_name': 'n'})
-    dead.last_known_checkpoint = '/cns/x/steps/step_41500.pt'
-    new = R.build_warm_restart_entry(dead, '/cns/x/steps/step_41500.pt', 'j2')
-    self.assertEqual(new.last_known_checkpoint, '/cns/x/steps/step_41500.pt')
-    self.assertEqual(new.cns_read_failures, 0)
+  def test_pending_move_cools_the_pair_and_keeps_the_budget(self):
+    e = self._row(auto_resumes=3)
+    res = R.end_attempt(e, R.AttemptEnd(kind=R.END_PENDING), _ON, 100.0)
+    self.assertEqual(res.verdict, R.REQUEUE)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.auto_resumes, 3)                   # decision 1
+    self.assertEqual(e.reroutes, 3)
+    self.assertTrue(R.pair_is_cooling(e, 'ga', 'h100', now=101.0))
+    self.assertEqual([ev['kind'] for ev in res.fleet_events], ['pending'])
+    self.assertEqual(e.submissions[-1].outcome, 'pending-timeout')
+    self.assertEqual(res.archive_xid, '111')
+
+  def test_thrash_move_records_an_eviction_strike(self):
+    e = self._row()
+    res = R.end_attempt(e, R.AttemptEnd(kind=R.END_THRASH), _ON, 100.0)
+    self.assertEqual(e.evictions['ga|h100']['strikes'], 1)
+    self.assertEqual([ev['kind'] for ev in res.fleet_events], ['thrash'])
+
+  def test_move_with_code_bug_only_advances_an_existing_pointer(self):
+    # 2026-09-29: a row at step 41500 requeued still pointing at step_40000.
+    e = self._row(launch_kwargs={'config': 'c',
+                                 'load_from': '/cns/x/steps/step_40000.pt'})
+    e.last_known_checkpoint = '/cns/y/steps/step_41500.pt'
+    res = R.end_attempt(e, R.AttemptEnd(kind=R.END_PENDING, code_bug='x'),
+                        _ON, 1.0)
+    self.assertTrue(res.pointer_moved)
+    self.assertEqual(e.launch_kwargs['load_from'], '/cns/y/steps/step_41500.pt')
+    cold = self._row(launch_kwargs={'config': 'c'})
+    cold.last_known_checkpoint = '/cns/y/steps/step_41500.pt'
+    R.end_attempt(cold, R.AttemptEnd(kind=R.END_PENDING, code_bug='x'), _ON, 1.0)
+    self.assertNotIn('load_from', cold.launch_kwargs)     # never adds one
+
+  def test_done_and_cancelled(self):
+    e = self._row()
+    R.end_attempt(e, R.AttemptEnd(kind=R.END_DONE), _ON, 1.0)
+    self.assertEqual((e.state, e.submissions[-1].state,
+                      e.submissions[-1].outcome),
+                     (R.JobState.DONE, 'DONE', 'done'))
+    c = self._row()
+    res = R.end_attempt(c, R.AttemptEnd(kind=R.END_CANCELLED,
+                                        cancelled_when='t0'), _ON, 1.0)
+    self.assertEqual((c.state, c.submissions[-1].state),
+                     (R.JobState.FAILED, 'CANCELLED'))
+    self.assertIsNone(res.archive_xid)
+
+
+class ChainNodesTest(unittest.TestCase):
+  """nodes = the checkpoint trunk; appended only on progress."""
+
+  def test_nodes_only_on_progress_and_last_known_is_the_tip(self):
+    e = _live(xid='1')
+    self.assertTrue(R.note_known_checkpoint(e, '/c/steps/step_100.pt', now=1.0))
+    self.assertTrue(R.note_known_checkpoint(e, '/c/steps/step_200.pt', now=2.0))
+    self.assertEqual(len(e.nodes), 1)                     # same attempt moves
+    self.assertEqual(e.nodes[-1]['step'], 200)
+    self.assertFalse(R.note_known_checkpoint(e, '/c/steps/step_150.pt'))
+    # Attempt 2 dies without saving: no node, its record is a leaf.
+    R.end_attempt(e, _death(found_checkpoint='/c/steps/step_200.pt',
+                            cause_text='preempted'), _ON, 3.0)
+    e.xid = '2'
+    e.cell, e.arch = 'gl', 'h100'
+    R.end_attempt(e, _death(found_checkpoint=None, cause_text='preempted'),
+                  _ON, 4.0)
+    self.assertEqual(len(e.nodes), 1)
+    self.assertIsNone(e.submissions[-1].end_step)
+    # Attempt 3 progresses: a second node.
+    e.xid = '3'
+    e.cell, e.arch = 'sh', 'h100'
+    R.note_known_checkpoint(e, '/c/steps/step_300.pt', now=5.0)
+    self.assertEqual([n['xid'] for n in e.nodes], ['1', '3'])
+    self.assertEqual(e.last_known_checkpoint, e.nodes[-1]['checkpoint'])
+
+  def test_start_ckpt_is_recorded_at_placement(self):
+    e = _entry('j', launch_kwargs={'load_from': _TORCH_CKPT})
+    R.apply_placement(e, R.Placement(job_id='j', cell='c', arch='v7', chips=32,
+                                     geometry=None, price=1.0, reason='r'),
+                      xid='9', now=1.0)
+    self.assertEqual(e.submissions[-1].start_ckpt, _TORCH_CKPT)
+
+  def test_chain_tree_lines(self):
+    e = _live(xid='1', cell='ga')
+    R.note_known_checkpoint(e, '/c/steps/step_100.pt', now=1.0)
+    R.end_attempt(e, _death(cause_text='preempted'), _ON, 2.0)
+    e.xid = '2'
+    e.cell, e.arch = 'gl', 'h100'
+    e.submissions[-1].cell, e.submissions[-1].arch = 'gl', 'h100'
+    e.submissions[-1].start_ckpt = '/c/steps/step_100.pt'
+    R.end_attempt(e, _death(cause_text='preempted'), _ON, 3.0)
+    lines = R.chain_tree_lines(e)
+    self.assertIn('2 attempt(s)', lines[0])
+    self.assertEqual(lines[1], '  trunk: scratch -> step_100 (1 ga/h100)')
+    self.assertIn('#1 1 ga/h100 start=scratch -> end=step_100 preempted [edge]',
+                  lines[2])
+    self.assertIn('#2 2 gl/h100 start=step_100 -> end=- preempted [leaf]',
+                  lines[3])
+
+  def test_chain_board_violations(self):
+    two = _live('a', xid='1')
+    two.prior_xids = ['0']
+    one = _live('b', xid='5')
+    done = _live('c', xid='7')
+    done.prior_xids = ['6']
+    done.state = R.JobState.DONE
+    v = R.chain_board_violations([two, one, done], {'0', '1', '5', '6', '7'})
+    self.assertEqual(v, [('a', ['0', '1'])])
+
+
+class ChainSerdeTest(unittest.TestCase):
+  """New fields round-trip; at their defaults they are not written, so rows
+  from before them (incl. the npu queue's legacy cooldown_* rows) load,
+  round-trip and save unchanged."""
+
+  def test_new_fields_roundtrip(self):
+    e = _live()
+    e.hardware_resumes = 2
+    R.note_known_checkpoint(e, _TORCH_CKPT, now=1.0)
+    e.submissions[-1].start_ckpt = '/s'
+    e.submissions[-1].outcome = 'preempted'
+    e.submissions[-1].end_step = 1024
+    e.submissions[-1].ended_at = 3.0
+    e2 = R.QueueEntry.from_dict(e.to_dict())
+    self.assertEqual(e2.hardware_resumes, 2)
+    self.assertEqual(e2.nodes, e.nodes)
+    s = e2.submissions[-1]
+    self.assertEqual((s.start_ckpt, s.outcome, s.end_step, s.ended_at),
+                     ('/s', 'preempted', 1024, 3.0))
+
+  def test_defaults_are_not_written(self):
+    d = _live().to_dict()
+    self.assertNotIn('hardware_resumes', d)
+    self.assertNotIn('nodes', d)
+    for k in ('start_ckpt', 'end_step', 'outcome', 'ended_at'):
+      self.assertNotIn(k, d['submissions'][-1])
+
+  def test_npu_old_schema_row_loads_and_roundtrips(self):
+    # The shape of a ~/lyy-work/.npu_local_queue.json row (legacy cooldown_*).
+    old = {
+        'job_id': 'lyy-1', 'name': 'n', 'power': 'v6e-8',
+        'allowed_archs': ['v6e'], 'tier': 'PROD', 'allowed_metros': None,
+        'priority': 0, 'power_tolerance': 0.15, 'max_price': None,
+        'topology_locked': False, 'locked_geometry': None,
+        'launch_kwargs': {'config': 'c'}, 'workdir': '/w', 'snapshot_dir': '',
+        'state': 'DONE', 'xid': '9', 'cell': 'ej', 'arch': 'v6e', 'chips': 8,
+        'submitted_at': 1.0, 'build_started_at': None,
+        'last_build_duration': None, 'worker_id': None, 'attempts': 0,
+        'reroutes': 0, 'group': None, 'pin_group': None, 'prior_xids': [],
+        'cooldown_cells': {}, 'cooldown_archs': {}, 'cooldown_metros': {},
+        'evictions': {}, 'last_reason': 'r', 'last_filter_reason': '',
+        'auto_resumes': 0,
+        'submissions': [{'seq': 1, 'xid': '9', 'state': 'DONE', 'cell': 'ej',
+                         'arch': 'v6e', 'chips': 8, 'group': None,
+                         'created_at': 1.0, 'confirmed_at': 1.0,
+                         'ended_reason': ''}]}
+    e = R.QueueEntry.from_dict(old)
+    d = e.to_dict()
+    self.assertEqual(d['submissions'], old['submissions'])   # byte for byte
+    for k in ('hardware_resumes', 'nodes'):
+      self.assertNotIn(k, d)
+    self.assertEqual(R.QueueEntry.from_dict(d).to_dict(), d)  # stable
+    self.assertEqual({k: d[k] for k in old if k in d},
+                     {k: old[k] for k in old if k in d})
 
 
 def _gpu_avail(cell, free, arch='h100', price=4.0):

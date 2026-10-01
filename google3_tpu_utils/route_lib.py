@@ -742,15 +742,32 @@ class Submission:
   created_at: Optional[float] = None    # epoch the experiment was created (early)
   confirmed_at: Optional[float] = None  # epoch the launch line was seen (late)
   ended_reason: str = ''
+  # ★THE ATTEMPT RECORD (Fix 8; unified_infra's dead_runs). Filled when the
+  # attempt starts (start_ckpt: the resume pointer it launched with, None =
+  # from scratch) and when it ends (end_attempt: outcome, ended_at, and
+  # end_step = the step of the checkpoint node it produced, None = no new
+  # progress). Optional and omitted from to_dict while unset, so rows written
+  # before these existed round-trip byte for byte.
+  start_ckpt: Optional[str] = None
+  end_step: Optional[int] = None
+  outcome: Optional[str] = None
+  ended_at: Optional[float] = None
 
   def to_dict(self) -> dict:
-    return dataclasses.asdict(self)
+    d = dataclasses.asdict(self)
+    for k in _SUBMISSION_OPTIONAL_KEYS:
+      if d.get(k) is None:
+        d.pop(k, None)
+    return d
 
   @classmethod
   def from_dict(cls, d: dict) -> 'Submission':
     known = {f.name for f in dataclasses.fields(cls)}
     return cls(**{k: v for k, v in d.items() if k in known})
 
+
+# Attempt-record keys written only once set (see Submission.start_ckpt).
+_SUBMISSION_OPTIONAL_KEYS = ('start_ckpt', 'end_step', 'outcome', 'ended_at')
 
 # Submission.state buckets. CREATING/SUBMITTED/RUNNING are live; the rest terminal.
 SUBMISSION_LIVE_STATES = frozenset({'CREATING', 'SUBMITTED', 'RUNNING'})
@@ -971,6 +988,18 @@ class QueueEntry:
   # ★How many times the rule set has already re-dispatched this row. Persisted,
   # because the budget is meaningless if it resets whenever the process does.
   auto_resumes: int = 0
+  # ★HARDWARE-DEATH BUDGET (Fix 6, operator 2026-10-01 00:51Z). A death whose
+  # log names a host/device fault draws on THIS counter, never on auto_resumes,
+  # so a run that used its preemption budget is still re-queued warm off a bad
+  # host (xid 294889693 was HELD at auto_resumes 3/3 for an NVLink fault).
+  # Capped by --hardware_resume_max. Omitted from to_dict while 0.
+  hardware_resumes: int = 0
+  # ★THE CHECKPOINT TRUNK (Fix 8): one node per attempt that saved a NEW
+  # checkpoint, {xid, checkpoint, step, cell, arch, at}, oldest first. Written
+  # only by note_known_checkpoint, so last_known_checkpoint == nodes[-1]
+  # ['checkpoint'] whenever nodes exist; nodes[-1] is the resume source.
+  # Omitted from to_dict while empty.
+  nodes: list = dataclasses.field(default_factory=list)
   # ★CNS READ FAILURES (operator 2026-09-30). Consecutive passes on which a
   # decision about this row needed a CNS read (its output dir, its checkpoints)
   # and the read FAILED -- a timeout or an error that is not a clean "not
@@ -1041,7 +1070,7 @@ class QueueEntry:
     if isinstance(value, property):
       return
     # Seed SUPERSEDED history BEFORE any current live submission. Used at
-    # construction (build_warm_restart_entry, tests). Preserves an already-open
+    # construction (tests, v1 migration). Preserves an already-open
     # current submission so `QueueEntry(xid=X, prior_xids=[...])` in either field
     # order yields [history..., current].
     cur = None
@@ -1084,7 +1113,8 @@ class QueueEntry:
     sub = Submission(seq=len(self.submissions) + 1,
                      xid=(str(xid) if xid else None), state='CREATING',
                      cell=cell, arch=arch, chips=chips, group=group,
-                     created_at=now)
+                     created_at=now,
+                     start_ckpt=resume_pointer_of(self) or None)
     self.submissions.append(sub)
     return sub
 
@@ -1096,6 +1126,14 @@ class QueueEntry:
     # not perturb merge_and_save_touched's baseline-equality check.
     d = dataclasses.asdict(self)
     d['state'] = self.state.value
+    # The chain fields are omitted at their defaults, so a row that never used
+    # them serialises exactly as it did before they existed (NPU constraint b:
+    # old-schema rows load, round-trip and save unchanged).
+    if not d.get('hardware_resumes'):
+      d.pop('hardware_resumes', None)
+    if not d.get('nodes'):
+      d.pop('nodes', None)
+    d['submissions'] = [s.to_dict() for s in self.submissions]
     return d
 
   @classmethod
@@ -1391,139 +1429,6 @@ def candidate_shapes(entry: QueueEntry,
   return out
 
 
-# ---------------------------------------------------------------------------
-# AUTO-RESUME RULE SET
-#
-# ★A RULE SET, NOT A RETRY LOOP. Each rule maps an OBSERVED failure to one of
-# three verdicts, and the default is DO NOTHING. Automatic re-dispatch is only
-# safe where the cause is known to be transient and OUTSIDE our control; where
-# the cause is on our side, an automatic retry is a machine for re-triggering
-# our own bug. That is not hypothetical: one line burned three XIDs in forty
-# minutes replaying into a price gate that re-routing can never clear.
-#
-# THE VERDICTS
-#   RESUME_XID   append a new work unit to the SAME experiment. The job then
-#                rediscovers its own newest complete checkpoint in-process
-#                (main.py::_apply_borg_autoresume, which enumerates
-#                $CHECKPOINT_BUCKET/checkpoints and skips any dir lacking
-#                extra.json -- a torn write). This is preferred over naming a
-#                path because the launcher cannot know which step survived,
-#                and CHECKPOINT_BUCKET is derived from the XID, so reusing the
-#                XID lands on the same prefix.
-#   LOAD_FROM    the old XID is unusable, so start a NEW experiment warm from
-#                an explicit checkpoint. ★Must point at a LEAF checkpoint dir,
-#                never its parent: orbax restores one directory, and passing
-#                `<bucket>/checkpoints` died with FileNotFoundError while ALSO
-#                suppressing auto-resume (which skips itself when LOAD_FROM is
-#                set). Travels ONLY as the env var, verbatim -- never as a
-#                config key, because which key wins differs per line, so
-#                writing the key keeps working on most and silently cold-starts
-#                the rest.
-#   HOLD         do not re-dispatch. Either the cause is ours, or we cannot see
-#                well enough to act.
-#
-# ★NEVER BOTH. --resume_xid and LOAD_FROM are mutually exclusive at the
-# launcher: setting LOAD_FROM disables the in-job rediscovery that --resume_xid
-# depends on. Emitting both silently picks the worse half.
-RESUME_XID = 'RESUME_XID'
-LOAD_FROM = 'LOAD_FROM'
-HOLD = 'HOLD'
-
-# Ordered (pattern, verdict, why). FIRST MATCH WINS, so the specific
-# prohibitions must precede the general permissions.
-_RESUME_RULES: list[tuple[str, str, str]] = [
-    # -- our own bugs: retrying re-triggers them ---------------------------
-    ('triggered_limit_order', HOLD,
-     'held by the global per-family price cap, which is pool-wide: re-routing '
-     'to another cell cannot clear it, so a retry is unbounded futile replay'),
-    ('zero work unit', HOLD,
-     'the launcher refused before adding a work unit (usually a metro with no '
-     'group storage), so nothing ran and there is no checkpoint to resume; the '
-     'fix is upstream, in cell selection'),
-    ('no work units were added', HOLD,
-     'same shell as the zero-work-unit case, seen in the launcher log'),
-    ('refusing to launch', HOLD,
-     'a launcher fail-closed gate (locality/bucket): deterministic, so a retry '
-     'reproduces it exactly'),
-    ('resource_exhausted', HOLD,
-     'quota or a poisoned personal bucket -- a retry writes another 0-byte file'),
-    # -- outside our control and transient: safe to continue ---------------
-    ('affinity_group_in_use', RESUME_XID,
-     'borg affinity group still in use from a prior attempt; transient conflict, safe to resume'),
-    ('affinity group', RESUME_XID,
-     'borg affinity group conflict; transient Borg state, safe to resume'),
-    ('affinitygroup', RESUME_XID,
-     'borg affinity group conflict; transient Borg state, safe to resume'),
-    ('task_action_fish', RESUME_XID,
-     'tpu hardware / ici security setup failure; transient host/hardware error, safe to resume'),
-    ('ici_security_setup', RESUME_XID,
-     'tpu ici security setup failure; transient host/hardware error, safe to resume'),
-    ('ici setup failure', RESUME_XID,
-     'tpu ici setup failure; transient host/hardware error, safe to resume'),
-    ('preempt', RESUME_XID,
-     'preemption is the normal cost of PROD sharing, not a defect; the work '
-     'already done is on CNS and the job can continue from it'),
-    ('evict', RESUME_XID, 'eviction is preemption by another name'),
-    ('task failure limit', RESUME_XID,
-     'borg retried the task past its limit; the experiment itself is intact'),
-    ('machine drain', RESUME_XID, 'planned host maintenance, nothing to fix'),
-    ('cancelled by pruner', LOAD_FROM,
-     'the pruner deletes the experiment, so its XID cannot be appended to; a '
-     'new one must start warm from the last surviving checkpoint'),
-]
-
-
-def classify_failure(reason: str) -> tuple[str, str]:
-  """Map a failure string to (verdict, why). Unmatched -> HOLD.
-
-  ★DEFAULTS TO HOLD, and an empty or unreadable reason holds too. "I do not
-  recognise this" must never become "retry it": the whole point of the rule set
-  is that re-dispatch is the exception, granted per known-transient cause.
-  """
-  r = (reason or '').strip().lower()
-  if not r:
-    return HOLD, 'no failure reason recorded -- cannot classify, so not acting'
-  for pat, verdict, why in _RESUME_RULES:
-    if pat in r:
-      return verdict, why
-  return HOLD, f'unrecognised failure ({r[:60]!r}); rule set defaults to HOLD'
-
-
-def plan_auto_resume(entry: 'QueueEntry',
-                     reason: str,
-                     checkpoint: Optional[str],
-                     max_auto_resumes: int = 3) -> tuple[str, str]:
-  """Decide whether this failed row may be re-dispatched, and how.
-
-  Returns (verdict, why). Verdict is one of RESUME_XID / LOAD_FROM / HOLD.
-
-  Three guards, each of which has a real incident behind it:
-    * a BUDGET, because an automatic retry with no ceiling is how three XIDs
-      went in forty minutes;
-    * NO CHECKPOINT, NO RESUME -- resuming a run that never wrote anything is
-      a cold start wearing a resume's clothes, and it re-enters whatever killed
-      it the first time;
-    * RESUME_XID needs a live XID to append to; without one the only honest
-      option is a warm start, and only if a checkpoint actually exists.
-  """
-  verdict, why = classify_failure(reason)
-  if verdict == HOLD:
-    return HOLD, why
-  used = int(getattr(entry, 'auto_resumes', 0) or 0)
-  if used >= max_auto_resumes:
-    return HOLD, (f'auto-resume budget spent ({used}/{max_auto_resumes}); '
-                  f'a human should look before this burns another XID')
-  if not checkpoint:
-    return HOLD, (f'{verdict} would be a cold start: no complete checkpoint '
-                  f'recorded for this job, so there is no progress to continue')
-  if verdict == RESUME_XID and not entry.xid:
-    if checkpoint:
-      return LOAD_FROM, ('no XID to append to, but a checkpoint exists: start a '
-                         'new experiment warm from it')
-    return HOLD, 'no XID and no checkpoint'
-  return verdict, why
-
-
 def checkpoint_step(path: Optional[str]) -> int:
   """The step number in a checkpoint path, or -1 if not parseable.
 
@@ -1618,10 +1523,18 @@ def pick_restart_checkpoint(entry: 'QueueEntry',
 
 
 def note_known_checkpoint(entry: 'QueueEntry', checkpoint: Optional[str],
-                          now: Optional[float] = None) -> bool:
+                          now: Optional[float] = None, *,
+                          at: Optional[float] = None) -> bool:
   """Record `checkpoint` as the row's last_known_checkpoint if it is newer than
   what the row already knows. Returns True when the record changed. `now`, when
-  given, stamps last_known_checkpoint_checked_at (the census rate limit).
+  given, stamps last_known_checkpoint_checked_at (the census rate limit); `at`
+  (default `now`) only timestamps the node.
+
+  ★This is the ONE writer of the checkpoint trunk (`nodes`), so
+  last_known_checkpoint == nodes[-1]['checkpoint'] holds by construction. New
+  progress by the attempt that already owns nodes[-1] moves that node forward;
+  progress by a later attempt appends a node. An attempt that saved nothing
+  new adds nothing (it is a leaf hanging off the node it started from).
 
   Call ONLY with a checkpoint read off this run's own output dirs, never with a
   resume pointer (see pick_restart_checkpoint for why)."""
@@ -1633,45 +1546,18 @@ def note_known_checkpoint(entry: 'QueueEntry', checkpoint: Optional[str],
   if cur and lineage_checkpoint_step(checkpoint) <= lineage_checkpoint_step(cur):
     return False
   entry.last_known_checkpoint = str(checkpoint)
+  when = at if at is not None else now
+  node = {'xid': entry.xid, 'checkpoint': str(checkpoint),
+          'step': lineage_checkpoint_step(checkpoint), 'cell': entry.cell,
+          'arch': entry.arch, 'at': float(when) if when is not None else None}
+  nodes = list(getattr(entry, 'nodes', None) or [])
+  if nodes and node['xid'] and nodes[-1].get('xid') == node['xid']:
+    nodes[-1] = node
+  else:
+    nodes.append(node)
+  entry.nodes = nodes
   return True
 
-
-def advance_resume_pointer(entry: 'QueueEntry') -> bool:
-  """Move a row's EXISTING resume pointer forward to its last_known_checkpoint,
-  under the same never-backwards rule as _apply_resume_pointer. Returns True
-  when the pointer moved.
-
-  For a requeue that is NOT a warm restart (the restart plan said HOLD, e.g. a
-  live same-config sibling): the row otherwise keeps the pointer it was first
-  given, and that stale pointer silently rewinds the run (2026-09-29: a row at
-  step 41500 was requeued still pointing at step_40000). Never adds a pointer to
-  a row that had none, and does not touch auto_resumes."""
-  known = getattr(entry, 'last_known_checkpoint', '') or ''
-  if not known or not resume_pointer_of(entry):
-    return False
-  lk = dict(entry.launch_kwargs or {})
-  before = dict(lk)
-  _apply_resume_pointer(lk, known)
-  if lk == before:
-    return False
-  entry.launch_kwargs = lk
-  return True
-
-
-# The pruned-restart verdict REUSES the LOAD_FROM contract: the pruner deleted
-# the old experiment, so there is no XID to append to (RESUME_XID is impossible)
-# and the only honest option is a NEW experiment warm from an explicit leaf
-# checkpoint. Named separately so call sites read as intent, not mechanism.
-RESUME_WARM = LOAD_FROM
-
-# A healthy run PREEMPTED before it wrote its first checkpoint has nothing to
-# resume FROM, but must still be retried -- a bounded COLD rerun from step 0.
-# Distinct from RESUME_WARM (which carries a LOAD_FROM pointer) and from HOLD: a
-# cold rerun re-enters the scheduler on a NEW cell (the old one now carries a
-# fresh eviction strike), so it does not simply die the same way. Gated in
-# plan_pruned_restart behind allow_cold, and bounded by the SAME auto_resume
-# budget as warm, so it can never loop unbounded.
-RESUME_COLD = 'RESUME_COLD'
 
 # Termination causes meaning "external kill of an otherwise-healthy run", for
 # which a cold rerun (when there is no checkpoint) is the right call. Matched as
@@ -1700,96 +1586,6 @@ def looks_trained(log_text: Optional[str]) -> bool:
   if not log_text:
     return False
   return re.search(r'(?<![A-Za-z])step\s+\d+', log_text, re.IGNORECASE) is not None
-
-
-def plan_pruned_restart(
-    entry: 'QueueEntry',
-    *,
-    xm_terminal: bool,
-    code_bug: Optional[str],
-    checkpoint: Optional[str],
-    other_live_writer: bool,
-    max_auto_resumes: int = 3,
-    trained: bool = False,
-    termination_cause: Optional[str] = None,
-    allow_cold: bool = False,
-) -> tuple[str, str]:
-  """Decide whether a TERMINATED row was PRUNED -- killed from outside an
-  otherwise-healthy run -- and may be re-queued warm from its last checkpoint.
-  Returns (verdict, why); verdict is RESUME_WARM, RESUME_COLD, or HOLD.
-
-  ★THIS IS THE CHECKPOINT-AS-EVIDENCE PATH, distinct from classify_failure's
-  reason-STRING path, and it exists because the two kinds of death look nothing
-  alike in the record. A WIM/duty-cycle prune -- and a plain preemption with no
-  restart budget -- leaves NO failure reason: the log stops mid-step, the work
-  unit goes terminal, and there is no traceback (measured on the dw line, killed
-  at step 1759 with a clean cut). classify_failure sees an empty reason and
-  correctly defaults to HOLD, because there is no string to match. So the signal
-  that an EXTERNAL kill hit a HEALTHY run, rather than a crash, is inverted: a
-  complete checkpoint survived AND the log carries no code-bug signature. That
-  is what this function keys on -- the presence of evidence, not the content of
-  a message.
-
-  Every guard defaults to HOLD, on purpose. An over-eager auto-resume is the
-  expensive direction: it burns PROD budget replaying a bug, or it puts a
-  SECOND writer on one checkpoint path (measured 2026-09-10: two jobs into one
-  out_dir, the 2.93 GB checkpoint at risk of truncation). HOLD costs one dead
-  row a human will see; a wrong RESUME costs a corrupted checkpoint or a bug on
-  a loop.
-  """
-  if not xm_terminal:
-    return HOLD, 'not terminal on XM -- nothing to restart'
-  if code_bug:
-    return HOLD, (
-        f'the log shows a code bug ({code_bug}); a warm restart would replay it '
-        f'and burn another XID. A human must fix the code first.')
-  if not checkpoint:
-    # Historically an UNCONDITIONAL hold. That mis-held 4 healthy PREEMPTED runs
-    # killed before their first save (2026-09-18): no checkpoint, but the log
-    # showed clean training. A COLD rerun (from step 0) is correct WHEN there is
-    # positive evidence the death was external to a healthy run -- a
-    # preemption/eviction/drain cause, or (cause unknown) the log shows it
-    # actually trained. It must still clear the SAME writer-safety and budget
-    # guards as a warm resume. Gated behind allow_cold so this is INERT until
-    # explicitly enabled (default off == byte-for-byte the old behavior).
-    cause = (termination_cause or '').strip().lower()
-    preempted = any(p in cause for p in _PREEMPTION_CAUSES)
-    if allow_cold and (preempted or trained):
-      if other_live_writer:
-        return HOLD, (
-            'another live job already writes this out_dir; re-queuing would put '
-            'a SECOND writer on one checkpoint path (truncation risk). Left '
-            'alone.')
-      used = int(getattr(entry, 'auto_resumes', 0) or 0)
-      if used >= max_auto_resumes:
-        return HOLD, (
-            f'auto-resume budget spent ({used}/{max_auto_resumes}); a human '
-            f'should look before this burns another XID')
-      if 'hardware' in cause:
-        why_ev = 'a hardware fault on the host'
-      elif preempted:
-        why_ev = 'a preemption/eviction cause'
-      else:
-        why_ev = 'no cause recorded but the log shows training progress'
-      return RESUME_COLD, (
-          f'terminal with no checkpoint, but {why_ev}: a healthy run killed '
-          f'before its first save -- bounded cold rerun from step 0')
-    return HOLD, (
-        'terminal with no complete checkpoint: a warm restart would be a cold '
-        'start, which re-enters whatever killed it. Nothing to continue from.')
-  if other_live_writer:
-    return HOLD, (
-        'another live job already writes this out_dir; re-queuing would put a '
-        'SECOND writer on one checkpoint path (truncation risk). Left alone.')
-  used = int(getattr(entry, 'auto_resumes', 0) or 0)
-  if used >= max_auto_resumes:
-    return HOLD, (
-        f'auto-resume budget spent ({used}/{max_auto_resumes}); a human should '
-        f'look before this burns another XID')
-  step = checkpoint_step(checkpoint)
-  return RESUME_WARM, (
-      f'pruned/preempted death of a healthy run (no code bug; checkpoint at '
-      f'step {step} survived) -- re-queue warm from the last checkpoint')
 
 
 # --------------------------------------------------------------------------
@@ -1985,28 +1781,6 @@ def looks_like_hardware_fault(log_tail: str) -> Optional[str]:
 HARDWARE_FAULT_COOLDOWN_S = 7200.0
 
 
-def carry_hardware_strike(new: 'QueueEntry', dead: 'QueueEntry', now: float,
-                          cooldown_s: float = HARDWARE_FAULT_COOLDOWN_S
-                          ) -> list[str]:
-  """Stamp the dead row's (cell, arch) onto its restart row `new` as a pair
-  cooldown + one eviction strike, so the restart is steered off the bad host's
-  cell. build_*_restart_entry deliberately carries no penalties (a fresh row),
-  which is right for a preemption but would let a hardware-fault restart land
-  straight back on the broken machine. Returns the keys stamped."""
-  keys = _blame_keys(dead)
-  if not keys:
-    return []
-  if not new.evictions:
-    new.evictions = {}
-  for key in keys:
-    stamp_pair_cooldown(new, key, now, cooldown_s)
-    rec = dict(new.evictions.get(key) or {})
-    rec['strikes'] = int(rec.get('strikes', 0) or 0) + 1
-    rec['last'] = now
-    new.evictions[key] = rec
-  return keys
-
-
 _OUT_DIR_PATTERNS = (
     re.compile(r"out_dir \(post-locality\) = '([^']+)'"),
     re.compile(r'checkpoint saved -> (\S+?)/steps/'),
@@ -2104,9 +1878,9 @@ def _elt_restart_from_checkpoint(
 def _apply_resume_pointer(lk: dict, checkpoint: str) -> dict:
   """Set the layout-correct resume pointer in launch_kwargs `lk` (mutated and
   returned). THE ONE PLACE the ELT-vs-torch layout trap is decided, shared by
-  build_warm_restart_entry (the reconcile path's fresh row) and
-  apply_warm_restart_in_place (the reroute path's existing row) so the
-  silently-destructive layout choice is never written twice.
+  requeue_in_place (a death's warm restart) and end_attempt's move pointer
+  (_set_pointer), so the silently-destructive layout choice is never written
+  twice.
 
   An ELT/EqR-jax CheckpointManager leaf (`<workdir>/checkpoints/<bare-int>`)
   resumes via restart_from(=workdir)+restart_step(=N) -- handed $LOAD_FROM
@@ -2138,172 +1912,480 @@ def _apply_resume_pointer(lk: dict, checkpoint: str) -> dict:
   return lk
 
 
-def build_warm_restart_entry(dead: 'QueueEntry', checkpoint: str,
-                             new_job_id: str) -> 'QueueEntry':
-  """A fresh QUEUED entry that resumes `dead` warm from `checkpoint`.
+# ---------------------------------------------------------------------------
+# ★ONE JOB = ONE ROW = ONE CHAIN, AND ONE WAY AN ATTEMPT ENDS (operator
+# 2026-10-01 01:31Z: "不要'打补丁'，不要'拆东墙补西墙'，而是整体做逻辑整治";
+# Fixes 6-8, unified_infra's "one job, one chain").
+#
+# A job keeps its row -- job_id, snapshot_dir, cooldowns, evictions, reroutes,
+# group -- for its whole life. Each XManager experiment is one ATTEMPT
+# (`submissions`, oldest first: the unified_infra `dead_runs` analogue). The
+# attempts that saved a NEW checkpoint form the `nodes` trunk, and nodes[-1] is
+# the resume source. Every way an attempt can end goes through end_attempt():
+# a reroute move (pending / never started / thrash), a death XManager reports,
+# a clean finish, or a deliberate `tpu cancel`. It
+#   1. records the attempt's outcome, end_step and ended_at;
+#   2. writes the row's memory (pair + group cooldown, eviction strike, the
+#      bad-host strike) and returns the fleet events for the caller to log;
+#   3. applies ONE budget policy, resume_budget(): DEATHS only. A HARDWARE
+#      death draws on hardware_resumes, any other death on auto_resumes, and a
+#      move never draws on either (operator 2026-10-01 02:15Z, decision 1);
+#   4. requeues IN PLACE -- warm from the chain's newest checkpoint, or a cold
+#      rerun only when the chain has none -- or retires the row (FAILED / HELD
+#      / DONE / cancelled); and
+#   5. names the dead xid the caller archives off the board, AFTER persisting.
+# decide_end() is the pure decision; end_attempt() applies it.
+# ---------------------------------------------------------------------------
 
-  Clones the launch spec (power / archs / tier / metros / workdir / config)
-  verbatim so the restart is the SAME run, wires the surviving checkpoint into
-  the RIGHT resume mechanism for its layout (see below), increments auto_resumes
-  (the budget the restart decision reads), and records the dead xid in
-  prior_xids. NOT called unless plan_pruned_restart returned RESUME_WARM, so
-  every guard has already passed.
+# How an attempt ended (AttemptEnd.kind).
+END_PENDING = 'pending'      # never started: XM PENDING past the deadline
+END_NOMINAL = 'nominal'      # never started: XM RUNNING, nothing on hardware
+END_THRASH = 'thrash'        # in-place preemption thrash, zero durable progress
+END_DEATH = 'death'          # XM reports the attempt terminal / gone
+END_DONE = 'done'            # ran to completion
+END_CANCELLED = 'cancelled'  # a deliberate `tpu cancel`
+MOVE_KINDS = frozenset({END_PENDING, END_NOMINAL, END_THRASH})
+_FLEET_KIND_OF_MOVE = {END_PENDING: 'pending', END_NOMINAL: 'pending',
+                       END_THRASH: 'thrash'}
+_OUTCOME_OF_MOVE = {END_PENDING: 'pending-timeout',
+                    END_NOMINAL: 'never-started', END_THRASH: 'thrash'}
 
-  ★RESUME MECHANISM IS LAYOUT-SPECIFIC, and picking the wrong one is silently
-  destructive. An ELT/EqR-jax CheckpointManager writes `<workdir>/checkpoints/
-  <step>` (a bare-integer leaf), and ELT TRAINING must resume via
-  restart_from(=workdir)+restart_step(=N): handed $LOAD_FROM instead, main_eqr
-  does `workdir = LOAD_FROM` and read+writes the rescued dir, so orbax
-  (max_to_keep) deletes the very checkpoints it resumed from (measured
-  2026-09-09: XID 288109183/288109952 died at step 0 this way). Every OTHER
-  fleet layout (torch `step_<N>.pt`, paligemma `checkpoint_<N>`, ...) honours
-  $LOAD_FROM. So we emit restart_from+restart_step for an ELT leaf and load_from
-  for everything else -- and CLEAR the other mechanism's keys, because the two
-  are mutually exclusive at the launcher (both set trips main_eqr's guard). See
-  elt_dit_pkg/configs/load_config.py::_apply_restart_from_env (the contract this
-  inverts) and elt_dit_pkg/load_from_guard.py (the runtime backstop).
-  """
-  lk = dict(getattr(dead, 'launch_kwargs', None) or {})
-  _apply_resume_pointer(lk, checkpoint)  # the shared ELT-vs-torch layout core
-  base = lk.get('exp_name') or dead.job_id
-  new_attempt = int(getattr(dead, 'auto_resumes', 0) or 0) + 1
-  lk['exp_name'] = _resume_exp_name(base, new_attempt)
-  prior = list(getattr(dead, 'prior_xids', None) or [])
-  if dead.xid:
-    prior.append(str(dead.xid))
-  entry = QueueEntry(
-      job_id=new_job_id,
-      # Carry the human label forward: a warm restart IS the same run, so it
-      # keeps its readable name. Only the opaque job_id is freshly minted (a new
-      # PK per §5.1), never the name -- so queue-status still shows what it is.
-      name=getattr(dead, 'name', '') or '',
-      power=dead.power,
-      allowed_archs=list(dead.allowed_archs),
-      tier=dead.tier,
-      allowed_metros=(list(dead.allowed_metros)
-                      if dead.allowed_metros else dead.allowed_metros),
-      priority=dead.priority,
-      power_tolerance=dead.power_tolerance,
-      max_price=dead.max_price,
-      launch_kwargs=lk,
-      workdir=dead.workdir,
-      # ★NOT snapshot_dir: a warm restart runs potentially DAYS after the
-      # original enqueue, by when the enqueue snapshot has been reclaimed (it is
-      # GC'd once the row reaches a terminal state, since the build's own
-      # durable CitC stagedir then exists). Inheriting that path would point the
-      # resume at a deleted directory and park it HELD. Leaving it empty makes
-      # package_dir fall back to `workdir` -- the pre-feature behavior, always
-      # safe. The enqueue snapshot protects the HUMAN's edit window between their
-      # enqueue and the first build; an infra-driven auto-resume has no such
-      # window to protect.
-      state=JobState.QUEUED,
-      auto_resumes=new_attempt,
-      last_reason=(f'auto warm-restart from {checkpoint} after '
-                   f'pruned/preempted death of {dead.job_id} '
-                   f'(xid {dead.xid})'),
-      # The lineage's newest known checkpoint travels with the run, so the NEXT
-      # restart can fall back to it if CNS is unreadable at that moment.
-      last_known_checkpoint=getattr(dead, 'last_known_checkpoint', '') or '',
-  )
-  # prior_xids is a DERIVED, property-backed field (Phase 2a), not a real
-  # __init__ parameter -- seed it through the setter AFTER construction (it
-  # records the carried-forward history as SUPERSEDED submissions). Passing it
-  # as a constructor kwarg tripped pyrefly with unexpected-keyword; the runtime
-  # dataclass tolerated it, so the offline suite never caught it.
-  entry.prior_xids = prior
-  return entry
+# What happens to the row (EndDecision.verdict).
+REQUEUE = 'REQUEUE'          # a move: back to QUEUED, no budget drawn
+RESUME_WARM = 'RESUME_WARM'  # a death: back to QUEUED, warm from the chain
+RESUME_COLD = 'RESUME_COLD'  # a death: back to QUEUED from scratch (no ckpt)
+HOLD = 'HOLD'                # a death: FAILED, left on the board for a human
+HELD = 'HELD'                # a death, CNS unreadable and nothing known: HELD
+FAILED = 'FAILED'            # a death with auto-resume off: FAILED, as always
+DONE = 'DONE'
+CANCELLED = 'CANCELLED'
+REQUEUE_VERDICTS = frozenset({REQUEUE, RESUME_WARM, RESUME_COLD})
+
+BUDGET_AUTO = 'auto'
+BUDGET_HARDWARE = 'hardware'
+DEFAULT_AUTO_RESUME_MAX = 3
+# Operator 2026-10-01 00:51Z: three bad hosts in a row is suspicious enough for
+# a human; a hardware death never spends the normal budget.
+DEFAULT_HARDWARE_RESUME_MAX = 3
+
+_CAUSE_WORDS = ('preempt', 'evict', 'drain', 'reclaim', 'pruned', 'affinity',
+                'ici', 'fish')
 
 
-def build_cold_restart_entry(dead: 'QueueEntry',
-                             new_job_id: str) -> 'QueueEntry':
-  """A fresh QUEUED entry that COLD-reruns `dead` from step 0.
-
-  The twin of build_warm_restart_entry for the case a healthy run was PREEMPTED
-  before it wrote its first checkpoint: there is nothing to resume FROM, so this
-  clones the launch spec verbatim but wires NO resume pointer (no load_from /
-  restart_from) -- the job starts fresh. It STILL increments auto_resumes, so a
-  cold rerun is bounded by the SAME budget as warm and can never loop unbounded,
-  and it records the dead xid in prior_xids. NOT called unless
-  plan_pruned_restart returned RESUME_COLD, so every guard (no code bug,
-  writer-safe, budget, preempted-or-trained) has already passed.
-
-  Why a cold rerun does not simply re-enter the same wall: the dead row stamped
-  an eviction strike on the cell that killed it, so the router's next placement
-  avoids that cell. Like warm, this does NOT inherit snapshot_dir (it may run
-  days later, by when the enqueue snapshot is GC'd) -- package_dir falls back to
-  workdir, the always-safe pre-feature behavior.
-  """
-  lk = dict(getattr(dead, 'launch_kwargs', None) or {})
-  # COLD: strip any resume pointer that might be lingering in the cloned spec,
-  # so nothing points the fresh run at an old checkpoint.
-  lk.pop('load_from', None)
-  lk.pop('restart_from', None)
-  lk.pop('restart_step', None)
-  base = lk.get('exp_name') or dead.job_id
-  new_attempt = int(getattr(dead, 'auto_resumes', 0) or 0) + 1
-  lk['exp_name'] = _resume_exp_name(base, new_attempt)
-  prior = list(getattr(dead, 'prior_xids', None) or [])
-  if dead.xid:
-    prior.append(str(dead.xid))
-  entry = QueueEntry(
-      job_id=new_job_id,
-      name=getattr(dead, 'name', '') or '',
-      power=dead.power,
-      allowed_archs=list(dead.allowed_archs),
-      tier=dead.tier,
-      allowed_metros=(list(dead.allowed_metros)
-                      if dead.allowed_metros else dead.allowed_metros),
-      priority=dead.priority,
-      power_tolerance=dead.power_tolerance,
-      max_price=dead.max_price,
-      launch_kwargs=lk,
-      workdir=dead.workdir,
-      state=JobState.QUEUED,
-      auto_resumes=new_attempt,
-      last_reason=(f'auto COLD rerun (no checkpoint) after '
-                   f'pruned/preempted death of {dead.job_id} '
-                   f'(xid {dead.xid})'),
-  )
-  # prior_xids is DERIVED/property-backed (see build_warm_restart_entry) -- seed
-  # it through the setter AFTER construction, not as a constructor kwarg.
-  entry.prior_xids = prior
-  return entry
+@dataclasses.dataclass
+class AttemptEnd:
+  """What the caller observed about the attempt that just ended. Only the I/O
+  layer fills this; end_attempt never reads CNS or XManager itself."""
+  kind: str
+  # The last_reason to stamp on a retired row (FAILED/DONE); '' = default.
+  reason: str = ''
+  # Text a termination cause is read from (prior last_reason + XM's message).
+  cause_text: str = ''
+  found_checkpoint: Optional[str] = None
+  read_error: str = ''          # the CNS evidence read failed
+  evidence_read: bool = False   # an evidence reader was consulted at all
+  code_bug: Optional[str] = None
+  trained: bool = False
+  hardware: Optional[str] = None
+  xm_status: str = ''
+  cancelled_when: str = ''
 
 
-def apply_warm_restart_in_place(entry: 'QueueEntry',
-                                checkpoint: str) -> 'QueueEntry':
-  """Wire `checkpoint` into an EXISTING row's launch_kwargs as the
-  layout-correct resume pointer, bump auto_resumes, and re-suffix exp_name --
-  the IN-PLACE twin of build_warm_restart_entry.
+@dataclasses.dataclass(frozen=True)
+class ResumePolicy:
+  """The one budget/memory policy. enabled = --auto_resume_pruned: with it off
+  a death retires the row FAILED exactly as reconcile always did."""
+  enabled: bool = False
+  auto_resume_max: int = DEFAULT_AUTO_RESUME_MAX
+  hardware_resume_max: int = DEFAULT_HARDWARE_RESUME_MAX
+  cooldown_s: float = 1800.0
+  hardware_cooldown_s: float = HARDWARE_FAULT_COOLDOWN_S
 
-  ★RECONCILE/REROUTE PARITY. run_reconcile handles a just-FAILED row by
-  APPENDING a fresh build_warm_restart_entry row: it has no row to keep (the
-  dead one goes FAILED), and a new row needs its whole spec cloned. run_reroute
-  is MOVING a row it KEEPS -- same job_id, same reroute counter, and
-  (crucially) the pair cooldown + eviction strike mark_reroute/record_eviction
-  just stamped ON THIS ROW so the next placement avoids the cell it was pulled
-  off. build_warm_restart_entry carries NONE of those forward, so substituting a
-  fresh row would re-land the job on the hot cell it was evicted from. So the
-  reroute path re-queues the SAME row and only wires the resume pointer into it
-  here, sharing the layout core (_apply_resume_pointer) so the ELT-vs-torch trap
-  is decided identically to the new-row path.
 
-  Call AFTER mark_reroute (which resets the row to QUEUED and supersedes the dead
-  xid into prior_xids); this only touches the resume keys, auto_resumes and the
-  cosmetic exp_name. Mirrors build_warm_restart_entry's auto_resumes++ so the two
-  restart paths share ONE budget and a job cannot dodge it by alternating paths.
-  """
+@dataclasses.dataclass(frozen=True)
+class EndDecision:
+  verdict: str
+  why: str
+  checkpoint: str = ''
+  budget: str = ''     # BUDGET_AUTO / BUDGET_HARDWARE for RESUME_*, else ''
+  pointer: str = ''    # moves: 'set' (newest chain ckpt) / 'advance' / ''
+
+
+@dataclasses.dataclass
+class EndResult:
+  verdict: str
+  why: str
+  checkpoint: str = ''
+  budget: str = ''
+  pointer: str = ''
+  pointer_moved: bool = False
+  fleet_events: list = dataclasses.field(default_factory=list)
+  steered: list = dataclasses.field(default_factory=list)
+  archive_xid: Optional[str] = None
+
+
+def termination_cause(text: str, entry: 'QueueEntry') -> Optional[str]:
+  """Best-effort termination cause, or None. A clean preemption leaves NO
+  cause in the job's own stdout, so this reads the row: an explicit
+  preempt/evict/drain/... word in `text`, else any eviction STRIKE on the row
+  (the router stamps one exactly when a cell evicts this job). Never raises."""
+  reason = (text or '').lower()
+  for word in _CAUSE_WORDS:
+    if word in reason:
+      return word
+  evictions = getattr(entry, 'evictions', None) or {}
+  try:
+    if any(int((v or {}).get('strikes', 0)) > 0 for v in evictions.values()):
+      return 'evict'
+  except (AttributeError, TypeError, ValueError):
+    pass
+  return None
+
+
+def resume_budget(entry: 'QueueEntry', budget: str,
+                  policy: ResumePolicy) -> tuple[int, int]:
+  """(used, cap) of the budget a death draws on. Fix 6: HARDWARE has its own."""
+  if budget == BUDGET_HARDWARE:
+    return (int(getattr(entry, 'hardware_resumes', 0) or 0),
+            int(policy.hardware_resume_max))
+  return int(getattr(entry, 'auto_resumes', 0) or 0), int(policy.auto_resume_max)
+
+
+def _second_writer_why() -> str:
+  return ('another live job already writes this out_dir; re-queuing would put '
+          'a SECOND writer on one checkpoint path (truncation risk). Left '
+          'alone.')
+
+
+def _death_verdict(entry: 'QueueEntry', end: AttemptEnd, policy: ResumePolicy,
+                   ckpt: str, budget: str,
+                   entries: Sequence['QueueEntry']) -> tuple[str, str]:
+  """RESUME_WARM / RESUME_COLD / HOLD for a death with auto-resume on. Every
+  guard defaults to HOLD: a wrong resume replays a bug or adds a second writer;
+  a HOLD costs one row a human looks at."""
+  if end.code_bug:
+    return HOLD, (
+        f'the log shows a code bug ({end.code_bug}); a warm restart would '
+        f'replay it and burn another XID. A human must fix the code first.')
+  if has_live_config_sibling(entry, entries):
+    return HOLD, _second_writer_why()
+  used, cap = resume_budget(entry, budget, policy)
+  if used >= cap:
+    if budget == BUDGET_HARDWARE:
+      return HOLD, (
+          f'hardware-resume budget spent ({used}/{cap}): {cap} bad hosts in a '
+          f'row is suspicious; a human should look before this burns another '
+          f'XID')
+    return HOLD, (f'auto-resume budget spent ({used}/{cap}); a human should '
+                  f'look before this burns another XID')
+  what = (f'a hardware fault on the host ({end.hardware})' if end.hardware
+          else 'a pruned/preempted death of a healthy run')
+  if ckpt:
+    # Rule 2 of Fix 8: a rerun never discards progress. ckpt is the CHAIN's
+    # newest checkpoint, so an attempt that died before saving anything still
+    # resumes from the node it started from.
+    return RESUME_WARM, (
+        f'{what} (no code bug; checkpoint at step '
+        f'{lineage_checkpoint_step(ckpt)} in the chain) -- re-queue warm from '
+        f'the chain\'s newest checkpoint')
+  cause = (f'hardware: {end.hardware}' if end.hardware
+           else (termination_cause(end.cause_text, entry) or ''))
+  preempted = any(p in cause for p in _PREEMPTION_CAUSES)
+  if not end.read_error and (preempted or end.trained):
+    why_ev = ('a hardware fault on the host' if end.hardware
+              else 'a preemption/eviction cause' if preempted
+              else 'no cause recorded but the log shows training progress')
+    return RESUME_COLD, (
+        f'terminal with no checkpoint anywhere in the chain, but {why_ev}: a '
+        f'healthy run killed before its first save -- bounded cold rerun from '
+        f'step 0')
+  return HOLD, (
+      'terminal with no complete checkpoint: a warm restart would be a cold '
+      'start, which re-enters whatever killed it. Nothing to continue from.')
+
+
+def decide_end(entry: 'QueueEntry', end: AttemptEnd, policy: ResumePolicy,
+               entries: Sequence['QueueEntry'] = ()) -> EndDecision:
+  """THE pure decision for an ending attempt. No I/O, no mutation, so the
+  dry-run and the live pass decide identically."""
+  if end.kind in MOVE_KINDS:
+    ckpt = pick_restart_checkpoint(entry, end.found_checkpoint)
+    if not ckpt:
+      return EndDecision(REQUEUE, 'no checkpoint in the chain')
+    if end.code_bug:
+      return EndDecision(
+          REQUEUE, f'code bug in the tail ({end.code_bug}): resume pointer '
+          f'not re-aimed, only kept from going backwards', ckpt, pointer='advance')
+    if has_live_config_sibling(entry, entries):
+      return EndDecision(REQUEUE, _second_writer_why(), ckpt, pointer='advance')
+    return EndDecision(
+        REQUEUE, f'resumes from the chain\'s newest checkpoint (step '
+        f'{lineage_checkpoint_step(ckpt)})', ckpt, pointer='set')
+  if end.kind == END_DONE:
+    return EndDecision(DONE, 'completed normally')
+  if end.kind == END_CANCELLED:
+    return EndDecision(CANCELLED, 'cancelled via tpu cancel; not a crash, no '
+                       'auto-resume')
+  if not policy.enabled:
+    return EndDecision(FAILED, 'auto-resume is off')
+  if end.read_error:
+    # Only a checkpoint this chain was actually SEEN to write counts: the
+    # pointer it started from may be days behind.
+    ckpt = getattr(entry, 'last_known_checkpoint', '') or ''
+  else:
+    ckpt = pick_restart_checkpoint(entry, end.found_checkpoint)
+  budget = BUDGET_HARDWARE if end.hardware else BUDGET_AUTO
+  verdict, why = _death_verdict(entry, end, policy, ckpt, budget, entries)
+  if end.read_error and verdict != RESUME_WARM:
+    return EndDecision(HELD, why, ckpt)
+  return EndDecision(verdict, why,
+                     ckpt if verdict == RESUME_WARM else '',
+                     budget if verdict in (RESUME_WARM, RESUME_COLD) else '')
+
+
+def _outcome_of(end: AttemptEnd, entry: 'QueueEntry') -> str:
+  if end.kind in MOVE_KINDS:
+    return _OUTCOME_OF_MOVE[end.kind]
+  if end.kind == END_DONE:
+    return 'done'
+  if end.kind == END_CANCELLED:
+    return 'cancelled'
+  if end.hardware:
+    return 'hardware'
+  if end.code_bug:
+    return 'code-bug'
+  if termination_cause(end.cause_text, entry):
+    return 'preempted'
+  if end.xm_status == 'GONE':
+    return 'gone'
+  return 'died'
+
+
+def _close_attempt(entry: 'QueueEntry', xid: Optional[str], outcome: str,
+                   now: float) -> None:
+  """Record outcome / ended_at / end_step on the attempt that just ended. The
+  submission's STATE is moved by the transition itself (SUPERSEDED for a
+  requeue, FAILED / DONE / CANCELLED for a retirement)."""
+  cur = entry.current_submission
+  if cur is None or not xid or cur.xid != xid:
+    return
+  cur.outcome = outcome
+  cur.ended_at = float(now)
+  nodes = getattr(entry, 'nodes', None) or []
+  if nodes and nodes[-1].get('xid') == xid:
+    cur.end_step = nodes[-1].get('step')
+
+
+def _supersede_current(entry: 'QueueEntry', reason: str) -> None:
+  """Move the live submission to SUPERSEDED (its id stays in history)."""
+  if entry.submissions and entry.submissions[-1].state in SUBMISSION_LIVE_STATES:
+    entry.submissions[-1].state = 'SUPERSEDED'
+    if not entry.submissions[-1].ended_reason:
+      entry.submissions[-1].ended_reason = reason
+
+
+def _reset_to_queued(entry: 'QueueEntry') -> None:
+  entry.state = JobState.QUEUED
+  entry.cell = None
+  entry.arch = None
+  entry.chips = None
+  entry.submitted_at = None
+
+
+def _set_pointer(entry: 'QueueEntry', checkpoint: str) -> bool:
+  """Aim the row's resume pointer at `checkpoint` (layout-correct, never
+  backwards). True when launch_kwargs changed."""
   lk = dict(entry.launch_kwargs or {})
+  before = dict(lk)
   _apply_resume_pointer(lk, checkpoint)
-  new_attempt = int(getattr(entry, 'auto_resumes', 0) or 0) + 1
-  base = lk.get('exp_name') or getattr(entry, 'name', '') or entry.job_id
-  lk['exp_name'] = _resume_exp_name(base, new_attempt)
+  if lk == before:
+    return False
   entry.launch_kwargs = lk
-  entry.auto_resumes = new_attempt
-  entry.last_reason = (f'{entry.last_reason}; warm-restart from {checkpoint}'
-                       if entry.last_reason
-                       else f'warm-restart from {checkpoint}')
-  return entry
+  return True
+
+
+def _advance_pointer(entry: 'QueueEntry') -> bool:
+  """Move an EXISTING pointer forward to last_known_checkpoint; never adds one
+  (2026-09-29: a row at step 41500 was requeued pointing at step_40000)."""
+  known = getattr(entry, 'last_known_checkpoint', '') or ''
+  if not known or not resume_pointer_of(entry):
+    return False
+  return _set_pointer(entry, known)
+
+
+def _strike_bad_host(entry: 'QueueEntry', now: float,
+                     cooldown_s: float) -> list[str]:
+  """A hardware death: cool the (cell, arch) it died on and add an eviction
+  strike, ON THIS ROW, so its requeue is steered off the broken host's cell."""
+  keys = _blame_keys(entry)
+  if not keys:
+    return []
+  if not entry.evictions:
+    entry.evictions = {}
+  for key in keys:
+    stamp_pair_cooldown(entry, key, now, cooldown_s)
+    rec = dict(entry.evictions.get(key) or {})
+    rec['strikes'] = int(rec.get('strikes', 0) or 0) + 1
+    rec['last'] = now
+    entry.evictions[key] = rec
+  return keys
+
+
+def requeue_in_place(entry: 'QueueEntry', verdict: str, checkpoint: str = '',
+                     *, budget: str = BUDGET_AUTO, reason: str = '') -> None:
+  """Send a DEAD attempt's row back to QUEUED in place (Fix 8).
+
+  WARM aims the resume pointer at `checkpoint` through _apply_resume_pointer
+  (the ELT restart_from+restart_step vs load_from trap is decided there and
+  only there); COLD strips every resume key. One budget is drawn
+  (auto_resumes, or hardware_resumes for a hardware death) and exp_name gets
+  the '-r<attempt>' suffix. job_id, name, snapshot_dir, cooldowns, evictions,
+  reroutes and group are KEPT: the row never passes through FAILED, so the
+  snapshot GC never reclaims the code the run was enqueued with."""
+  lk = dict(entry.launch_kwargs or {})
+  if verdict == RESUME_WARM and checkpoint:
+    _apply_resume_pointer(lk, checkpoint)
+  else:
+    for k in ('load_from', 'restart_from', 'restart_step'):
+      lk.pop(k, None)
+  if budget == BUDGET_HARDWARE:
+    entry.hardware_resumes = int(entry.hardware_resumes or 0) + 1
+  else:
+    entry.auto_resumes = int(entry.auto_resumes or 0) + 1
+  attempt = int(entry.auto_resumes or 0) + int(entry.hardware_resumes or 0)
+  base = lk.get('exp_name') or getattr(entry, 'name', '') or entry.job_id
+  lk['exp_name'] = _resume_exp_name(base, attempt)
+  entry.launch_kwargs = lk
+  _supersede_current(entry, reason or 'died; requeued in place')
+  _reset_to_queued(entry)
+  entry.last_reason = reason
+
+
+def end_attempt(entry: 'QueueEntry', end: AttemptEnd, policy: ResumePolicy,
+                now: float,
+                entries: Sequence['QueueEntry'] = ()) -> EndResult:
+  """THE attempt-end handler: apply decide_end() to `entry` in place.
+
+  Must be called while entry.xid / cell / arch still name the attempt that
+  ended. Returns what the caller must do outside: record fleet_events, and
+  archive `archive_xid` off the board ONLY after the queue write persisting
+  this row has succeeded (never on a retirement: a FAILED / HELD row stays on
+  the board for a human)."""
+  xid = entry.xid
+  if end.found_checkpoint and not end.read_error:
+    note_known_checkpoint(entry, end.found_checkpoint, at=now)
+  d = decide_end(entry, end, policy, entries)
+  res = EndResult(verdict=d.verdict, why=d.why, checkpoint=d.checkpoint,
+                  budget=d.budget, pointer=d.pointer)
+  _close_attempt(entry, xid, _outcome_of(end, entry), now)
+  # Memory, read while cell/arch still name the placement.
+  if end.kind in MOVE_KINDS:
+    res.fleet_events = fleet_events_for(entry, _FLEET_KIND_OF_MOVE[end.kind],
+                                        now)
+    if end.kind == END_THRASH:
+      record_eviction(entry, now)
+  elif end.kind == END_DEATH and end.hardware:
+    # A broken host is fleet news whether or not this row restarts.
+    res.fleet_events = fleet_events_for(entry, 'hardware', now)
+    res.steered = _strike_bad_host(entry, now, policy.hardware_cooldown_s)
+  v = d.verdict
+  if v == REQUEUE:
+    mark_reroute(entry, now, policy.cooldown_s)
+    if d.pointer == 'set':
+      res.pointer_moved = _set_pointer(entry, d.checkpoint)
+    elif d.pointer == 'advance':
+      res.pointer_moved = _advance_pointer(entry)
+  elif v in (RESUME_WARM, RESUME_COLD):
+    how = (f'auto warm-restart in place from {d.checkpoint}'
+           if v == RESUME_WARM else 'auto COLD rerun in place (no checkpoint)')
+    # Keep the death's own reason (cause, 'zombie cleaned up') on the row: the
+    # requeued row is the only record a human reads.
+    died = end.reason or reconcile_reason(entry.state, JobState.FAILED,
+                                          end.xm_status)
+    requeue_in_place(entry, v, d.checkpoint, budget=d.budget,
+                     reason=(f'{how} after xid {xid} ended '
+                             f'({_outcome_of(end, entry)}); {died}'))
+  elif v in (FAILED, HOLD, HELD):
+    old = entry.state
+    entry.state = JobState.FAILED
+    sync_current_submission(entry, JobState.FAILED, reason=end.reason)
+    entry.last_reason = end.reason or reconcile_reason(
+        old, JobState.FAILED, end.xm_status)
+    if v == HOLD and 'code bug (' in d.why and 'cause:' not in entry.last_reason:
+      entry.last_reason = f'{entry.last_reason} [{d.why.split(";")[0]}]'
+    if v == HELD:
+      hold_entry(entry, (
+          f'CNS unreadable on {entry.cns_read_failures} consecutive checks '
+          f'after XM reported the job dead, and no known checkpoint to resume '
+          f'from ({d.why}). Check the run\'s output dir by hand; `tpu requeue` '
+          f'restarts it AS IS (cold unless it has a resume pointer). Last read '
+          f'error: {end.read_error}'))
+  elif v == DONE:
+    old = entry.state
+    entry.state = JobState.DONE
+    sync_current_submission(entry, JobState.DONE, reason=end.reason)
+    entry.last_reason = end.reason or reconcile_reason(old, JobState.DONE, '')
+  elif v == CANCELLED:
+    mark_cancelled(entry, when=end.cancelled_when)
+  if end.evidence_read and not end.read_error:
+    entry.cns_read_failures = 0
+    entry.cns_read_error = ''
+  res.archive_xid = xid if v in REQUEUE_VERDICTS else None
+  return res
+
+
+def _step_label(path: Optional[str]) -> str:
+  if not path:
+    return 'scratch'
+  s = lineage_checkpoint_step(path)
+  return f'step_{s}' if s >= 0 else str(path)
+
+
+def chain_tree_lines(entry: 'QueueEntry') -> list[str]:
+  """The row's chain as text: the checkpoint trunk (nodes), then every attempt
+  as an EDGE (it produced a node) or a LEAF hanging off the node it started
+  from. Read-only; shown by `route_check --show_chain=<job>`."""
+  name = f' ({entry.name})' if getattr(entry, 'name', '') else ''
+  lines = [f'chain {entry.job_id}{name}: {entry.state.value}, '
+           f'{len(entry.submissions)} attempt(s), auto_resumes='
+           f'{entry.auto_resumes}, hardware_resumes={entry.hardware_resumes}, '
+           f'reroutes={entry.reroutes}']
+  trunk = ['scratch'] + [
+      f"{_step_label(n.get('checkpoint'))} ({n.get('xid') or '?'} "
+      f"{n.get('cell') or '?'}/{n.get('arch') or '?'})"
+      for n in (entry.nodes or [])]
+  lines.append('  trunk: ' + ' -> '.join(trunk))
+  for s in entry.submissions:
+    live = s.state in SUBMISSION_LIVE_STATES
+    if s.start_ckpt:
+      start = _step_label(s.start_ckpt)
+    elif live or s.outcome:
+      start = 'scratch'
+    else:
+      start = '?'          # recorded before attempts carried a start pointer
+    end = f'step_{s.end_step}' if s.end_step is not None else '-'
+    shape = 'live' if live else ('edge' if s.end_step is not None else 'leaf')
+    lines.append(f'  #{s.seq} {s.xid or "(no xid)"} {s.cell or "?"}/'
+                 f'{s.arch or "?"} start={start} -> end={end} '
+                 f'{s.outcome or s.state} [{shape}]')
+  return lines
+
+
+def chain_board_violations(entries: Sequence['QueueEntry'],
+                           board_xids) -> list[tuple[str, list[str]]]:
+  """(job_id, xids) for every live row with MORE THAN ONE of its xids on the
+  `tpu check` board (Fix 7's invariant: at most one per router-made chain).
+  Manual resumes are separate rows with no submissions linkage, so they never
+  count. Pure; the caller only logs."""
+  board = {str(x) for x in board_xids}
+  out = []
+  for e in entries:
+    if e.state in FINISHED_STATES:
+      continue
+    on = sorted(entry_xids(e) & board, key=lambda x: (len(x), x))
+    if len(on) > 1:
+      out.append((e.job_id, on))
+  return out
 
 
 def _metro_has_group_storage(metro: str) -> bool:
@@ -2862,6 +2944,8 @@ def apply_placement(entry: QueueEntry, placement: Placement, xid: str,
     cur.confirmed_at = now
     if cur.created_at is None:
       cur.created_at = now
+    if cur.start_ckpt is None:
+      cur.start_ckpt = resume_pointer_of(entry) or None
   else:
     # A DIFFERENT live xid means a genuine re-submit: supersede the old record
     # (its id survives in history -- NEVER orphaned, the whole point of §5.2)
@@ -2871,7 +2955,8 @@ def apply_placement(entry: QueueEntry, placement: Placement, xid: str,
     entry.submissions.append(Submission(
         seq=len(entry.submissions) + 1, xid=xid, state='SUBMITTED',
         cell=placement.cell, arch=placement.arch, chips=placement.chips,
-        group=getattr(entry, 'group', None), created_at=now, confirmed_at=now))
+        group=getattr(entry, 'group', None), created_at=now, confirmed_at=now,
+        start_ckpt=resume_pointer_of(entry) or None))
   entry.cell = placement.cell
   entry.arch = placement.arch
   entry.chips = placement.chips
@@ -3851,18 +3936,25 @@ def reconcile_entry(entry: QueueEntry, xm_status: str, reason: str = '',
   entry.state = new_state
   # Keep the authoritative submission record in step with the row transition.
   sync_current_submission(entry, new_state, reason=reason)
-  if new_state == JobState.DONE:
-    entry.last_reason = reason or f'reconciled: XM reports COMPLETED (was local {old.value}); finished normally'
-  elif new_state == JobState.FAILED:
-    if xm_status == 'GONE':
-      entry.last_reason = reason or (
-          f'reconciled: XM resolves the id but reports ZERO work units '
-          f'(was local {old.value}); experiment is gone, row cleaned up')
-    else:
-      entry.last_reason = reason or f'reconciled: XM reports terminal (was local {old.value}); zombie cleaned up'
-  elif new_state == JobState.RUNNING:
-    entry.last_reason = reason or f'reconciled: XM confirms RUNNING (was local {old.value})'
+  entry.last_reason = reason or reconcile_reason(old, new_state, xm_status)
   return True
+
+
+def reconcile_reason(old: 'JobState', new_state: 'JobState',
+                     xm_status: str) -> str:
+  """The default last_reason for a reconcile transition old -> new_state."""
+  if new_state == JobState.DONE:
+    return (f'reconciled: XM reports COMPLETED (was local {old.value}); '
+            f'finished normally')
+  if new_state == JobState.FAILED:
+    if xm_status == 'GONE':
+      return (f'reconciled: XM resolves the id but reports ZERO work units '
+              f'(was local {old.value}); experiment is gone, row cleaned up')
+    return (f'reconciled: XM reports terminal (was local {old.value}); zombie '
+            f'cleaned up')
+  if new_state == JobState.RUNNING:
+    return f'reconciled: XM confirms RUNNING (was local {old.value})'
+  return ''
 
 
 def mark_cancelled(entry: QueueEntry, reason: str = '', when: str = '') -> bool:
