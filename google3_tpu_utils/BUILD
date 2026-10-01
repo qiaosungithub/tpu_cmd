@@ -345,6 +345,24 @@ pytype_strict_contrib_test(
     ],
 )
 
+# Borg staging/test 'twin' cells (names matching `-c(-staging|-test)?$`, e.g.
+# yucbfad-c-staging) advertise free chips but fail 100% at PROD turn-up. The
+# availability -> placement path must exclude them the way the market layer
+# already does. Asserts build_availability drops them from BOTH the candidate
+# pool and the arch-pool magnitude, that best_cell_for_shape / plan_one then
+# pick the real cell despite the twin's far larger free-chip count, and a
+# NEGATIVE CONTROL feeding the twin directly (which IS chosen without the
+# filter) so the test can actually fail.
+pytype_strict_contrib_test(
+    name = "stagingcell_test",
+    srcs = ["stagingcell_test.py"],
+    deps = [
+        ":avail_provider",
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
 # A caller's alloc-group PIN beats the g5/g3-first preference (operator GO
 # 2026-08-31 10:2xZ). Four negative controls: an unpinned job still picks g5,
 # a blank pin is not a pin, a pinned job still obeys the g9 income/10 bar, and
@@ -553,15 +571,6 @@ pytype_strict_contrib_test(
 )
 
 pytype_strict_contrib_test(
-    name = "archcooldown_test",
-    srcs = ["archcooldown_test.py"],
-    deps = [
-        ":route_lib",
-        "//testing/pybase",
-    ],
-)
-
-pytype_strict_contrib_test(
     name = "reroutebrake_test",
     srcs = ["reroutebrake_test.py"],
     deps = [
@@ -574,6 +583,25 @@ pytype_strict_contrib_test(
 pytype_strict_contrib_test(
     name = "gonezombie_test",
     srcs = ["gonezombie_test.py"],
+    deps = [
+        ":route_check_lib",
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
+# A job killed at Borg TURN-UP (xid 291448297: "Turning up failed:
+# INVALID_ARGUMENT: Try to create job in <cell>...") is transient -- an
+# immediate re-submit lands on a healthy cell. reconcile reads the DETAILED XM
+# termination message through a NEW fail-open failure_message() channel and, on
+# a whitelist match within auto-resume budget, re-queues the row COLD instead of
+# leaving it terminal FAILED. The NEGATIVE CONTROLS carry the file: budget spent,
+# unreadable/empty message, a code-bug signature, a non-matching reason, the flag
+# off, and the global brake must ALL leave the row FAILED; a normal preemption
+# must still take the existing pruned/preempted warm path.
+pytype_strict_contrib_test(
+    name = "turnupretry_test",
+    srcs = ["turnupretry_test.py"],
     deps = [
         ":route_check_lib",
         ":route_lib",
