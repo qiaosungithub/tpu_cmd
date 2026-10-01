@@ -564,6 +564,20 @@ class StatusWhyTest(unittest.TestCase):
     self.assertIn('PLACEABLE now', out)
     self.assertNotIn('waiting:', out)
 
+  def test_status_uses_the_routers_debited_view(self):
+    # c7 shows 10 free v7-32 slices and our own SUBMITTED row already claims
+    # one of them in the GQM auction: the status board plans on the router's
+    # debited view (one placement view, operator 2026-10-01; in-flight debit,
+    # operator 2026-09-30), so it reports 9.
+    with _FlagCtx(_FLEET_PAIR_EVENTS_FILE=''):
+      self.assertIn('-> c7 (10 free slice(s)', self._status(oversold=False))
+      held = R.QueueEntry(job_id='s1', power='v7-32', allowed_archs=['v7'])
+      held.state = R.JobState.SUBMITTED
+      held.xid = '42'
+      held.cell, held.arch, held.chips = 'c7', 'v7', 32
+      RC.save_queue(self.path, RC.load_queue(self.path) + [held])
+      self.assertIn('-> c7 (9 free slice(s)', self._status(oversold=False))
+
 
 if __name__ == '__main__':
   unittest.main()

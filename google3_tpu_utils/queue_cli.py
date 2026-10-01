@@ -59,6 +59,8 @@ for _alias in ('dry-run', 'dryrun', 'n'):
   if _alias not in flags.FLAGS:
     flags.DEFINE_alias(_alias, 'dry_run')
 _GROUP = route_check._GROUP            # pylint: disable=protected-access
+_FLEET_PAIR_EVENTS_FILE = route_check._FLEET_PAIR_EVENTS_FILE  # pylint: disable=protected-access
+_COOLDOWN_S = route_check._COOLDOWN_S  # pylint: disable=protected-access
 
 # enqueue flags
 _POWER = flags.DEFINE_string(
@@ -811,11 +813,14 @@ def _cmd_status(argv: list[str]) -> int:
   reason_by_id: dict[str, str] = {}
   placed_ids: set[str] = set()
   try:
-    provider = avail_provider.AvailabilityProvider(group=_GROUP.value)
-    avail_by_cell, arch_price, arch_pool = provider.fetch()
-    placements = route_lib.select_and_plan(
-        entries, avail_by_cell, time.time(),
-        arch_price=arch_price, arch_pool=arch_pool)
+    # The SAME view the router plans with (in-flight debit + fleet records),
+    # so "PLACEABLE now" never promises a slot our own SUBMITTED rows hold.
+    now = time.time()
+    view = route_check.ViewSource(
+        avail_provider.AvailabilityProvider(group=_GROUP.value),
+        route_check.FleetLog(_FLEET_PAIR_EVENTS_FILE.value),
+        _COOLDOWN_S.value).build(entries, now)
+    placements = route_lib.plan_batch(entries, view, now)
     for p in placements:
       reason_by_id[p.job_id] = p.reason
       placed_ids.add(p.job_id)

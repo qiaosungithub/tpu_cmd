@@ -30,6 +30,7 @@ from absl import app
 from absl import flags
 
 from google3.experimental.users.qiaos.tpu_utils import avail_provider
+from google3.experimental.users.qiaos.tpu_utils import route_check
 from google3.experimental.users.qiaos.tpu_utils import route_lib
 
 
@@ -45,8 +46,10 @@ class _Provider(Protocol):
 _TPU_TYPE = flags.DEFINE_string(
     'tpu_type', None, 'Accelerator type, e.g. v7-32. REQUIRED. A comma list '
     '(v4-64,v5p-32) is rejected -- pin one type per submit.')
-_GROUP = flags.DEFINE_string('group', avail_provider.DEFAULT_GROUP,
-                             'Alloc group (same numbering as tpu queue).')
+# `group` and `queue_file` are defined by route_check (imported for the shared
+# placement view); re-defining them would be a duplicate-flag error.
+_GROUP = route_check._GROUP            # pylint: disable=protected-access
+_QUEUE_FILE = route_check._QUEUE_FILE  # pylint: disable=protected-access
 _TIER = flags.DEFINE_string('tier', 'PROD', 'PROD | BATCH (unused for the pick '
                             'today; kept so the flag surface matches tpu queue).')
 _METROS = flags.DEFINE_list(
@@ -81,35 +84,44 @@ def parse_tpu_type(tpu_type: str) -> Optional[tuple[str, int]]:
 
 
 def pick(tpu_type: str,
-         provider: _Provider,
+         provider: '_Provider | route_check.ViewSource',
          now: Optional[float] = None,
          metros: Optional[list[str]] = None,
-         max_price: Optional[float] = None) -> Optional[str]:
-  """The best cell name for `tpu_type`, or None. Pure over an injected provider.
+         max_price: Optional[float] = None,
+         queue_rows: Optional[list[route_lib.QueueEntry]] = None
+         ) -> Optional[str]:
+  """The best cell name for `tpu_type`, or None. Pure over an injected source.
 
-  Builds a throwaway QueueEntry carrying only what the ranking needs (the arch,
-  the metro/price constraints) and defers to route_lib.best_cell_for_shape, so
-  the pick matches the router exactly: metro filter, price cap, oversold drop,
-  >=1 placeable slice, ranked by free slices then price then headroom.
+  Builds a throwaway QueueEntry carrying only what the ranking needs (exactly
+  this arch and chip count, the metro/price constraints) and places it with
+  route_lib.place over the router's own placement view, so the pick matches
+  the router exactly: metro filter, price cap, oversold drop, >=1 placeable
+  slice, cell_score ranking, availability minus our in-flight claims.
+  `queue_rows` are the local queue's rows (their SUBMITTED claims are debited).
   """
   parsed = parse_tpu_type(tpu_type)
   if parsed is None:
     return None
   arch, chips = parsed
   now = time.time() if now is None else now
+  # ★The SAME placement view the router plans with: availability minus the
+  # chips our own SUBMITTED queue rows already claim in the GQM auction, plus
+  # the fleet (cell, arch) records. A manual `tpu queue` must not land on the
+  # slot the router's in-flight rows are waiting for (operator 2026-10-01: one
+  # placement view, every caller).
   try:
-    avail_by_cell, _, _ = provider.fetch()
+    view = route_check.as_view_source(provider).build(queue_rows or [], now)
   except Exception:  # pylint: disable=broad-except
     return None
+  # power_tolerance=0: exactly the requested shape, no power substitution.
   entry = route_lib.QueueEntry(
       job_id='_pick', power=f'{arch}-{chips}', allowed_archs=[arch],
       allowed_metros=[m.strip() for m in metros] if metros else None,
-      max_price=max_price)
-  hit = route_lib.best_cell_for_shape(arch, chips, entry, avail_by_cell, now)
-  if hit is None:
+      max_price=max_price, power_tolerance=0.0)
+  p = route_lib.place(entry, view, now)
+  if p is None or (p.arch, p.chips) != (arch, chips):
     return None
-  cell_avail, _ = hit
-  return cell_avail.cell
+  return p.cell
 
 
 def main(argv):
@@ -121,9 +133,14 @@ def main(argv):
     return 1
   arch, _ = parsed
   # ONE RPC: restrict the provider to just this arch.
-  provider = avail_provider.AvailabilityProvider(archs=[arch], group=_GROUP.value)
-  cell = pick(_TPU_TYPE.value, provider, metros=_METROS.value,
-              max_price=_MAX_PRICE.value)
+  source = route_check.ViewSource(
+      avail_provider.AvailabilityProvider(archs=[arch], group=_GROUP.value),
+      route_check.FleetLog(
+          route_check._FLEET_PAIR_EVENTS_FILE.value),  # pylint: disable=protected-access
+      route_check._COOLDOWN_S.value)  # pylint: disable=protected-access
+  cell = pick(_TPU_TYPE.value, source, metros=_METROS.value,
+              max_price=_MAX_PRICE.value,
+              queue_rows=route_check.load_queue(_QUEUE_FILE.value))
   if not cell:
     return 1
   print(cell)

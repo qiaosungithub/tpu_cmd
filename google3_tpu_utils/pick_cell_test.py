@@ -57,6 +57,28 @@ class PickTest(unittest.TestCase):
     avail = {'c|v7': _avail('c', 'v7', 16)}   # 16 < 32 chips
     self.assertIsNone(PC.pick('v7-32', _FakeProvider(avail)))
 
+  def test_pick_debits_our_own_submitted_rows(self):
+    # yukulwh is the roomier cell but our own SUBMITTED rows already claim all
+    # of it in the GQM auction: the manual pick must go elsewhere (the router's
+    # one placement view, operator 2026-10-01).
+    avail = {'yukulwh|v7': _avail('yukulwh', 'v7', 64),
+             'yuskedq|v7': _avail('yuskedq', 'v7', 32)}
+    rows = []
+    for i in range(2):
+      e = R.QueueEntry(job_id=f's{i}', power='v7-32', allowed_archs=['v7'])
+      e.state = R.JobState.SUBMITTED
+      e.xid = str(100 + i)
+      e.cell, e.arch, e.chips = 'yukulwh', 'v7', 32
+      rows.append(e)
+    self.assertEqual(PC.pick('v7-32', _FakeProvider(avail)), 'yukulwh')
+    self.assertEqual(PC.pick('v7-32', _FakeProvider(avail), queue_rows=rows),
+                     'yuskedq')
+
+  def test_pick_keeps_the_exact_shape(self):
+    # power_tolerance 0: a v7-32 pick never substitutes v7-16 or v7-64.
+    avail = {'c|v7': _avail('c', 'v7', 16)}
+    self.assertIsNone(PC.pick('v7-32', _FakeProvider(avail)))
+
   def test_rpc_failure_returns_none(self):
     self.assertIsNone(PC.pick('v7-32', _FakeProvider({}, raise_exc=True)))
 

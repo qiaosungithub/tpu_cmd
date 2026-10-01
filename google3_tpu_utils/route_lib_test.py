@@ -224,7 +224,7 @@ class BatchSchedulingTest(unittest.TestCase):
     lo = _entry('lo', priority=0)
     hi = _entry('hi', priority=10)
     avail = {'c': _avail('c', 'v7', free=32)}   # exactly ONE slice
-    plcs = R.select_and_plan([lo, hi], avail, now=0.0, rng=random.Random(0))
+    plcs = R.plan_batch([lo, hi], R.PlacementView(avail), now=0.0, rng=random.Random(0))
     self.assertEqual(len(plcs), 1)
     self.assertEqual(plcs[0].job_id, 'hi')      # high priority took the one slice
 
@@ -235,7 +235,7 @@ class BatchSchedulingTest(unittest.TestCase):
     avail = {'c': _avail('c', 'v7', free=32)}
     winners = set()
     for seed in range(20):
-      plcs = R.select_and_plan([a, b], avail, now=0.0, rng=random.Random(seed))
+      plcs = R.plan_batch([a, b], R.PlacementView(avail), now=0.0, rng=random.Random(seed))
       winners.add(plcs[0].job_id)
     self.assertEqual(winners, {'a', 'b'})       # both win under some seed
 
@@ -244,7 +244,7 @@ class BatchSchedulingTest(unittest.TestCase):
     # into the same cell beyond capacity.
     jobs = [_entry(f'j{i}') for i in range(3)]
     avail = {'c': _avail('c', 'v7', free=64)}    # 2 slices
-    plcs = R.select_and_plan(jobs, avail, now=0.0, rng=random.Random(1))
+    plcs = R.plan_batch(jobs, R.PlacementView(avail), now=0.0, rng=random.Random(1))
     self.assertEqual(len(plcs), 2)               # third stays queued
 
   def test_drawdown_spreads_across_cells(self):
@@ -253,7 +253,7 @@ class BatchSchedulingTest(unittest.TestCase):
         'a': _avail('a', 'v7', free=32),   # 1 slice
         'b': _avail('b', 'v7', free=32),   # 1 slice
     }
-    plcs = R.select_and_plan(jobs, avail, now=0.0, rng=random.Random(2))
+    plcs = R.plan_batch(jobs, R.PlacementView(avail), now=0.0, rng=random.Random(2))
     self.assertEqual(len(plcs), 2)
     self.assertEqual({p.cell for p in plcs}, {'a', 'b'})  # one each, not both on one
 
@@ -267,7 +267,7 @@ class BatchSchedulingTest(unittest.TestCase):
         'je|v6e': _avail('je', 'v6e', free=999),   # same cell, other gen
         'je|v7': _avail('je', 'v7', free=64),      # 2 v7 slices only
     }
-    plcs = R.select_and_plan(jobs, avail, now=0.0, rng=random.Random(3))
+    plcs = R.plan_batch(jobs, R.PlacementView(avail), now=0.0, rng=random.Random(3))
     self.assertEqual(len(plcs), 2)                 # v7 drawn down to 0, third waits
     self.assertTrue(all(p.arch == 'v7' and p.cell == 'je' for p in plcs))
 
@@ -573,8 +573,9 @@ class PairCooldownTest(unittest.TestCase):
     e.arch = 'b200'
     e.submitted_at = 0.0
     R.mark_reroute(e, now=700.0, cooldown_s=1800.0)
+    # b200 is a GPU: the pair cools GPU_PATIENCE_MULTIPLIER x 1800 (fix 2).
     self.assertEqual(e.cooldown_pairs,
-                     {'sj|b200': {'until': 2500.0, 'strikes': 1}})
+                     {'sj|b200': {'until': 700.0 + 3600.0, 'strikes': 1}})
     self.assertFalse(hasattr(e, 'cooldown_cells'))
     self.assertFalse(hasattr(e, 'cooldown_archs'))
     self.assertFalse(hasattr(e, 'cooldown_metros'))
@@ -2578,11 +2579,12 @@ class PlanOneWhyNotTest(unittest.TestCase):
     self.assertEqual(len(s), R._FILTER_REASON_MAX_CHARS)
     self.assertTrue(s.endswith('...'))
 
-  def test_select_and_plan_leaves_a_reason_on_each_unplaced_row(self):
+  def test_plan_batch_leaves_a_reason_on_each_unplaced_row(self):
     a = _entry('a', power='v7-32', archs=('v7',))
     b = _entry('b', power='v7-32', archs=('v7',))
-    got = R.select_and_plan([a, b], {'c7': _avail('c7', 'v7', free=32)},
-                            now=0.0, rng=random.Random(0))
+    got = R.plan_batch([a, b],
+                       R.PlacementView({'c7': _avail('c7', 'v7', free=32)}),
+                       now=0.0, rng=random.Random(0))
     self.assertEqual(len(got), 1)                 # one slice for two rows
     placed = {got[0].job_id}
     for e in (a, b):
@@ -2941,6 +2943,281 @@ class LineageCheckpointTest(unittest.TestCase):
     new = R.build_warm_restart_entry(dead, '/cns/x/steps/step_41500.pt', 'j2')
     self.assertEqual(new.last_known_checkpoint, '/cns/x/steps/step_41500.pt')
     self.assertEqual(new.cns_read_failures, 0)
+
+
+def _gpu_avail(cell, free, arch='h100', price=4.0):
+  # metro '' fails open in the storage gate, so synthetic cells stay candidates.
+  return R.CellAvail(cell=cell, arch=arch, free_chips=free, oversold=False,
+                     price=price, metro='')
+
+
+def _gpu_row(job_id, state, cell=None, arch='h100', chips=8, xid=None):
+  e = _entry(job_id, power=f'{arch}-{chips}', archs=(arch,))
+  e.state = state
+  if xid:
+    e.xid = xid                  # opens a live SUBMITTED submission
+  e.cell, e.arch, e.chips = cell, (arch if cell else None), (chips if cell
+                                                             else None)
+  return e
+
+
+class PlacementViewTest(unittest.TestCase):
+  """ONE placement view (operator-approved 2026-09-30 in-flight debit; one
+  view per round 2026-10-01): our own SUBMITTED rows are debited from cell
+  availability, because GetCellAvailability does not drop until Borg
+  allocates. Measured: gl showed 3 free h100-8 slices and received 8 rows in
+  3 min."""
+
+  def test_claims_live_submitted_rows_only(self):
+    rows = [
+        _gpu_row('s1', R.JobState.SUBMITTED, 'gl', xid='1'),
+        _gpu_row('s2', R.JobState.SUBMITTED, 'gl', xid='2'),
+        _gpu_row('s3', R.JobState.SUBMITTED, 'sj', arch='b200', xid='3'),
+        # RUNNING: Borg's free count already excludes it -> NOT debited.
+        _gpu_row('r1', R.JobState.RUNNING, 'gl', xid='4'),
+        _gpu_row('q1', R.JobState.QUEUED),
+        # SUBMITTED but no cell recorded: nothing to debit.
+        _gpu_row('s4', R.JobState.SUBMITTED, None, xid='5'),
+    ]
+    v = R.PlacementView.build({'gl|h100': _gpu_avail('gl', 64),
+                               'sj|b200': _gpu_avail('sj', 64, arch='b200')},
+                              rows)
+    self.assertEqual(v.claims, {'s1': ('gl|h100', 8), 's2': ('gl|h100', 8),
+                                's3': ('sj|b200', 8)})
+    self.assertEqual(v.free['gl|h100'].free_chips, 48)
+    self.assertEqual(v.free['sj|b200'].free_chips, 56)
+    self.assertEqual(v.debit_note(), 'gl|h100 -16, sj|b200 -8')
+
+  def test_superseded_submission_is_not_a_claim(self):
+    e = _gpu_row('s1', R.JobState.SUBMITTED, 'gl', xid='1')
+    e.submissions[-1].state = 'SUPERSEDED'
+    self.assertIsNone(R.inflight_claim(e))
+
+  def test_no_age_limit(self):
+    e = _gpu_row('s1', R.JobState.SUBMITTED, 'gl', xid='1')
+    e.submitted_at = 1.0          # submitted long ago: still holds its claim
+    self.assertEqual(R.inflight_claim(e), ('gl|h100', 8))
+
+  def test_excluding_gives_the_row_its_own_claim_back(self):
+    rows = [_gpu_row('s1', R.JobState.SUBMITTED, 'gl', xid='1'),
+            _gpu_row('s2', R.JobState.SUBMITTED, 'gl', xid='2')]
+    v = R.PlacementView.build({'gl|h100': _gpu_avail('gl', 24)}, rows)
+    self.assertEqual(v.free['gl|h100'].free_chips, 8)
+    v1 = v.excluding('s1')
+    self.assertEqual(v1.free['gl|h100'].free_chips, 16)
+    self.assertEqual(v1.debit_note(), 'gl|h100 -8')
+    self.assertEqual(v.free['gl|h100'].free_chips, 8)    # original untouched
+
+  def test_debit_clamps_and_does_not_mutate_raw(self):
+    av = {'gl|h100': _gpu_avail('gl', 24), 'sh|h100': _gpu_avail('sh', 16)}
+    rows = [_gpu_row(f's{i}', R.JobState.SUBMITTED, 'gl', xid=str(i))
+            for i in range(4)]    # 32 chips claimed on a cell showing 24
+    v = R.PlacementView.build(av, rows)
+    self.assertEqual(v.free['gl|h100'].free_chips, 0)     # clamped, not -8
+    self.assertEqual(v.free['sh|h100'].free_chips, 16)
+    self.assertEqual(av['gl|h100'].free_chips, 24)        # input untouched
+
+  def test_debit_matches_by_cell_and_arch_content(self):
+    # je hosts two generations; a v7 claim must not draw down je's v6e.
+    av = {'je|v6e': R.CellAvail('je', 'v6e', 64, False, 1.0, ''),
+          'je|v7': R.CellAvail('je', 'v7', 64, False, 1.0, '')}
+    e = _entry('s', power='v7-32', archs=('v7',))
+    e.state = R.JobState.SUBMITTED
+    e.xid = '9'
+    e.cell, e.arch, e.chips = 'JE', 'V7', 32               # case-insensitive
+    v = R.PlacementView.build(av, [e])
+    self.assertEqual(v.free['je|v7'].free_chips, 32)
+    self.assertEqual(v.free['je|v6e'].free_chips, 64)
+
+  def test_debit_note_names_only_pairs_present(self):
+    rows = [_gpu_row('s1', R.JobState.SUBMITTED, 'gl', xid='1'),
+            _gpu_row('s2', R.JobState.SUBMITTED, 'sj', arch='b200', xid='2')]
+    self.assertEqual(R.PlacementView.build({'gl|h100': _gpu_avail('gl', 24)},
+                                           rows).debit_note(), 'gl|h100 -8')
+    self.assertEqual(R.PlacementView({'gl|h100': _gpu_avail('gl', 24)})
+                     .debit_note(), '')
+
+  def test_herd_next_row_goes_elsewhere_after_debit(self):
+    # gl shows 3 free slices (24 chips) and is cheaper; sh shows 2. Three rows
+    # were already submitted to gl within the last minutes. The next row must
+    # land on sh, not become gl's 4th claim on 3 slots.
+    av = {'gl|h100': _gpu_avail('gl', 24, price=3.0),
+          'sh|h100': _gpu_avail('sh', 16, price=4.0)}
+    rows = [_gpu_row(f's{i}', R.JobState.SUBMITTED, 'gl', xid=str(i))
+            for i in range(3)]
+    nxt = _gpu_row('next', R.JobState.QUEUED)
+    p = _ok(R.place(nxt, R.PlacementView.build(av, rows), 1000.0))
+    self.assertEqual(p.cell, 'sh')
+    # NEGATIVE CONTROL: the raw RPC view (no claims) sends it to gl.
+    p_raw = _ok(R.place(nxt, R.PlacementView(av), 1000.0))
+    self.assertEqual(p_raw.cell, 'gl')
+
+  def test_take_draws_down_for_the_rest_of_the_round(self):
+    v = R.PlacementView({'gl|h100': _gpu_avail('gl', 8, price=3.0),
+                         'sh|h100': _gpu_avail('sh', 8, price=4.0)})
+    a, b = _gpu_row('a', R.JobState.QUEUED), _gpu_row('b', R.JobState.QUEUED)
+    pa = _ok(R.place(a, v, 0.0))
+    v.take(pa)
+    pb = _ok(R.place(b, v, 0.0))
+    self.assertEqual((pa.cell, pb.cell), ('gl', 'sh'))
+    # A view derived after a take() keeps the draw-down.
+    self.assertEqual(v.excluding('zz').free['gl|h100'].free_chips, 0)
+
+  def test_place_passes_market_data(self):
+    e = _entry('j', power='v7-32', archs=('v7', 'v6p'))
+    av = {'c7': _avail('c7', 'v7', free=320), 'c6': _avail('c6', 'v6p', 320)}
+    v = R.PlacementView(av, arch_price={'v7': 20.0, 'v6p': 9.77},
+                        arch_pool={'v7': 4096, 'v6p': 30})
+    self.assertEqual(_ok(R.place(e, v, 0.0)).arch, 'v6p')
+
+
+class GpuPairCooldownTest(unittest.TestCase):
+  """Router fix 2 (operator 2026-09-30: 对GPU，把cell的冷却时长也加长): a GPU
+  (cell, arch) pair cools 2x the base window; TPU pairs and the GROUP
+  cooldown keep the base window."""
+
+  def _rerouted(self, cell, arch, group='5'):
+    e = _entry(power=f'{arch}-8', archs=(arch,))
+    e.state = R.JobState.SUBMITTED
+    e.cell, e.arch, e.chips, e.submitted_at = cell, arch, 8, 0.0
+    e.group = group
+    e.xid = '1'
+    R.mark_reroute(e, now=1000.0, cooldown_s=7200.0)
+    return e
+
+  def test_pair_cooldown_for(self):
+    self.assertEqual(R.pair_cooldown_for('h100', 7200.0), 14400.0)
+    self.assertEqual(R.pair_cooldown_for('B200', 7200.0), 14400.0)
+    self.assertEqual(R.pair_cooldown_for('v7', 7200.0), 7200.0)
+    self.assertEqual(R.pair_cooldown_for(None, 7200.0), 7200.0)
+
+  def test_gpu_pair_doubles_but_group_does_not(self):
+    e = self._rerouted('gl', 'h100')
+    self.assertEqual(e.cooldown_pairs['gl|h100']['until'], 1000.0 + 14400.0)
+    self.assertEqual(e.cooldown_groups['5']['until'], 1000.0 + 7200.0)
+
+  def test_tpu_pair_unchanged(self):
+    e = self._rerouted('nm', 'v7')
+    self.assertEqual(e.cooldown_pairs['nm|v7']['until'], 1000.0 + 7200.0)
+    self.assertEqual(e.cooldown_groups['5']['until'], 1000.0 + 7200.0)
+
+
+def _ev(pair, job_id, at, kind='pending'):
+  return {'pair': pair, 'kind': kind, 'job_id': job_id, 'at': at}
+
+
+def _cd(arch):
+  return R.pair_cooldown_for(arch, 7200.0)
+
+
+class FleetPairRecordsTest(unittest.TestCase):
+  """Router fix 2: the fleet event log -> per-pair soft-score records."""
+
+  def test_distinct_jobs_count_once_and_hardware_counts_two(self):
+    evs = [_ev('gl|h100', 'a', 100.0), _ev('gl|h100', 'a', 200.0),
+           _ev('gl|h100', 'b', 300.0),
+           _ev('ga|h100', 'c', 100.0, kind='hardware')]
+    rec = R.fleet_pair_records(evs, 1000.0, _cd)
+    self.assertEqual(rec['gl|h100'], {'until': 300.0 + 14400.0, 'strikes': 2})
+    self.assertEqual(rec['ga|h100'], {'until': 100.0 + 14400.0, 'strikes': 2})
+
+  def test_strikes_cap(self):
+    evs = [_ev('gl|h100', str(i), 100.0) for i in range(9)]
+    rec = R.fleet_pair_records(evs, 1000.0, _cd)
+    self.assertEqual(rec['gl|h100']['strikes'], R.PAIR_COOLDOWN_MAX_STRIKES)
+
+  def test_window_is_arch_scaled_and_expired_events_drop(self):
+    evs = [_ev('gl|h100', 'a', 0.0), _ev('nm|v7', 'b', 0.0)]
+    # 10000 s later: the TPU event (7200 s window) has expired, the GPU one
+    # (14400 s) is still active.
+    rec = R.fleet_pair_records(evs, 10000.0, _cd)
+    self.assertIn('gl|h100', rec)
+    self.assertNotIn('nm|v7', rec)
+    self.assertEqual(R.fleet_pair_records(evs, 20000.0, _cd), {})
+
+  def test_only_active_events_count(self):
+    evs = [_ev('gl|h100', 'old', 0.0), _ev('gl|h100', 'new', 9000.0)]
+    rec = R.fleet_pair_records(evs, 15000.0, _cd)
+    self.assertEqual(rec['gl|h100']['strikes'], 1)     # 'old' expired
+
+  def test_malformed_events_are_skipped(self):
+    evs = [{'pair': 'gl|h100'}, {'at': 1.0}, 'junk', {'pair': 'nobar',
+                                                     'at': 1.0},
+           _ev('gl|h100', 'a', 100.0)]
+    rec = R.fleet_pair_records(evs, 1000.0, _cd)   # type: ignore[arg-type]
+    self.assertEqual(rec, {'gl|h100': {'until': 14500.0, 'strikes': 1}})
+
+  def test_fleet_events_for_blames_the_current_pair(self):
+    e = _gpu_row('j', R.JobState.SUBMITTED, 'gl', xid='1')
+    self.assertEqual(R.fleet_events_for(e, 'pending', 5.0),
+                     [{'pair': 'gl|h100', 'kind': 'pending', 'job_id': 'j',
+                       'at': 5.0}])
+    self.assertEqual(R.fleet_events_for(_gpu_row('q', R.JobState.QUEUED),
+                                        'pending', 5.0), [])
+
+  def test_stronger_pair_record(self):
+    own = {'until': 1e9, 'strikes': 1}
+    fleet = {'until': 1e9, 'strikes': 3}
+    self.assertIs(R.stronger_pair_record(own, fleet, 0.0), fleet)
+    self.assertIs(R.stronger_pair_record(fleet, own, 0.0), fleet)
+    self.assertIs(R.stronger_pair_record(own, None, 0.0), own)
+    self.assertEqual(R.stronger_pair_record({}, None, 0.0), {})
+    self.assertEqual(R.stronger_pair_record({}, fleet, 0.0), fleet)
+
+
+class FleetPairScoringTest(unittest.TestCase):
+  """Router fix 2: fleet records are a SOFT score, never a fallthrough."""
+
+  _FLEET_GL = {'gl|h100': {'until': 1e9, 'strikes': 4}}
+
+  def _av(self):
+    return {'gl|h100': _gpu_avail('gl', 64, price=3.0),
+            'lb|h100': _gpu_avail('lb', 64, price=4.0)}
+
+  def test_fleet_record_ranks_gl_down(self):
+    e = _gpu_row('j', R.JobState.QUEUED)
+    self.assertEqual(_ok(R.place(e, R.PlacementView(self._av()), 0.0)).cell,
+                     'gl')
+    v = R.PlacementView(self._av(), fleet_pairs=self._FLEET_GL)
+    self.assertEqual(_ok(R.place(e, v, 0.0)).cell, 'lb')
+    self.assertEqual(v.fleet_note(), 'gl|h100 s4')
+
+  def test_none_is_old_behaviour(self):
+    e = _gpu_row('j', R.JobState.QUEUED)
+    hit = _ok(R.best_cell_for_shape('h100', 8, e, self._av(), 0.0,
+                                    fleet_pairs=None))
+    self.assertEqual(hit[0].cell, 'gl')
+
+  def test_own_record_stronger_than_fleet_is_kept(self):
+    e = _gpu_row('j', R.JobState.QUEUED)
+    e.cooldown_pairs = {'gl|h100': {'until': 1e9, 'strikes': 4}}
+    weak = {'gl|h100': {'until': 1e9, 'strikes': 1}}
+    p = _ok(R.place(e, R.PlacementView(self._av(), fleet_pairs=weak), 0.0))
+    self.assertEqual(p.cell, 'lb')        # own x5 still applies
+
+  def test_CRITICAL_fleet_cooling_never_triggers_cross_arch_fallthrough(self):
+    # sj is the only b200 cell and is fleet-cooling at max strikes; the row has
+    # NO own record; h100 has a free cell. The row must still get b200@sj --
+    # a fleet-driven fallthrough would push every b200 row onto ~30x dearer
+    # h100.
+    e = _entry('j', power='h100-8', archs=('h100', 'b200'))
+    av = {'sj|b200': _gpu_avail('sj', 64, arch='b200', price=0.18),
+          'sm|h100': _gpu_avail('sm', 64, arch='h100', price=5.7)}
+    fleet = {'sj|b200': {'until': 1e9, 'strikes': R.PAIR_COOLDOWN_MAX_STRIKES}}
+    v = R.PlacementView(av, fleet_pairs=fleet)
+    p = _ok(R.place(e, v, 0.0))
+    self.assertEqual((p.arch, p.cell), ('b200', 'sj'))
+    # CONTROL: the row's OWN cooldown on sj|b200 does fall through (unchanged).
+    e.cooldown_pairs = {'sj|b200': {'until': 1e9, 'strikes': 1}}
+    p = _ok(R.place(e, v, 0.0))
+    self.assertEqual((p.arch, p.cell), ('h100', 'sm'))
+
+  def test_plan_batch_uses_the_views_fleet_records(self):
+    e = _gpu_row('j', R.JobState.QUEUED)
+    pl = R.plan_batch([e], R.PlacementView(self._av(),
+                                           fleet_pairs=self._FLEET_GL),
+                      0.0, rng=random.Random(0))
+    self.assertEqual([p.cell for p in pl], ['lb'])
 
 
 if __name__ == '__main__':

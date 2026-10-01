@@ -432,6 +432,7 @@ pytype_strict_library(
     srcs = ["pick_cell.py"],
     deps = [
         ":avail_provider",
+        ":route_check_lib",
         ":route_lib",
         "//third_party/py/absl:app",
         "//third_party/py/absl/flags:flags",

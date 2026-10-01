@@ -546,6 +546,101 @@ def stamp_pair_cooldown(entry: 'QueueEntry', key: str, now: float,
   entry.cooldown_pairs[key] = {'until': now + cooldown_s, 'strikes': strikes}
 
 
+# ★GPU PAIR COOLDOWN x2 (operator 2026-09-30 23:22Z: "对GPU，把cell的冷却时长
+# 也加长"). A GPU (cell, arch) pair a job was re-routed off cools for
+# GPU_PATIENCE_MULTIPLIER x the base window (7200 s -> 4 h), the same factor
+# GPU rows already get on the pending deadline: a GPU row waits ~2x longer
+# before it is cancelled, so a 2 h pair window had mostly elapsed by the time
+# the next placement looked at it. TPU pairs are unchanged. The GROUP cooldown
+# deliberately stays at the base window: it is a hard gate for g5/g3, and
+# lengthening it would push more jobs onto g9, which nobody asked for.
+def pair_cooldown_for(arch: Optional[str], base_s: float) -> float:
+  """The (cell, arch) pair cooldown for `arch`: GPU_PATIENCE_MULTIPLIER x
+  `base_s` for a GPU arch, `base_s` otherwise. Pure."""
+  return base_s * (GPU_PATIENCE_MULTIPLIER if is_gpu(arch or '') else 1.0)
+
+
+# ---------------------------------------------------------------------------
+# ★FLEET-WIDE (cell, arch) MEMORY (operator-approved 2026-09-30 23:22Z, router
+# fix 2). cooldown_pairs lives ON THE ROW, so every new row re-learned a bad
+# cell by wasting 30-57 min in it: the 16 never-started cancels on gl on
+# 2026-09-30 came from 16 DIFFERENT rows (gl start rate 0/16; 3/40 over five
+# days). The rerouter now also appends one event per blamed pair to a sidecar
+# log (route_check owns the I/O), and these helpers turn it into per-pair
+# records of the same {'until', 'strikes'} shape as cooldown_pairs.
+#
+# ★CRITICAL: a fleet record feeds ONLY the soft cell_score multiplier, as the
+# stronger of it and the row's own record. It never drives plan_one's
+# cross-arch "cooled fallback" fallthrough, which stays on the row's OWN
+# record. sj is the only b200 cell; it has many reroutes AND the best start
+# rate (81%), and b200 costs 0.18 vs h100 5.7 cr/chip-hr, so a fleet-driven
+# fallthrough would push every b200 row onto the full, 30x dearer h100 pool.
+# Within an arch the multiplier only reorders cells: gl down, lb/mf up.
+FLEET_EVENT_KINDS = ('pending', 'thrash', 'hardware')
+
+
+def fleet_events_for(entry: 'QueueEntry', kind: str,
+                     now: float) -> list[dict]:
+  """The fleet events to log when `entry` fails on its current placement:
+  one {pair, kind, job_id, at} per pair the row blames (_blame_keys). Must be
+  called while entry.cell / entry.arch still name the failed placement."""
+  return [{'pair': k, 'kind': kind, 'job_id': entry.job_id, 'at': float(now)}
+          for k in _blame_keys(entry)]
+
+
+def fleet_pair_records(events: Sequence[dict], now: float,
+                       cooldown_for_arch: Callable[[str], float]
+                       ) -> dict[str, dict]:
+  """{pair: {'until', 'strikes'}} from the fleet event log. Pure.
+
+  An event is ACTIVE while at + cooldown_for_arch(arch) > now. strikes is the
+  number of DISTINCT job_ids with an active event on the pair, a job whose
+  active events include a 'hardware' one counting 2, capped at
+  PAIR_COOLDOWN_MAX_STRIKES; until is the latest active `at` + cooldown.
+  Malformed events are skipped, never raised on."""
+  weight: dict[str, dict[str, int]] = {}
+  until: dict[str, float] = {}
+  for i, ev in enumerate(events or ()):
+    try:
+      pair = str(ev['pair']).strip().lower()
+      at = float(ev['at'])
+      kind = str(ev.get('kind') or '')
+    except (KeyError, TypeError, ValueError, AttributeError):
+      continue
+    if '|' not in pair:
+      continue
+    end = at + float(cooldown_for_arch(pair.split('|', 1)[1]))
+    if end <= now:
+      continue
+    who = str(ev.get('job_id') or f'#{i}')
+    w = 2 if kind == 'hardware' else 1
+    per_job = weight.setdefault(pair, {})
+    per_job[who] = max(per_job.get(who, 0), w)
+    until[pair] = max(until.get(pair, 0.0), end)
+  return {p: {'until': until[p],
+              'strikes': min(sum(js.values()), PAIR_COOLDOWN_MAX_STRIKES)}
+          for p, js in weight.items()}
+
+
+def stronger_pair_record(own: Optional[dict], fleet: Optional[dict],
+                         now: float) -> dict:
+  """Of the row's own pair record and the fleet record, the one whose
+  cooldown_penalty is larger right now ({} when neither is active). Ties keep
+  the row's own record."""
+  def pen(rec: Optional[dict]) -> float:
+    if not isinstance(rec, dict) or rec.get('until') is None:
+      return 1.0
+    try:
+      return cooldown_penalty(float(rec['until']), now,
+                              strikes=int(rec.get('strikes', 1) or 1))
+    except (TypeError, ValueError):
+      return 1.0
+  own_p, fleet_p = pen(own), pen(fleet)
+  if fleet_p > own_p and isinstance(fleet, dict):
+    return fleet
+  return own if isinstance(own, dict) else {}
+
+
 def cell_score(price: Optional[float], n_slices: int,
                strikes: int = 0, since_s: Optional[float] = None,
                cooldown_until: Optional[float] = None,
@@ -2308,8 +2403,13 @@ def best_cell_for_shape(
     entry: QueueEntry,
     avail_by_cell: dict[str, CellAvail],
     now: float,
+    fleet_pairs: Optional[dict[str, dict]] = None,
 ) -> Optional[tuple[CellAvail, int]]:
   """Best placeable cell for one (arch, chips), or None if none can place it.
+
+  `fleet_pairs` (fleet_pair_records; None = old behaviour) only strengthens the
+  soft pair-cooldown multiplier: the stronger of the row's own record and the
+  fleet's record for that pair is scored (see FLEET-WIDE (cell, arch) MEMORY).
 
   HARD GATES first, in order: metro filter, price cap, oversold drop, cooldown
   drop, and >=1 placeable slice. Those are prohibitions -- a cell that fails one
@@ -2390,6 +2490,9 @@ def best_cell_for_shape(
     # THIS arch, so being stuck on b200 in sj says nothing about h100 in sj or
     # about b200 elsewhere (see PAIR COOLDOWN).
     cd = pair_cooldown_record(entry, ca.cell, arch)
+    if fleet_pairs:
+      cd = stronger_pair_record(cd, fleet_pairs.get(pair_key(ca.cell, arch)),
+                                now)
     score = cell_score(ca.price, n, strikes, since,
                        cooldown_until=cd.get('until'), now=now,
                        cooldown_strikes=int(cd.get('strikes', 1) or 1))
@@ -2478,8 +2581,14 @@ def plan_one(entry: QueueEntry,
              legal_sizes: Optional[dict[str, list[int]]] = None,
              arch_price: Optional[dict[str, float]] = None,
              arch_pool: Optional[dict[str, float]] = None,
+             fleet_pairs: Optional[dict[str, dict]] = None,
              ) -> Optional[Placement]:
   """Decide where to place ONE job, trying its accepted shapes best-first.
+
+  `fleet_pairs` (None = old behaviour) is handed to best_cell_for_shape for
+  the SOFT score only. ★It never feeds the cooled-fallback test below, which
+  reads the row's OWN record (see FLEET-WIDE (cell, arch) MEMORY: a fleet-
+  driven fallthrough would move every b200 row off sj onto 30x dearer h100).
 
   Shapes are ordered by `candidate_shapes` -- effective-price-first when market
   data is supplied (select type by price+pool bonus), ARCH_PREF otherwise. For
@@ -2513,7 +2622,8 @@ def plan_one(entry: QueueEntry,
   why_not: dict[str, str] = {}   # arch -> why its preferred shape found no cell
   fallback: Optional[tuple[str, int, CellAvail, int]] = None
   for arch, chips in candidate_shapes(entry, legal_sizes, arch_price, arch_pool):
-    hit = best_cell_for_shape(arch, chips, entry, avail_by_cell, now)
+    hit = best_cell_for_shape(arch, chips, entry, avail_by_cell, now,
+                              fleet_pairs=fleet_pairs)
     if hit is None:
       a = arch.lower()
       if a not in why_not:
@@ -2538,29 +2648,172 @@ def plan_one(entry: QueueEntry,
   return None
 
 
-def select_and_plan(
+def _take_chips(avail_by_cell: dict[str, CellAvail], cell: Optional[str],
+                arch: Optional[str], chips: Optional[int]) -> bool:
+  """Draw `chips` down from the (cell, arch) CellAvail in `avail_by_cell`, IN
+  PLACE (the frozen CellAvail is replaced), clamped at 0. Returns True when a
+  matching entry was found.
+
+  Matched by CONTENT, not by dict key: a cell can host two accelerator
+  generations (je carries both v6e and v7 pods), so avail is keyed per
+  (cell, arch) and the wrong generation must never be drawn down."""
+  c = str(cell or '').strip().lower()
+  a = str(arch or '').strip().lower()
+  if not c or not a or not chips:
+    return False
+  for k, ca in avail_by_cell.items():
+    if ca.cell.lower() == c and ca.arch.lower() == a:
+      avail_by_cell[k] = dataclasses.replace(
+          ca, free_chips=max(0, ca.free_chips - int(chips)))
+      return True
+  return False
+
+
+def inflight_claim(entry: 'QueueEntry') -> Optional[tuple[str, int]]:
+  """(pair_key, chips) this row claims in the GQM auction right now, or None.
+
+  ★IN-FLIGHT DEBIT (operator-approved 2026-09-30 23:22Z). The availability RPC
+  reports free chips as Borg sees them, and Borg does not count a job that is
+  still waiting in the GQM auction. Measured 2026-09-30: gl showed 3 free
+  h100-8 slices and received 8 rows in 3 min, sh showed 2 and received 7, lb 2
+  and 6; all 21 then sat "Queued (GQM auction short of chips)" for 9-37 min.
+  So a row CLAIMS its cell while it is SUBMITTED with a live current
+  submission naming cell, arch and chips (its own fields, else the
+  submission's). There is NO age limit: such a row holds its queue position
+  for as long as it exists. RUNNING rows do not claim: Borg's free count
+  already excludes them, and counting them again would hide real capacity."""
+  if entry.state != JobState.SUBMITTED:
+    return None
+  cur = entry.current_submission
+  if cur is None or cur.state not in SUBMISSION_LIVE_STATES:
+    return None
+  cell = (entry.cell or cur.cell or '').strip()
+  arch = (entry.arch or cur.arch or '').strip()
+  chips = entry.chips or cur.chips
+  if not cell or not arch or not chips:
+    return None
+  return pair_key(cell, arch), int(chips)
+
+
+class PlacementView:
+  """THE input of every placement decision in one round (operator 2026-10-01:
+  one placement view, one placement function, no per-caller variants).
+
+  Built ONCE per round from:
+    * live availability (`raw`) plus the market data (arch_price, arch_pool);
+    * the in-flight claims of our own SUBMITTED rows (inflight_claim), which
+      are subtracted from `raw`;
+    * fleet-wide (cell, arch) records (fleet_pair_records), a SOFT score only.
+  The row's own memory (cooldown_pairs, evictions) lives on the row and is read
+  by best_cell_for_shape. Every caller -- the tick, the worker build, the
+  dispatch pre-filter, reroute's better-placement check, `tpu queue-status`,
+  `tpu_pick_cell` -- plans through route_lib.place() over a view.
+
+  `free` is the debited availability. take() draws it down after each
+  placement within the round (the in-round thundering-herd guard).
+  excluding(job_id) is the view as that row would see it if it gave up its own
+  claim: a SUBMITTED row asking "is there somewhere better" must not count its
+  own GQM claim against the cell it is in. Pure: no I/O."""
+
+  def __init__(self, raw: dict[str, CellAvail],
+               arch_price: Optional[dict[str, float]] = None,
+               arch_pool: Optional[dict[str, float]] = None,
+               claims: Optional[dict[str, tuple[str, int]]] = None,
+               fleet_pairs: Optional[dict[str, dict]] = None):
+    self.raw = dict(raw or {})
+    self.arch_price = dict(arch_price or {})
+    self.arch_pool = dict(arch_pool or {})
+    self.claims = dict(claims or {})          # job_id -> (pair_key, chips)
+    self.fleet_pairs = dict(fleet_pairs or {})
+    self._taken: list[tuple[str, str, int]] = []
+    self._excluded: frozenset[str] = frozenset()
+    self.free: dict[str, CellAvail] = {}
+    self._recompute()
+
+  @classmethod
+  def build(cls, raw: dict[str, CellAvail], entries: Sequence['QueueEntry'],
+            arch_price: Optional[dict[str, float]] = None,
+            arch_pool: Optional[dict[str, float]] = None,
+            fleet_pairs: Optional[dict[str, dict]] = None) -> 'PlacementView':
+    """The round's view: `raw` minus the claims of every row in `entries`."""
+    claims = {}
+    for e in entries:
+      c = inflight_claim(e)
+      if c is not None:
+        claims[e.job_id] = c
+    return cls(raw, arch_price, arch_pool, claims, fleet_pairs)
+
+  def _recompute(self) -> None:
+    free = dict(self.raw)
+    for jid, (key, chips) in sorted(self.claims.items()):
+      if jid in self._excluded:
+        continue
+      cell, arch = key.split('|', 1)
+      _take_chips(free, cell, arch, chips)
+    for cell, arch, chips in self._taken:
+      _take_chips(free, cell, arch, chips)
+    self.free = free
+
+  def excluding(self, job_id: str) -> 'PlacementView':
+    """A copy of this view with `job_id`'s own claim given back."""
+    v = PlacementView(self.raw, self.arch_price, self.arch_pool, self.claims,
+                      self.fleet_pairs)
+    v._taken = list(self._taken)
+    v._excluded = self._excluded | {job_id}
+    v._recompute()
+    return v
+
+  def take(self, placement: 'Placement') -> None:
+    """Draw `placement`'s chips down for the rest of the round."""
+    self._taken.append((placement.cell, placement.arch, int(placement.chips)))
+    _take_chips(self.free, placement.cell, placement.arch, placement.chips)
+
+  def debit_note(self) -> str:
+    """'gl|h100 -64, sj|b200 -232': the in-flight debit actually applied
+    (claims on pairs this view has no availability for change nothing and
+    are left out). '' when nothing is debited."""
+    present = {pair_key(ca.cell, ca.arch) for ca in self.raw.values()}
+    tot: dict[str, int] = {}
+    for jid, (key, chips) in self.claims.items():
+      if jid not in self._excluded and key in present:
+        tot[key] = tot.get(key, 0) + chips
+    return ', '.join(f'{k} -{n}' for k, n in sorted(tot.items()))
+
+  def fleet_note(self) -> str:
+    """'gl|h100 s4, sh|h100 s1': active fleet records, strongest first."""
+    items = sorted(self.fleet_pairs.items(),
+                   key=lambda kv: (-int(kv[1].get('strikes', 0) or 0), kv[0]))
+    return ', '.join(f'{k} s{int(v.get("strikes", 0) or 0)}'
+                     for k, v in items)
+
+
+def place(entry: QueueEntry, view: PlacementView, now: float,
+          legal_sizes: Optional[dict[str, list[int]]] = None
+          ) -> Optional[Placement]:
+  """THE placement function: plan_one over the round's view (debited
+  availability, market data, fleet records as a soft score). Does NOT draw the
+  view down; callers that place several rows call view.take(p)."""
+  return plan_one(entry, view.free, now, legal_sizes, view.arch_price,
+                  view.arch_pool, fleet_pairs=view.fleet_pairs or None)
+
+
+def plan_batch(
     entries: list[QueueEntry],
-    avail_by_cell: dict[str, CellAvail],
+    view: PlacementView,
     now: float,
     rng: Optional[random.Random] = None,
     max_placements: Optional[int] = None,
     legal_sizes: Optional[dict[str, list[int]]] = None,
-    arch_price: Optional[dict[str, float]] = None,
-    arch_pool: Optional[dict[str, float]] = None,
 ) -> list[Placement]:
   """Plan placements for a whole QUEUED batch, honoring priority + fairness.
 
   Order: higher priority first; among equal priority, RANDOM order (seeded rng
-  for tests) so no job in a priority band starves. As each placement is chosen,
-  its slices are DECREMENTED from the local availability copy so two jobs in one
-  tick do not both get routed to the same cell and re-create the oversold
-  (thundering herd). Only QUEUED entries are considered."""
+  for tests) so no job in a priority band starves. Each placement is taken
+  from `view` (view.take) before the next row is planned, so two jobs in one
+  round never both land on the last free slice. Only QUEUED entries are
+  considered. Mutates `view`."""
   rng = rng or random.Random()
-  # local mutable copy of availability so we can decrement within the tick
-  local: dict[str, CellAvail] = dict(avail_by_cell)
-
   queued = [e for e in entries if e.state == JobState.QUEUED]
-  # group by priority desc; shuffle within each band
   by_prio: dict[int, list[QueueEntry]] = {}
   for e in queued:
     by_prio.setdefault(e.priority, []).append(e)
@@ -2574,19 +2827,11 @@ def select_and_plan(
   for entry in ordered:
     if max_placements is not None and len(placements) >= max_placements:
       break
-    p = plan_one(entry, local, now, legal_sizes, arch_price, arch_pool)
+    p = place(entry, view, now, legal_sizes)
     if p is None:
       continue
     placements.append(p)
-    # Decrement the chosen (cell, arch)'s free chips so the next job in this
-    # tick sees the draw-down. Matched by CONTENT, not by dict key: a cell can
-    # host two accelerator generations (je carries both v6e and v7 pods), so
-    # avail is keyed per (cell, arch) and we must not decrement the wrong one.
-    for k, ca in local.items():
-      if ca.cell == p.cell and ca.arch.lower() == p.arch.lower():
-        local[k] = dataclasses.replace(
-            ca, free_chips=max(0, ca.free_chips - p.chips))
-        break
+    view.take(p)
   return placements
 
 
@@ -3015,10 +3260,12 @@ def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry
   """Return the entry reset to QUEUED after a failed placement.
 
   Cools the (cell, arch) PAIR it was stuck on (`cooldown_pairs`) for
-  `cooldown_s` seconds, strikes stacking while that pair's previous window is
-  still open (see PAIR COOLDOWN). Nothing wider is cooled: not the other archs
-  of that cell, not the same arch in other cells, not the metro (operator
-  2026-09-23).
+  pair_cooldown_for(arch, cooldown_s) seconds -- 2x for a GPU arch (operator
+  2026-09-30), 1x for TPU -- strikes stacking while that pair's previous
+  window is still open (see PAIR COOLDOWN). Nothing wider is cooled: not the
+  other archs of that cell, not the same arch in other cells, not the metro
+  (operator 2026-09-23). The group is cooled for the base `cooldown_s`
+  (never scaled: see GPU PAIR COOLDOWN x2).
 
   Also cools the alloc GROUP it ran under (`cooldown_groups`), a separate
   axis:
@@ -3029,7 +3276,8 @@ def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry
   # Read while entry.cell / entry.arch still name the stuck placement (both are
   # cleared below).
   for key in _blame_keys(entry):
-    stamp_pair_cooldown(entry, key, now, cooldown_s)
+    stamp_pair_cooldown(entry, key, now,
+                        pair_cooldown_for(key.split('|', 1)[1], cooldown_s))
   # GROUP-LEVEL cooldown (operator 2026-09-23). The pool is the one the stuck
   # submission was built under: its own record first (apply_placement copies the
   # row's group onto it), else the row's `group`. Neither is cleared below.

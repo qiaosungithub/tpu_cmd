@@ -4,7 +4,7 @@ WHAT IT DOES, once per invocation (the daemon calls it on a loop):
 
   1. load the durable local queue (~/.tpu_local_queue.json),
   2. fetch live availability (avail_provider: free chips + price + pool),
-  3. plan placements (route_lib.select_and_plan: priority + fairness, cheapest
+  3. plan placements (route_lib.plan_batch: priority + fairness, cheapest
      effective-price type, most-placeable cell, never into an oversold/full one),
   4. for each planned placement, submit via `tpu queue` (pinned --cell) and
      record the XID -- OR, in --dry_run (the DEFAULT), just print the plan.
@@ -192,6 +192,119 @@ def _save_reroute_history(times: list[float],
     pass  # history is best-effort; never break re-routing over it
 
 
+# --- the round's placement view: availability + in-flight debit + fleet ----
+# ★FLEET-WIDE (cell, arch) MEMORY (operator-approved 2026-09-30 23:22Z).
+# cooldown_pairs lives ON THE ROW, so every new row re-learned a bad cell by
+# wasting 30-57 min in it: the 16 never-started cancels on gl on 2026-09-30
+# came from 16 DIFFERENT rows. The attempt-end path appends one event per
+# blamed pair here; every placement reads the active events back as a SOFT
+# score (route_lib.fleet_pair_records / PlacementView), never as a gate.
+FLEET_PAIR_EVENTS_FILE = os.path.expanduser('~/.tpu_fleet_pair_events.json')
+FLEET_EVENT_RETENTION_S = 86400.0
+# The base (cell, arch) / group cooldown (--cooldown_s default; operator
+# 2026-09-10: 30 min -> 2 h). GPU pairs get route_lib.pair_cooldown_for x2.
+DEFAULT_COOLDOWN_S = 7200.0
+
+
+class FleetLog:
+  """The fleet (cell, arch) event log on disk: a JSON list of
+  {pair, kind, job_id, at}, pruned to `retention_s` on every write.
+
+  Reads FAIL OPEN (missing / corrupt / no path -> no events: losing the log
+  only forgets fleet history; every row's own memory still applies). Writes
+  are atomic (tmp + os.replace) so a reader never sees a torn file."""
+
+  def __init__(self, path: Optional[str],
+               retention_s: float = FLEET_EVENT_RETENTION_S):
+    self.path = path or None
+    self.retention_s = retention_s
+
+  def load(self, now: float) -> list[dict]:
+    if not self.path:
+      return []
+    try:
+      with open(self.path) as f:
+        raw = json.load(f)
+    except (OSError, ValueError):
+      return []
+    out = []
+    for ev in raw if isinstance(raw, list) else []:
+      try:
+        if isinstance(ev, dict) and float(ev['at']) >= now - self.retention_s:
+          out.append(ev)
+      except (KeyError, TypeError, ValueError):
+        continue
+    return out
+
+  def append(self, events: Sequence[dict], now: float) -> None:
+    """Append + prune + atomic write. Raises OSError on failure."""
+    if not self.path:
+      return
+    merged = self.load(now) + list(events)
+    d = os.path.dirname(self.path) or '.'
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.fleet_pair_events.')
+    try:
+      with os.fdopen(fd, 'w') as f:
+        json.dump(merged, f)
+      os.replace(tmp, self.path)
+    except BaseException:
+      if os.path.exists(tmp):
+        os.unlink(tmp)
+      raise
+
+  def record(self, events: Sequence[dict], now: float, log: list[str],
+             tag: str) -> None:
+    """Best-effort append + one log line; never raises (fleet memory must not
+    break a reroute or reconcile pass)."""
+    if not self.path or not events:
+      return
+    try:
+      self.append(events, now)
+      log.append(f'[fleet] {tag}: recorded '
+                 + ', '.join(f'{ev["pair"]} {ev["kind"]}' for ev in events))
+    except Exception as exc:  # pylint: disable=broad-except
+      log.append(f'[fleet] {tag}: could not record fleet event(s) '
+                 f'(non-fatal): {exc!r}')
+
+  def pairs(self, now: float, base_cooldown_s: float) -> dict[str, dict]:
+    """Active per-pair records, each event lasting
+    route_lib.pair_cooldown_for(arch, base_cooldown_s). Fails open to {}."""
+    try:
+      return route_lib.fleet_pair_records(
+          self.load(now), now,
+          lambda a: route_lib.pair_cooldown_for(a, base_cooldown_s))
+    except Exception:  # pylint: disable=broad-except
+      return {}
+
+
+class ViewSource:
+  """Builds the round's route_lib.PlacementView: ONE availability fetch, ONE
+  fleet read, and the in-flight claims of the rows passed in. Every placement
+  caller (tick, worker build, dispatch pre-filter, reroute's better-placement
+  check, `tpu queue-status`, `tpu_pick_cell`) gets its view from here, so no
+  call site assembles its own variant. build() raises when the availability
+  fetch raises; each caller keeps its own fetch-failure policy."""
+
+  def __init__(self, provider: _Provider, fleet_log: Optional[FleetLog] = None,
+               cooldown_s: float = DEFAULT_COOLDOWN_S):
+    self.provider = provider
+    self.fleet_log = fleet_log
+    self.cooldown_s = cooldown_s
+
+  def build(self, entries: Sequence[route_lib.QueueEntry],
+            now: float) -> route_lib.PlacementView:
+    raw, price, pool = self.provider.fetch()
+    fleet = (self.fleet_log.pairs(now, self.cooldown_s)
+             if self.fleet_log is not None else {})
+    return route_lib.PlacementView.build(raw, entries, price, pool, fleet)
+
+
+def as_view_source(p: '_Provider | ViewSource') -> ViewSource:
+  """A ViewSource as is; a bare availability provider (tests, ad-hoc tools)
+  as a ViewSource with no fleet log (the in-flight debit still applies)."""
+  return p if isinstance(p, ViewSource) else ViewSource(p)
+
+
 DEFAULT_QUEUE_FILE = os.path.expanduser('~/.tpu_local_queue.json')
 # The wrapper defining the `tpu` shell function; we source it, then call `tpu`.
 TPU_WRAPPER = os.path.expanduser('~/work/tpu_cmd/tpu_wrapper.sh')
@@ -252,11 +365,17 @@ _REROUTE_AFTER_S = flags.DEFINE_float(
     'reroute_after_s', 300.0, 'A SUBMITTED job still PENDING this many seconds '
     'after submit is cancelled and re-routed (operator default: 5 min).')
 _COOLDOWN_S = flags.DEFINE_float(
-    'cooldown_s', 7200.0, 'After a re-route, cool the stuck (cell, arch) pair '
+    'cooldown_s', DEFAULT_COOLDOWN_S, 'After a re-route, cool the stuck (cell, arch) pair '
     'for this long (operator 2026-09-10: 30min -> 2h). The old 30min window '
     'expired before the backlogged serial build-worker re-dispatched the job, '
     'so the penalty read as gone at the moment it should have applied. Feeds '
     'cooldown_pairs (operator 2026-09-23).')
+_FLEET_PAIR_EVENTS_FILE = flags.DEFINE_string(
+    'fleet_pair_events_file', FLEET_PAIR_EVENTS_FILE, 'Fleet-wide (cell, arch) '
+    'event log (operator-approved 2026-09-30). Every attempt that ends on a '
+    'never-started / thrash / hardware-fault cancel or death appends one event; '
+    'every placement view reads the active events as a SOFT cell-score penalty '
+    '(never a cross-arch fallthrough). Empty disables both sides.')
 _CONFIRM_GAP_S = flags.DEFINE_float(
     'reroute_confirm_gap_s', 15.0, 'Before cancelling a PENDING job, wait this '
     'long and re-probe; only cancel if STILL pending. Clears BATCH shadow-WU '
@@ -2172,6 +2291,7 @@ def run_reconcile(
     auto_resume_max: int = 3,
     restart_evidence=None,
     cancelled_lookup: Optional[Callable[[str], Optional[str]]] = None,
+    fleet_log: Optional[FleetLog] = None,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """Re-verify every non-terminal (RECONCILABLE_STATES) entry against XManager
   and clean up stale local state. Returns (entries, log_lines).
@@ -2323,6 +2443,11 @@ def run_reconcile(
     if changed:
       if e.state == route_lib.JobState.FAILED:
         n_zombie += 1
+        if hw_seen and fleet_log is not None:
+          # A broken host is fleet news whether or not this row restarts.
+          # reconcile_entry leaves e.cell / e.arch intact: they name the host.
+          fleet_log.record(route_lib.fleet_events_for(e, 'hardware', now), now,
+                           log, tag)
         if st == STATUS_GONE:
           log.append(f'[reconcile] {tag} -> FAILED '
                      f'(experiment GONE: 0 work units, age {int(age_s or 0)}s)')
@@ -2475,6 +2600,8 @@ def _reroute_requeue_after_cancel(
     ok_reason: str,
     fail_prefix: str,
     persist_fn: Optional[Callable[[], None]] = None,
+    fleet_log: Optional[FleetLog] = None,
+    fleet_kind: str = 'pending',
 ) -> None:
   """The shared tail of all THREE reroute cancel sites (a: in-place thrash,
   b: PENDING x2, c: nominally-RUNNING): once the decision to cancel+requeue is
@@ -2537,6 +2664,11 @@ def _reroute_requeue_after_cancel(
     return
   hist.append(time.time())
   _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
+  # ★FLEET MEMORY: tell every FUTURE row this (cell, arch) just failed one of
+  # ours. Read e.cell / e.arch BEFORE mark_reroute clears them.
+  if fleet_log is not None:
+    fleet_log.record(route_lib.fleet_events_for(e, fleet_kind, now), now, log,
+                     f'{e.job_id} (xid={xid})')
   if record_evict:
     # ★record_eviction BEFORE mark_reroute: the latter clears e.cell, and the
     # strike must land on the cell that did the evicting -- that is what makes
@@ -2589,6 +2721,7 @@ def run_reroute(
     restart_evidence=None,
     auto_resume_max: int = 3,
     persist_fn: Optional[Callable[[], None]] = None,
+    fleet_log: Optional[FleetLog] = None,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """Cancel SUBMITTED jobs stuck PENDING past the deadline and return them to
   QUEUED for the next tick to re-place. Returns (entries, log_lines).
@@ -2731,9 +2864,9 @@ def run_reroute(
           record_evict=False,
           dry_reason=f'{tag}: PENDING x2, no fresh output',
           ok_reason=(f'[reroute] cancelled + re-queued {tag}; cell|arch cooled '
-                     f'{int(cooldown_s)}s'),
+                     f'{int(route_lib.pair_cooldown_for(e.arch, cooldown_s))}s'),
           fail_prefix=f'[reroute] cancel FAILED for {tag}, left SUBMITTED.',
-          persist_fn=persist_fn)
+          persist_fn=persist_fn, fleet_log=fleet_log, fleet_kind='pending')
     elif state == STATUS_RUNNING:
       # ★XM RUNNING IS NOT "HAS CHIPS", AND PROMOTING ON IT IS A ONE-WAY DOOR.
       # needs_reroute() selects SUBMITTED rows only, so the moment RUNNING is
@@ -2804,10 +2937,12 @@ def run_reroute(
               record_evict=True,  # thrash: blame the cell that evicted it
               dry_reason=f'{tag}: {why}',
               ok_reason=(f'[reroute] cancelled + re-queued {tag}: {why}; cell|arch '
-                         f'cooled {int(cooldown_s)}s, eviction strike recorded'),
+                         f'cooled '
+                         f'{int(route_lib.pair_cooldown_for(e.arch, cooldown_s))}s'
+                         f', eviction strike recorded'),
               fail_prefix=(f'[reroute] cancel FAILED for thrashing {tag}, left '
                            f'as-is.'),
-              persist_fn=persist_fn)
+              persist_fn=persist_fn, fleet_log=fleet_log, fleet_kind='thrash')
           continue
       vm_running = borg_probe.has_running_vmgroup(e) if borg_probe else None
       cell_known = bool((e.cell or '').strip())
@@ -2869,10 +3004,11 @@ def run_reroute(
           record_evict=False,
           dry_reason=f'{tag}: {stuck_why}',
           ok_reason=(f'[reroute] cancelled + re-queued {tag}: nominally RUNNING '
-                     f'({stuck_why}); cell|arch cooled {int(cooldown_s)}s'),
+                     f'({stuck_why}); cell|arch cooled '
+                     f'{int(route_lib.pair_cooldown_for(e.arch, cooldown_s))}s'),
           fail_prefix=(f'[reroute] cancel FAILED for nominally-RUNNING {tag}, '
                        f'left as-is.'),
-          persist_fn=persist_fn)
+          persist_fn=persist_fn, fleet_log=fleet_log, fleet_kind='pending')
     elif state == STATUS_TERMINAL:
       if restart_evidence is not None:
         # Auto-resume is on: the reconcile pass (next round) owns dead rows,
@@ -2935,9 +3071,20 @@ def run_checkpoint_census(
 
 
 # --- the tick -------------------------------------------------------------
+def _log_view(view: route_lib.PlacementView, log: list[str], tag: str) -> None:
+  """The two view lines every placement round logs (when non-empty): the
+  in-flight debit applied, and the active fleet records (soft score)."""
+  debit = view.debit_note()
+  if debit:
+    log.append(f'{tag} in-flight debit: {debit}')
+  fleet = view.fleet_note()
+  if fleet:
+    log.append(f'{tag} fleet pair cooldowns (soft): {fleet}')
+
+
 def run_tick(
     entries: list[route_lib.QueueEntry],
-    provider: _Provider,
+    provider: '_Provider | ViewSource',
     now: float,
     submitter: Optional[_Submitter] = None,
     dry_run: bool = True,
@@ -2947,9 +3094,11 @@ def run_tick(
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """One router tick. Returns (updated_entries, log_lines).
 
-  Pure orchestration over route_lib + the provider + the submitter seam; the
-  entries list is mutated in place (apply_placement) and also returned. In
-  dry-run nothing is submitted -- the plan is logged and the queue is unchanged.
+  Pure orchestration over route_lib + the round's placement view + the
+  submitter seam; the entries list is mutated in place (apply_placement) and
+  also returned. In dry-run nothing is submitted -- the plan is logged and the
+  queue is unchanged. `provider` is a ViewSource, or a bare availability
+  provider (then no fleet records; the in-flight debit still applies).
   """
   log: list[str] = []
   queued = [e for e in entries if e.state == route_lib.JobState.QUEUED]
@@ -2957,14 +3106,14 @@ def run_tick(
     log.append('[route_check] no QUEUED jobs; nothing to do.')
     return entries, log
 
-  avail_by_cell, arch_price, arch_pool = provider.fetch()
+  view = as_view_source(provider).build(entries, now)
   log.append(f'[route_check] {len(queued)} queued; availability: '
-             f'{len(avail_by_cell)} (cell,arch) entries, '
-             f'pools={ {a: int(p) for a, p in arch_pool.items()} }')
+             f'{len(view.raw)} (cell,arch) entries, '
+             f'pools={ {a: int(p) for a, p in view.arch_pool.items()} }')
+  _log_view(view, log, '[route_check]')
 
-  placements = route_lib.select_and_plan(
-      entries, avail_by_cell, now, max_placements=max_placements,
-      arch_price=arch_price, arch_pool=arch_pool)
+  placements = route_lib.plan_batch(entries, view, now,
+                                    max_placements=max_placements)
 
   if not placements:
     log.append('[route_check] nothing placeable this tick (all candidate '
@@ -3103,26 +3252,9 @@ class _StageHealthProbe(Protocol):
     ...
 
 
-def plan_one_entry(
-    entry: route_lib.QueueEntry,
-    provider: _Provider,
-    now: float,
-) -> Optional[route_lib.Placement]:
-  """Pick a placement for ONE already-claimed entry, using live availability.
-  Same policy as the tick (effective-price type, most-placeable cell), but for a
-  single entry -- the worker has already chosen WHICH job via the queue order."""
-  try:
-    avail_by_cell, arch_price, arch_pool = provider.fetch()
-  except Exception as e:  # pylint: disable=broad-except
-    entry.last_reason = f'availability fetch failed: {e}'
-    return None
-  return route_lib.plan_one(entry, avail_by_cell, now,
-                            arch_price=arch_price, arch_pool=arch_pool)
-
-
 def run_worker_once(
     queue_file: str,
-    provider: _Provider,
+    provider: '_Provider | ViewSource',
     submitter: _Submitter,
     now: float,
     worker_id: str,
@@ -3193,7 +3325,15 @@ def run_worker_once(
   # PLAN a cell for it (live availability) BEFORE any XManager jobid-tag RPC:
   # if no cell can place this entry right now, release the slot immediately
   # without paying for a remote XManager lookup.
-  placement = plan_one_entry(claimed, provider, now)
+  # The claimed row was planned against the live queue: every OTHER SUBMITTED
+  # row's claim is debited (the claimed row is BUILDING, so it claims nothing).
+  try:
+    view = as_view_source(provider).build(load_queue(queue_file), now)
+    _log_view(view, log, '[worker]')
+    placement = route_lib.place(claimed, view, now)
+  except Exception as e:  # pylint: disable=broad-except
+    claimed.last_reason = f'availability fetch failed: {e}'
+    placement = None
   if placement is None:
     # Nothing placeable right now -> release the slot, back to QUEUED.
     # Note: claim_next_build overwrote claimed.last_reason with
@@ -3538,7 +3678,7 @@ def run_dispatch_once(
     budget_query_fn: 'Callable[..., Optional[dict]]' = budget_query,
     dry_run: bool = True,
     group_order: Optional[list[str]] = None,
-    provider: Optional[_Provider] = None,
+    provider: 'Optional[_Provider | ViewSource]' = None,
     group_capacity_fn: 'Optional[Callable[[str], Optional[route_lib.GroupCapacity]]]' = None,
 ) -> tuple[str, list[str]]:
   """ONE router-dispatch round (the DISPATCH half of the rewritten worker).
@@ -3595,13 +3735,29 @@ def run_dispatch_once(
   # will actually submit, not the `--power` string the job was enqueued with.
   placement_by_id: dict = {}
   if provider is not None:
-    placeable_queued: list[route_lib.QueueEntry] = []
     unplaceable_reasons: dict[str, tuple[str, str]] = {}
-    for e in queued:
-      pl = plan_one_entry(e, provider, now)
+    # ONE view for the whole round, planned in priority order: each placement
+    # is taken from the view before the next row is planned, so N rows are
+    # never promoted for one free slot (the in-round half of the in-flight
+    # debit; the view itself already debits every SUBMITTED row).
+    try:
+      view: Optional[route_lib.PlacementView] = (
+          as_view_source(provider).build(entries, now))
+      fetch_err = ''
+    except Exception as ex:  # pylint: disable=broad-except
+      view, fetch_err = None, f'availability fetch failed: {ex}'
+    if view is not None:
+      _log_view(view, log, '[dispatch]')
+    for e in sorted(queued, key=lambda x: -x.priority):
+      pl = None
+      if view is None:
+        e.last_reason = fetch_err
+      else:
+        pl = route_lib.place(e, view, now)
       if pl is not None:
         placement_by_id[e.job_id] = pl
-        placeable_queued.append(e)
+        assert view is not None
+        view.take(pl)
       else:
         f_why = getattr(e, 'last_filter_reason', '') or ''
         p_why = e.last_reason or ''
@@ -3625,6 +3781,7 @@ def run_dispatch_once(
               changed_q = True
         if changed_q:
           save_queue(queue_file, live_q)
+    placeable_queued = [e for e in queued if e.job_id in placement_by_id]
     if not placeable_queued:
       log.append(f'[dispatch] 0/{len(queued)} QUEUED job(s) have placeable '
                  f'capacity right now; holding in QUEUED.')
@@ -3853,7 +4010,7 @@ def run_dispatch_once(
 
 def run_worker_loop(
     queue_file: str,
-    provider_factory: 'Callable[[], _Provider]',
+    provider_factory: 'Callable[[], _Provider | ViewSource]',
     submitter: _Submitter,
     worker_id: str,
     poll_s: float = 15.0,
@@ -3870,7 +4027,7 @@ def run_worker_loop(
   last_fail = None
   it = 0
   requeued_in_sweep: set[str] = set()
-  cached_provider: Optional[_Provider] = None
+  cached_provider: 'Optional[_Provider | ViewSource]' = None
   while max_iterations is None or it < max_iterations:
     it += 1
     if cached_provider is None:
@@ -3909,7 +4066,7 @@ def run_worker_loop(
 
 def run_dispatch_worker_loop(
     queue_file: str,
-    provider_factory: 'Callable[[], _Provider]',
+    provider_factory: 'Callable[[], _Provider | ViewSource]',
     submitter: _Submitter,
     worker_id: str,
     group_order: Optional[list[str]] = None,
@@ -3937,7 +4094,7 @@ def run_dispatch_worker_loop(
   """
   last_fail = None
   it = 0
-  cached_provider: Optional[_Provider] = None
+  cached_provider: 'Optional[_Provider | ViewSource]' = None
   while max_iterations is None or it < max_iterations:
     it += 1
     if cached_provider is None:
@@ -3971,6 +4128,16 @@ def run_dispatch_worker_loop(
     time.sleep(poll_s)
 
 
+def _view_source_factory(group: str, fleet_file: Optional[str],
+                         cooldown_s: float) -> 'Callable[[], ViewSource]':
+  """The production ViewSource factory for the worker loops: live
+  availability for `group`, the fleet log at `fleet_file`
+  (--fleet_pair_events_file), the --cooldown_s base."""
+  return lambda: ViewSource(
+      avail_provider.AvailabilityProvider(group=group),
+      FleetLog(fleet_file), cooldown_s)
+
+
 def main(argv):
   del argv
 
@@ -3992,7 +4159,8 @@ def main(argv):
           f'one build at a time, poll {_WORKER_POLL_S.value}s.', flush=True)
     run_worker_loop(
         _QUEUE_FILE.value,
-        provider_factory=lambda: avail_provider.AvailabilityProvider(group=_GROUP.value),
+        provider_factory=_view_source_factory(
+            _GROUP.value, _FLEET_PAIR_EVENTS_FILE.value, _COOLDOWN_S.value),
         submitter=Submitter(),
         worker_id=worker_id,
         poll_s=_WORKER_POLL_S.value,
@@ -4020,7 +4188,8 @@ def main(argv):
           f'build, poll {_WORKER_POLL_S.value}s.', flush=True)
     run_dispatch_worker_loop(
         _QUEUE_FILE.value,
-        provider_factory=lambda: avail_provider.AvailabilityProvider(group=_GROUP.value),
+        provider_factory=_view_source_factory(
+            _GROUP.value, _FLEET_PAIR_EVENTS_FILE.value, _COOLDOWN_S.value),
         submitter=Submitter(),
         worker_id=worker_id,
         group_order=([g.strip() for g in _GROUP_ORDER.value.split(',') if g.strip()]
@@ -4058,7 +4227,9 @@ def main(argv):
             restart_evidence=(CnsRestartEvidence()
                               if _AUTO_RESUME_PRUNED.value else None),
             # Fresh per pass: the lookup caches each registry file once.
-            cancelled_lookup=make_registry_cancelled_lookup())
+            cancelled_lookup=make_registry_cancelled_lookup(),
+            # The reroute loop is the ONE writer of the fleet log.
+            fleet_log=FleetLog(_FLEET_PAIR_EVENTS_FILE.value))
         for line in rc_log:
           print(f'  [reroute-loop:reconcile] {line}', flush=True)
         if not _DRY_RUN.value:
@@ -4091,7 +4262,8 @@ def main(argv):
             persist_fn=(
                 (lambda _s=snap, _b=baseline: merge_and_save_touched(
                     _QUEUE_FILE.value, _s, baseline=_b))
-                if not _DRY_RUN.value else None))
+                if not _DRY_RUN.value else None),
+            fleet_log=FleetLog(_FLEET_PAIR_EVENTS_FILE.value))
         for line in rr_log:
           print(f'  [reroute-loop:reroute] {line}', flush=True)
         if not _DRY_RUN.value:
@@ -4188,10 +4360,12 @@ def main(argv):
           a.lower() for e in remaining for a in (e.allowed_archs or [])
           if a.lower() in avail_provider.ARCH_PLATFORM
       })
-      provider = avail_provider.AvailabilityProvider(
-          group=grp, archs=queued_archs or None)
+      source = ViewSource(
+          avail_provider.AvailabilityProvider(group=grp,
+                                              archs=queued_archs or None),
+          FleetLog(_FLEET_PAIR_EVENTS_FILE.value), _COOLDOWN_S.value)
       updated, tick_log = run_tick(
-          updated, provider, now=time.time(),
+          updated, source, now=time.time(),
           dry_run=_DRY_RUN.value, group=grp,
           max_placements=_MAX_PLACEMENTS.value, verbose=_VERBOSE.value)
       log.extend(tick_log)

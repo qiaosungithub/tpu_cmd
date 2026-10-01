@@ -4075,5 +4075,258 @@ class CheckpointCensusTest(unittest.TestCase):
     self.assertIsNone(b.last_known_checkpoint_checked_at)
 
 
+
+def _gav(cell, free, arch='h100', price=4.0):
+  # metro '' fails open in route_lib's storage gate (synthetic cells).
+  return R.CellAvail(cell=cell, arch=arch, free_chips=free, oversold=False,
+                     price=price, metro='')
+
+
+def _gpu_submitted(job_id, cell, xid, arch='h100', chips=8, group=None):
+  e = _entry(job_id, power=f'{arch}-{chips}', archs=(arch,))
+  e.state = R.JobState.SUBMITTED
+  e.xid = xid
+  e.cell, e.arch, e.chips = cell, arch, chips
+  e.group = group
+  return e
+
+
+def _gpu_queued(job_id, priority=0):
+  e = _entry(job_id, power='h100-8', archs=('h100',))
+  e.state = R.JobState.QUEUED
+  e.priority = priority
+  return e
+
+
+def _fits_seam(tpu_type, tier='PROD', lo='', group=''):
+  return {'income': 1000.0, 'bar': 100.0, 'current': 0.0,
+          'headroom': 1000.0, 'new_cost': 1.0, 'exempt': False,
+          'fits': True}
+
+
+class PlacementViewWiringTest(unittest.TestCase):
+  """ONE placement view per round (operator 2026-10-01), carrying the
+  in-flight debit (operator-approved 2026-09-30: gl showed 3 free h100-8
+  slices and received 8 rows in 3 min) and the fleet (cell, arch) records as a
+  soft score. Every caller -- tick, worker build, dispatch pre-filter -- plans
+  through it."""
+
+  def setUp(self):
+    self.dir = tempfile.mkdtemp()
+    self.addCleanup(lambda: __import__('shutil').rmtree(self.dir, True))
+    self.q = os.path.join(self.dir, 'q.json')
+    self.ev = os.path.join(self.dir, 'fleet.json')
+
+  def test_fleet_log_append_prunes_and_is_atomic(self):
+    fl = RC.FleetLog(self.ev)
+    fl.append([{'pair': 'gl|h100', 'kind': 'pending', 'job_id': 'a',
+                'at': 0.0}], 0.0)
+    fl.append([{'pair': 'sh|h100', 'kind': 'pending', 'job_id': 'b',
+                'at': 90000.0}], 90000.0)
+    self.assertEqual([e['pair'] for e in fl.load(90000.0)], ['sh|h100'])
+    self.assertEqual([n for n in os.listdir(self.dir)
+                      if n.startswith('.fleet_pair_events.')], [])
+
+  def test_fleet_log_fails_open(self):
+    with open(self.ev, 'w') as f:
+      f.write('{not json')
+    self.assertEqual(RC.FleetLog(self.ev).load(0.0), [])
+    self.assertEqual(RC.FleetLog(self.ev).pairs(0.0, 7200.0), {})
+    self.assertEqual(RC.FleetLog(None).load(0.0), [])
+    log = []
+    RC.FleetLog(None).record([{'pair': 'gl|h100', 'kind': 'pending',
+                               'job_id': 'a', 'at': 0.0}], 0.0, log, 't')
+    self.assertEqual(log, [])
+
+  def test_fleet_log_pairs_are_gpu_scaled(self):
+    fl = RC.FleetLog(self.ev)
+    fl.append([{'pair': 'gl|h100', 'kind': 'pending', 'job_id': 'a',
+                'at': 0.0},
+               {'pair': 'nm|v7', 'kind': 'pending', 'job_id': 'a',
+                'at': 0.0}], 0.0)
+    rec = fl.pairs(10000.0, 7200.0)     # GPU window 14400 s, TPU 7200 s
+    self.assertEqual(rec, {'gl|h100': {'until': 14400.0, 'strikes': 1}})
+
+  def test_view_source_builds_one_view(self):
+    RC.FleetLog(self.ev).append([{'pair': 'gl|h100', 'kind': 'pending',
+                                  'job_id': 'x', 'at': 100.0}], 100.0)
+    src = RC.ViewSource(_FakeProvider({'gl|h100': _gav('gl', 24),
+                                       'sh|h100': _gav('sh', 16)}),
+                        RC.FleetLog(self.ev), 7200.0)
+    v = src.build([_gpu_submitted('s1', 'gl', '1')], now=200.0)
+    self.assertEqual(v.free['gl|h100'].free_chips, 16)
+    self.assertEqual(v.debit_note(), 'gl|h100 -8')
+    self.assertEqual(v.fleet_note(), 'gl|h100 s1')
+    # A bare provider is a source with no fleet log; the debit still applies.
+    v2 = RC.as_view_source(_FakeProvider({'gl|h100': _gav('gl', 24)})).build(
+        [_gpu_submitted('s1', 'gl', '1')], now=200.0)
+    self.assertEqual((v2.free['gl|h100'].free_chips, v2.fleet_pairs),
+                     (16, {}))
+
+  def test_run_tick_debits_inflight_rows(self):
+    # gl (cheaper) shows 1 free slice that a SUBMITTED row already claims.
+    rows = [_gpu_submitted('s1', 'gl', '1'), _gpu_queued('new')]
+    prov = _FakeProvider({'gl|h100': _gav('gl', 8, price=3.0),
+                          'sh|h100': _gav('sh', 8, price=4.0)})
+    _, log = RC.run_tick(rows, prov, now=100.0, dry_run=True)
+    self.assertIn('[route_check] in-flight debit: gl|h100 -8', log)
+    self.assertTrue(any('new' in l and '-> sh' in l for l in log), log)
+
+  def test_dispatch_prefilter_debits_in_round(self):
+    # ONE free slice on gl, three queued rows: only one may be promoted, and
+    # it is the highest-priority one.
+    RC.save_queue(self.q, [_gpu_queued('c', 1), _gpu_queued('a', 3),
+                           _gpu_queued('b', 2)])
+    out, _ = RC.run_dispatch_once(self.q, now=100.0,
+                                  budget_query_fn=_fits_seam, dry_run=False,
+                                  group_order=['9'],
+                                  provider=_FakeProvider(
+                                      {'gl|h100': _gav('gl', 8)}))
+    self.assertEqual(out, 'dispatched')
+    rows = {e.job_id: e.state for e in RC.load_queue(self.q)}
+    self.assertEqual(rows, {'a': R.JobState.BUILD_REQUESTED,
+                            'b': R.JobState.QUEUED, 'c': R.JobState.QUEUED})
+
+  def test_dispatch_prefilter_debits_submitted_rows(self):
+    RC.save_queue(self.q, [_gpu_submitted('s1', 'gl', '1'), _gpu_queued('a')])
+    out, log = RC.run_dispatch_once(
+        self.q, now=100.0, budget_query_fn=_fits_seam, dry_run=False,
+        group_order=['9'], provider=_FakeProvider({'gl|h100': _gav('gl', 8)}))
+    self.assertEqual(out, 'idle')                 # gl's one slot is claimed
+    self.assertIn('[dispatch] in-flight debit: gl|h100 -8', log)
+
+  def test_worker_build_plans_against_the_debited_view(self):
+    RC.save_queue(self.q, [_gpu_submitted('s1', 'gl', '1'), _gpu_queued('a')])
+    prov = _FakeProvider({'gl|h100': _gav('gl', 8, price=3.0),
+                          'sh|h100': _gav('sh', 8, price=4.0)})
+    outcome, log, _ = RC.run_worker_once(self.q, prov, _FakeSubmitter(xid='7'),
+                                         now=100.0, worker_id='w')
+    self.assertEqual(outcome, 'submitted')
+    self.assertIn('[worker] in-flight debit: gl|h100 -8', log)
+    self.assertEqual({e.job_id: e.cell for e in RC.load_queue(self.q)}['a'],
+                     'sh')
+
+  def test_dispatch_and_worker_read_fleet_records(self):
+    prov = _FakeProvider({'gl|h100': _gav('gl', 64, price=3.0),
+                          'lb|h100': _gav('lb', 64, price=4.0)})
+    now = 1000.0
+    fl = RC.FleetLog(self.ev)
+    fl.append([{'pair': 'gl|h100', 'kind': 'pending', 'job_id': str(i),
+                'at': now} for i in range(4)], now)
+    src = RC.ViewSource(prov, fl, 7200.0)
+    RC.save_queue(self.q, [_gpu_queued('a')])
+    _, log = RC.run_dispatch_once(self.q, now=now, budget_query_fn=_fits_seam,
+                                  dry_run=False, group_order=['9'],
+                                  provider=src)
+    self.assertIn('[dispatch] fleet pair cooldowns (soft): gl|h100 s4', log)
+    outcome, _, _ = RC.run_worker_once(
+        self.q, src, _FakeSubmitter(xid='7'), now=now, worker_id='w',
+        claim_pick=R.next_build_requested)
+    self.assertEqual(outcome, 'submitted')
+    self.assertEqual(RC.load_queue(self.q)[0].cell, 'lb')
+    # NEGATIVE CONTROL: the same round with no fleet log takes the cheaper gl.
+    RC.save_queue(self.q, [_gpu_queued('b')])
+    RC.run_dispatch_once(self.q, now=now, budget_query_fn=_fits_seam,
+                         dry_run=False, group_order=['9'], provider=prov)
+    RC.run_worker_once(self.q, prov, _FakeSubmitter(xid='8'), now=now,
+                       worker_id='w', claim_pick=R.next_build_requested)
+    self.assertEqual(RC.load_queue(self.q)[0].cell, 'gl')
+
+  def test_production_loops_get_a_fleet_backed_view_source(self):
+    src = RC._view_source_factory('9', self.ev, 7200.0)()
+    self.assertIsInstance(src, RC.ViewSource)
+    self.assertEqual((src.fleet_log.path if src.fleet_log else None,
+                      src.cooldown_s), (self.ev, 7200.0))
+
+
+
+class FleetEventWriteTest(unittest.TestCase):
+  """The write side of fleet (cell, arch) memory (operator-approved
+  2026-09-30): never-started and thrash cancels, and hardware deaths, append
+  one event per blamed pair; dry runs and failed cancels append nothing."""
+
+  def setUp(self):
+    self.dir = tempfile.mkdtemp()
+    self.addCleanup(lambda: __import__('shutil').rmtree(self.dir, True))
+    self.ev = os.path.join(self.dir, 'fleet.json')
+    self.hist = os.path.join(self.dir, 'hist.json')
+    with open(self.hist, 'w') as f:
+      f.write('[]')
+    self.fl = RC.FleetLog(self.ev)
+
+  def _kinds(self):
+    return [(x['pair'], x['kind'], x['job_id']) for x in self.fl.load(0.0)]
+
+  def test_pending_cancel_records_a_pending_event(self):
+    e = _gpu_submitted('j1', 'gl', '111')
+    e.submitted_at = 0.0
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute(
+        [e], now=5000.0, probe=_FakeProbe({'111': RC.STATUS_PENDING}),
+        submitter=sub, reroute_after_s=600.0, cooldown_s=7200.0,
+        dry_run=False, sleep_fn=lambda _: None, history_file=self.hist,
+        fleet_log=self.fl)
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(self._kinds(), [('gl|h100', 'pending', 'j1')])
+    # GPU pair cooldown x2 (operator 2026-09-30): 2 x 7200 s.
+    self.assertTrue(any('cell|arch cooled 14400s' in l for l in log), log)
+
+  def test_thrash_cancel_records_a_thrash_event(self):
+    e = _running('j1', '111', 'ej', submitted_at=0.0)
+    RC.run_reroute(
+        [e], now=4000.0, probe=_FakeProbe({'111': RC.STATUS_RUNNING}),
+        submitter=_FakeSubmitter(), cooldown_s=1800.0, dry_run=False,
+        output_probe=_FakeOutputProbe({'111': 3999.0}),
+        restart_probe=_FakeRestartProbe({'111': 5}),
+        inplace_reroute=True, inplace_restart_threshold=3,
+        nominal_running_grace_s=3600.0, history_file=self.hist,
+        sleep_fn=lambda _: None, fleet_log=self.fl)
+    self.assertEqual(self._kinds(), [('ej|v7', 'thrash', 'j1')])
+
+  def test_no_fleet_log_writes_nothing_and_dry_run_records_nothing(self):
+    e = _gpu_submitted('j1', 'gl', '111')
+    e.submitted_at = 0.0
+    with mock.patch.object(RC, 'FLEET_PAIR_EVENTS_FILE', self.ev):
+      RC.run_reroute(
+          [e], now=5000.0, probe=_FakeProbe({'111': RC.STATUS_PENDING}),
+          submitter=_FakeSubmitter(), reroute_after_s=600.0, dry_run=False,
+          sleep_fn=lambda _: None, history_file=self.hist)
+    self.assertFalse(os.path.exists(self.ev))
+    e2 = _gpu_submitted('j2', 'gl', '222')
+    e2.submitted_at = 0.0
+    RC.run_reroute(
+        [e2], now=5000.0, probe=_FakeProbe({'222': RC.STATUS_PENDING}),
+        submitter=_FakeSubmitter(), reroute_after_s=600.0, dry_run=True,
+        sleep_fn=lambda _: None, history_file=self.hist, fleet_log=self.fl)
+    self.assertFalse(os.path.exists(self.ev))
+
+  def _hw_dead(self, auto_resumes):
+    e = _gpu_submitted('h1', 'ga', '901')
+    e.submitted_at = 0.0
+    e.launch_kwargs = {'config': 'cfgH', 'exp_name': 'pc-h'}
+    e.auto_resumes = auto_resumes
+    return e
+
+  def _reconcile(self, e, hw=True):
+    ev = _HwEvidence({e.xid: (None, '/cns/x/steps/step_1000.pt', True)},
+                     {e.xid: 'NVLink P2P disabled (bad GPU host): GPUs 6<->0'}
+                     if hw else {})
+    probe = _FakeProbe({e.xid: RC.STATUS_TERMINAL},
+                       reasons={e.xid: 'RuntimeError: NCCL init failed'})
+    return RC.run_reconcile([e], now=100.0, probe=probe, dry_run=False,
+                            auto_resume_pruned=True, restart_evidence=ev,
+                            auto_resume_max=3, fleet_log=self.fl)
+
+  def test_hardware_death_records_an_event_even_when_not_restarted(self):
+    # The fleet must learn about the bad ga host whatever happens to the row
+    # (xid 294889693, 2026-09-30 23:18Z).
+    self._reconcile(self._hw_dead(auto_resumes=3))
+    self.assertEqual(self._kinds(), [('ga|h100', 'hardware', 'h1')])
+
+  def test_non_hardware_death_records_nothing(self):
+    self._reconcile(self._hw_dead(auto_resumes=0), hw=False)
+    self.assertFalse(os.path.exists(self.ev))
+
+
 if __name__ == '__main__':
   unittest.main()
