@@ -1,0 +1,600 @@
+{
+ "cases": {
+  "a100-1": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "a100": 1,
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "a100"
+   ]
+  },
+  "a100-16": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "a100": 16,
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "a100"
+   ]
+  },
+  "a100-4": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "a100": 4,
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "a100"
+   ]
+  },
+  "a100-8": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "a100": 8,
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "a100"
+   ]
+  },
+  "a100-8+batch": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "a100": 8,
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "location": "mg",
+      "service_tier": "ServiceTier.BATCH",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "a100"
+   ]
+  },
+  "a100-8+evict3": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "borg_overrides": {
+      "__type__": "RESTRICTED_BorgOverrides",
+      "scheduling": {
+       "__type__": "scheduling",
+       "max_task_evictions": 3
+      }
+     },
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "a100": 8,
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "a100"
+   ]
+  },
+  "a100_80gib-4": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "a100_80gib": 4,
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "a100_80gib"
+   ]
+  },
+  "a100_80gib-8": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "a100_80gib": 8,
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "a100_80gib"
+   ]
+  },
+  "b200-8": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "b200": 8,
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "b200"
+   ]
+  },
+  "b200-8+batch": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "b200": 8,
+      "location": "mg",
+      "service_tier": "ServiceTier.BATCH",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "b200"
+   ]
+  },
+  "cpu": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "cpu": 1,
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "cpu"
+   ]
+  },
+  "h100-4": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "h100": 4,
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "h100"
+   ]
+  },
+  "h100-8": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "h100": 8,
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "h100"
+   ]
+  },
+  "h100-8+evict3": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "borg_overrides": {
+      "__type__": "RESTRICTED_BorgOverrides",
+      "scheduling": {
+       "__type__": "scheduling",
+       "max_task_evictions": 3
+      }
+     },
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "h100": 8,
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "h100"
+   ]
+  },
+  "h100-8,b200-8": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "h100": 8,
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    },
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "b200": 8,
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "h100",
+    "b200"
+   ]
+  },
+  "h200-8": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "h200": 8,
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": false,
+   "tpu_res_names": [
+    "h200"
+   ]
+  },
+  "v5p-16": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184,
+      "viperfish": "2x2x4"
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": true,
+   "tpu_res_names": [
+    "viperfish"
+   ]
+  },
+  "v6e-16": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "ghostlite_pod": "4x4",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": true,
+   "tpu_res_names": [
+    "ghostlite_pod"
+   ]
+  },
+  "v6p-32": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "ghostfish": "2x4x4",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": true,
+   "tpu_res_names": [
+    "ghostfish"
+   ]
+  },
+  "v7-16": {
+   "executors": [
+    {
+     "__type__": "Borg",
+     "logs_read_access_roles": [
+      "all"
+     ],
+     "requirements": {
+      "__type__": "JobRequirements",
+      "allocator": "group:deepmind-dynamic/fr-dna-grand-challenge-team-resource",
+      "ghostfishlite": "2x2x4",
+      "location": "mg",
+      "service_tier": "ServiceTier.PROD",
+      "tmp_ram_fs": 17179869184
+     },
+     "scheduling": {
+      "__type__": "BorgScheduling",
+      "max_per_task_failures": 3,
+      "max_task_failures": -1,
+      "task_failure_credit_period": 7200
+     }
+    }
+   ],
+   "is_tpu_job": true,
+   "tpu_res_names": [
+    "ghostfishlite"
+   ]
+  }
+ },
+ "launcher": "/usr/local/google/home/qiaos/work/tpu_cmd/xm_launcher.py.bak_bigrig_a100_20261016_020602Z"
+}

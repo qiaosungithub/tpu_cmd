@@ -649,6 +649,85 @@ def _borg_overrides_for_eviction_budget(max_task_evictions: int):
     return borg_overrides
 
 
+# BIGRIG LOCALITY FOR SUB-HOST A100 ASKS (added 2026-10-16).
+# Borg master refuses any alloc/job that asks for more than one GPU of a
+# "BigRig" scalar without a device_group_spec locality rule pinning them to one
+# BIG_RIG_<n> group: //borg/control/core/api/collection_api_util.cc
+# (BigRigScalars / NeedBigRigLocalityRule / DeviceBigRigDomain). XManager emits
+# that rule itself ONLY when the ask is a full host group (the platform's
+# chips_per_device_group: platforms/accelerator_metadata/platforms/*.gcl,
+# rendered by common/borg/api.gcl device_group_spec()), which is why h100-8
+# (8 per group) always worked and a100-8 (16 per group) did not: XID 300261498
+# died with zero tasks on "INVALID_ARGUMENT: Alloc is requesting 8 units of
+# GPU_TESLA_A100_40GIB for its children. Please also include a locality rule
+# requiring that the GPUs are co-located on the same BIGRIG group."
+#
+# Scope is deliberately A100 only. H100/H200 are BigRig scalars too and an
+# h100-2/-4 ask would hit the same refusal, but the operator required the h100
+# request to stay byte-for-byte unchanged, and H200's platform group is
+# NEUTRON_8, not BIG_RIG. b200 is not a BigRig scalar. The idiom (job `group` +
+# alloc `child_group`, both via RESTRICTED_BorgOverrides) is the one in
+# //prototypes/gdm/users/arischioppa/deepsign/pytorch/xm_launch.py and
+# //experimental/users/hlaczko/partsdf/partsdf/tools/xm_launch.py; the BCL shape
+# is XManager's own (spec1 = {group, locality}).
+# Pinned by ~/work/tpu_cmd/scripts/test_bigrig_locality.py (golden diff).
+_BIGRIG_SUBHOST_GPUS = {
+    # arch token -> (Borg scalar key, GPUs per BIG_RIG host group)
+    'a100': ('GPU_TESLA_A100_40GIB', 16),
+    'a100_80gib': ('GPU_TESLA_A100_80GIB', 8),
+}
+_BIGRIG_DOMAIN_SIZES = (2, 4, 8, 16)   # BIG_RIG_2/4/8/16 in accelerator.proto
+
+
+def _bigrig_device_group_specs(res_name, count):
+    """(job BCL, alloc BCL) device_group_spec for a sub-host BigRig ask, or None.
+
+    None means "leave the request exactly as it was": not an A100 type, a
+    single GPU (no rule needed), a full host group (XManager already emits the
+    rule), or a count Borg has no BIG_RIG domain for (Borg rejects it either way).
+    """
+    entry = _BIGRIG_SUBHOST_GPUS.get(res_name)
+    if entry is None or isinstance(count, bool) or not isinstance(count, int):
+        return None
+    scalar, host_group = entry
+    if count not in _BIGRIG_DOMAIN_SIZES or count >= host_group:
+        return None
+
+    def spec(field):
+        return ('{\n'
+                '  spec1 = {\n'
+                f"    {field} = [{{ scalar = [{{ key = '{scalar}', value = {count} }}] }}]\n"
+                f"    locality = [{{ type = 'BIG_RIG_{count}', devices = ['{scalar}'] }}]\n"
+                '  }\n'
+                '}')
+
+    return spec('group'), spec('child_group')
+
+
+def _apply_bigrig_locality(borg_kwargs, res_name, count):
+    """Adds the BIG_RIG rule to xm_abc.Borg kwargs; a no-op for every other type.
+
+    The job half goes into `borg_overrides` (reusing the eviction-budget
+    override object when there is one, so neither clobbers the other); the alloc
+    half goes into `alloc_overrides` (Borg: "Jobs cannot specify child groups").
+    """
+    specs = _bigrig_device_group_specs(res_name, count)
+    if specs is None:
+        return
+    job_spec, alloc_spec = specs
+    job_overrides = borg_kwargs.get('borg_overrides')
+    if job_overrides is None:
+        job_overrides = xm_abc.RESTRICTED_BorgOverrides()
+    job_overrides.device_group_spec = xm_abc.RESTRICTED_BorgToken(job_spec)
+    borg_kwargs['borg_overrides'] = job_overrides
+    alloc_overrides = xm_abc.RESTRICTED_BorgOverrides()
+    alloc_overrides.device_group_spec = xm_abc.RESTRICTED_BorgToken(alloc_spec)
+    borg_kwargs['alloc_overrides'] = alloc_overrides
+    print(f"[gpu] {res_name}-{count}: adding Borg locality BIG_RIG_{count} "
+          f"(job group + alloc child_group) -- XManager emits it only for a "
+          f"full {_BIGRIG_SUBHOST_GPUS[res_name][1]}-GPU host group.")
+
+
 # XManager derives the Borg job name from the packaged target ('main'); naming
 # the job explicitly keeps that in sync with the BCL token built below.
 _JOB_NAME = 'main'
@@ -1735,6 +1814,10 @@ def main(argv) -> None:
                 _MAX_TASK_EVICTIONS.value)
             if eviction_overrides is not None:
                 borg_kwargs['borg_overrides'] = eviction_overrides
+            # A100 only: sub-host asks need an explicit BIG_RIG locality
+            # rule or Borg refuses the alloc (see _apply_bigrig_locality).
+            _apply_bigrig_locality(borg_kwargs, res_name,
+                                   req_kwargs.get(res_name))
             if _AUTOPILOT.value is not None:
                 borg_kwargs['autopilot_params'] = xm_abc.AutopilotParams(
                     enabled=_AUTOPILOT.value)
