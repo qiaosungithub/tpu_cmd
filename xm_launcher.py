@@ -1340,6 +1340,38 @@ def _load_default_wandb() -> dict:
     return {}
 
 
+def _ca_mpm_workspace_tag() -> str:
+    """'ws=<workspace>@<baseline CL>' of the CitC workspace the stagedir lives in.
+
+    The prebuilt-MPM cache below used to be keyed on target_label + bazel args
+    only. A content-addressed label (eqr_run_ca_<sha12>) hashes the SOURCE tree,
+    not the workspace it is built in, so the same code staged into a different
+    workspace silently reused the MPM built from the old one -- and with it the
+    old workspace's third_party (2026-11-09: XID 310216628 was staged into
+    tpu_staging_t215_20261109 (torch 2.15.0a0) yet ran torch 2.13.0 from an MPM
+    built at hg_recovery_20260906). The workspace name + its baseline CL pins
+    the dependency set. Returns '' when it cannot be resolved; the caller then
+    skips reuse rather than guess. Never raises.
+    """
+    try:
+        stagedir = os.environ.get("TPU_STAGEDIR", "") or os.getcwd()
+        m = re.match(r"^(/google/src/cloud/[^/]+/[^/]+)/google3(/|$)",
+                     os.path.realpath(stagedir))
+        if not m:
+            return ""
+        ws_root = m.group(1)
+        # .citc/baseline is a directory tree; the synced CL is the first
+        # `change: N` in the ascii workspace proto.
+        with open(os.path.join(ws_root, ".citc", "srcfs_workspace.ascii"),
+                  "rb") as f:
+            cl = re.search(rb"change:\s*(\d+)", f.read())
+        if not cl:
+            return ""
+        return f"ws={os.path.basename(ws_root)}@{cl.group(1).decode()}"
+    except Exception:  # noqa: BLE001 - a cache key must never block a launch
+        return ""
+
+
 def main(argv) -> None:
     # NORMALISE --config to the bare <mode>. The contract is a short mode name
     # (`remote_run`); load_config and the launcher then wrap it into
@@ -2177,7 +2209,16 @@ def main(argv) -> None:
                 "/eqr_run_ca_" in target_label
                 and os.environ.get("TPU_CA_MPM_REUSE", "1") != "0"
             )
-            _ca_mpm_key = f"{target_label}|{' '.join(sorted(_bazel_args))}"
+            # The key includes the staging workspace + baseline CL (see
+            # _ca_mpm_workspace_tag); without it a workspace switch kept the
+            # old torch. Unresolvable workspace -> no reuse and no caching.
+            _ca_mpm_ws = _ca_mpm_workspace_tag()
+            if _ca_mpm_enabled and not _ca_mpm_ws:
+                print("[ca-mpm] staging workspace/baseline CL unresolved; "
+                      "building fresh (no MPM reuse)", flush=True)
+                _ca_mpm_enabled = False
+            _ca_mpm_key = (f"{target_label}|{' '.join(sorted(_bazel_args))}"
+                           f"|{_ca_mpm_ws}")
             _cached_mpm = None
             if _ca_mpm_enabled and os.path.exists(_ca_mpm_cache_file):
                 try:
