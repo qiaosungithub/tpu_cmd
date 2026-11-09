@@ -67,6 +67,8 @@ class Env:
         "TPU_STAGE_WS_ROTATE_DIR": self.state,
         "TPU_STAGE_WS_G4": self.g4,
         "TPU_STAGE_WS_PROBE_SLEEP_S": "0.05",
+        # the daily retirement check has its own tests (stage_ws_retire_test)
+        "TPU_STAGE_WS_RETIRE_CHECK": "0",
         "FAKE_CITC_ROOT": self.root,
         **extra,
     }

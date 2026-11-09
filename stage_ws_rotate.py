@@ -22,8 +22,10 @@ CONTRACT (shared with tpu_wrapper.sh, which globs the same names):
     minimum, eqr_jax_final_stages created, a probe file written and read back
     after 6 s and 12 s, dropped_resources.ascii still at its 49-byte header.
   * A member that fails verification is appended to <state dir>/.tpu_stage_ws_bad
-    and the wrapper never uses it. Nothing is ever deleted: retired workspaces
-    keep their stagedirs so --resume_xid keeps resolving.
+    and the wrapper never uses it. This script never deletes a workspace: full
+    members keep their stagedirs so --resume_xid keeps resolving. Retirement
+    is stage_ws_retire.py (`retire`, below), REPORT-ONLY unless --execute,
+    which archives every still-referenced stagedir to CNS before deleting.
   * The wrapper prefers members oldest first, so one fills to the 10 MiB limit
     before the next takes over; this script creates a new member as soon as no
     member has headroom (< 9 MiB by default), i.e. one step ahead.
@@ -39,6 +41,12 @@ COMMANDS
       wait for a lock held by another creator (0 = do not wait).
       Exit codes: 0 ok / created / dry-run, 1 failed or refused (cooldown,
       daily cap), 2 lock busy.
+      A non-dry-run ensure also runs stage_ws_retire.daily_check() at most once
+      per 24 h: a client count (WARNING above 60) plus a detached report-only
+      retirement check logged to the log below. It never archives or deletes.
+  retire [--json] | retire --execute [--client NAME ...] | retire restore ...
+      Delegates to stage_ws_retire.py (see its docstring for the policy).
+      Without --execute it only reports; --execute is wired nowhere.
 
 SAFETY RAILS: at most TPU_STAGE_WS_MAX_CREATES_PER_DAY (default 2) creations per
 family per 24 h, and a 30 min cooldown after a failed creation, so a bug or a
@@ -439,8 +447,19 @@ def _heartbeat(cfg: dict, family: str, pref: dict) -> None:
     pass
 
 
+def _daily_retire_check() -> None:
+  """Report-only retirement check, at most once a day; never fails ensure."""
+  try:
+    import stage_ws_retire  # pylint: disable=import-outside-toplevel
+    stage_ws_retire.daily_check()
+  except Exception:  # pylint: disable=broad-except
+    pass
+
+
 def ensure(cfg: dict, family: str, *, dry_run: bool = False,
            background: bool = False, wait_s: float = 0.0) -> int:
+  if not dry_run:
+    _daily_retire_check()
   infos = scan(cfg, family)
   if any(i["headroom"] for i in infos):
     pref = _preferred(infos)
@@ -514,6 +533,12 @@ def ensure(cfg: dict, family: str, *, dry_run: bool = False,
 # CLI
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
+  argv = list(sys.argv[1:] if argv is None else argv)
+  if argv and argv[0] == "retire":
+    import stage_ws_retire  # pylint: disable=import-outside-toplevel
+    rest = argv[1:]
+    return stage_ws_retire.main(rest if rest[:1] == ["restore"]
+                                else ["retire"] + rest)
   ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
   sub = ap.add_subparsers(dest="cmd", required=True)
   s = sub.add_parser("status")
