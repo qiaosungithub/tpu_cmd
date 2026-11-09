@@ -688,6 +688,7 @@ tpu() {
     local tier=""
     local power=""
     local force=0
+    local dry_run=0
     local skip_preflight=0
     # lo_price removed 2026-08-25: the cap is a fixed per-family policy, not an
     # operator-supplied number. budget_check now accounts at the market price.
@@ -742,6 +743,10 @@ tpu() {
           ;;
         --force|-f)
           force=1
+          shift
+          ;;
+        --dry-run|--dry_run|--dryrun)
+          dry_run=1
           shift
           ;;
         # NOTE: --lo-price / --limit-order-price were REMOVED 2026-08-25. The
@@ -1104,16 +1109,211 @@ print(d['group'], d['tpu_type'], d['status'],
     # median<30 on 0919/0920). Controlled interleaved A/B confirmed the
     # fresh ws is ~10x faster at CreateSnapshot. 15202 is RETAINED (365d)
     # with all its archived stage dirs -- nothing deleted -- and RETIRED.
-    # tpu_staging_20260921 (qiaos/18002) is the new dedicated staging ws.
-    # Keep explicit STAGE_WS_ROOT overrides intact.
-    local _default_ws="/google/src/cloud/qiaos/tpu_staging_20260921/google3"
+    # tpu_staging_20260921 (qiaos/18002, 432,982 live resources, 50.74 MB
+    # manifest) and lyyprobe_upload (qiaos/16802, 290,499 live resources,
+    # 35.40 MB manifest) have ALSO been rotated out (2026-10-26) after crossing
+    # CitC's ~100,000 live-resource auto-keyframe cliff (~12 MB binary
+    # .citc/manifest), which caused 224s-500s CreateSnapshot barrier stalls in
+    # xm_abc.create_experiment(), 15-20s local blaze query diffAwareness.getDiff
+    # stalls, and 11-20s remote BuildRabbit manifest loads.
+    #
+    # AUTOMATIC HEALTH GUARD + FAILOVER POOL (2026-10-26):
+    # Whenever STAGE_WS_ROOT (including an inherited env var from a long-lived
+    # worker/tmux session, unless TPU_STAGE_WS_FORCE=1) has .citc/manifest >=
+    # 10 MB (~80,000 live resources, safely below the 100K auto-keyframe cliff)
+    # or .citc/dropped_resources.ascii > 49B, automatically fall over to the
+    # first clean workspace in the operator's pool while retaining all retired
+    # workspaces untouched so --resume_xid continues to resolve.
+    local _default_ws="/google/src/cloud/qiaos/tpu_utils_router_cl/google3"
     local STAGE_WS_ROOT="${STAGE_WS_ROOT:-$_default_ws}"
+    local _is_lyy=0
     if [ "${TPU_OPERATOR:-}" = "lyy" ] || [ "${TPU_JOB_NAME_PREFIX:-}" = "lyy-" ]; then
-      if [ -z "${NPU_STAGE_WS_ROOT:-}" ] && [ "$STAGE_WS_ROOT" = "$_default_ws" ] && [ -d "/google/src/cloud/qiaos/lyyprobe_upload/google3/experimental/qiaos/eqr_jax_final_stages" ]; then
-        STAGE_WS_ROOT="/google/src/cloud/qiaos/lyyprobe_upload/google3"
+      _is_lyy=1
+      if [ -z "${NPU_STAGE_WS_ROOT:-}" ] && [ "$STAGE_WS_ROOT" = "$_default_ws" ]; then
+        STAGE_WS_ROOT="/google/src/cloud/qiaos/a100_80g_probe/google3"
       elif [ -n "${NPU_STAGE_WS_ROOT:-}" ]; then
         STAGE_WS_ROOT="$NPU_STAGE_WS_ROOT"
       fi
+    fi
+    # FAILOVER POOL, per operator, in preference order. Hoisted out of the
+    # health branch (2026-11-09) so the torch-version guard below can reuse it.
+    # tpu_staging_t215_20261109 (2026-11-09): a FRESH workspace synced at CL
+    # 989229158 -- the same baseline as cppflag_probe_0927, i.e. torch
+    # 2.15.0a0 and every other third_party pin the fleet built against
+    # 11-02..11-07 -- created because tpu_utils_router_cl and cppflag_probe_0927
+    # both crossed the 10 MiB manifest limit (10,505,209 / 10,512,804 B) and the
+    # rotation fell through to hg_recovery_20260906 (torch 2.13.0), where masked
+    # GQA SDPA has no efficient kernel and falls back to MATH (OOM, XID
+    # 310045786).
+    #
+    # AUTO-ROTATED FAMILIES (2026-11-09). stage_ws_rotate.py (next to this
+    # file) creates the NEXT staging workspace at the SAME baseline CL
+    # 989229158 (torch 2.15.0a0) before the current one reaches the 10 MiB
+    # limit, so the torch guard below never runs out of a torch >= 2.15 root:
+    #   qiaos: tpu_staging_t215_<YYYYMMDD>[_n]   lyy: tpu_staging_lyy_t215_<YYYYMMDD>[_n]
+    # (all qiaos-owned clients, like every other pool entry). Every existing
+    # member joins its operator's pool HERE, by name, OLDEST first, so one
+    # fills up before the next takes over; the other operator's family is the
+    # last-resort fallback. Names in ~/.tpu_stage_ws_bad (failed verification)
+    # are skipped. Nothing is ever deleted: a full member keeps its stagedirs so
+    # --resume_xid still resolves. TPU_STAGE_WS_AUTOROTATE=0 stops creation
+    # (the existing members stay in the pool).
+    local _ws_rot_py="$HOME/work/tpu_cmd/stage_ws_rotate.py"
+    local _ws_family="qiaos" _ws_other_family="lyy"
+    if [ "$_is_lyy" = "1" ]; then _ws_family="lyy"; _ws_other_family="qiaos"; fi
+    _tpu_ws_family_members() {   # <qiaos|lyy> -> google3 roots, oldest first
+      local _pfx="tpu_staging_t215_" _d _n
+      [ "$1" = "lyy" ] && _pfx="tpu_staging_lyy_t215_"
+      for _d in /google/src/cloud/qiaos/${_pfx}*/google3; do
+        [ -d "$_d" ] || continue
+        _n="${_d%/google3}"; _n="${_n##*/}"
+        [[ "$_n" =~ ^${_pfx}[0-9]{8}(_[0-9]+)?$ ]] || continue
+        grep -qsxF "$_n" "${TPU_STAGE_WS_ROTATE_DIR:-$HOME}/.tpu_stage_ws_bad" && continue
+        printf '%s\n' "$_n"
+      done | sort -V | sed 's|^|/google/src/cloud/qiaos/|; s|$|/google3|'
+    }
+    local _cand_pool=()
+    _tpu_ws_build_pool() {
+      local _own=() _other=()
+      mapfile -t _own < <(_tpu_ws_family_members "$_ws_family")
+      mapfile -t _other < <(_tpu_ws_family_members "$_ws_other_family")
+      if [ "$_is_lyy" = "1" ]; then
+        _cand_pool=(
+          "${_own[@]}"
+          "/google/src/cloud/qiaos/a100_80g_probe/google3"
+          "/google/src/cloud/qiaos/raft_build/google3"
+          "/google/src/cloud/qiaos/rr_launch_check/google3"
+          "/google/src/cloud/qiaos/cppflag_probe_0927/google3"
+          "/google/src/cloud/qiaos/hg_recovery_20260906/google3"
+          "${_other[@]}"
+        )
+      else
+        _cand_pool=(
+          "/google/src/cloud/qiaos/tpu_utils_router_cl/google3"
+          "${_own[@]}"
+          "/google/src/cloud/qiaos/cppflag_probe_0927/google3"
+          "/google/src/cloud/qiaos/hg_recovery_20260906/google3"
+          "/google/src/cloud/qiaos/raft_build/google3"
+          "/google/src/cloud/qiaos/rr_launch_check/google3"
+          "${_other[@]}"
+        )
+      fi
+    }
+    _tpu_ws_build_pool
+    # Called when NO pool member is usable (health rotation found nothing, or
+    # the torch guard found no healthy torch >= min root): create the next
+    # family member NOW (blocking, waits for a background creator's lock),
+    # then rebuild the pool. At most once per stage; never fails the launch.
+    local _ws_rot_sync_done=0
+    _tpu_ws_rotate_sync() {
+      [ "$_ws_rot_sync_done" = "1" ] && return 1
+      _ws_rot_sync_done=1
+      [ "${TPU_STAGE_WS_AUTOROTATE:-1}" != "0" ] && [ -f "$_ws_rot_py" ] || return 1
+      local _rot_dry=()
+      [ "$dry_run" = "1" ] && _rot_dry=(--dry-run)
+      echo -e "\033[33m[$TPU_CMD_NAME queue] [stage-ws] no usable workspace in the ${_ws_family} pool; running stage_ws_rotate.py ensure --family ${_ws_family} ${_rot_dry[*]} (blocking, <= 240s)\033[0m"
+      timeout -k 5 240 python3 "$_ws_rot_py" ensure --family "$_ws_family" --wait 200 "${_rot_dry[@]}" 2>&1 \
+        | sed "s/^/[$TPU_CMD_NAME queue] [stage-ws]   /"
+      _tpu_ws_build_pool
+      return 0
+    }
+    if [ "${TPU_STAGE_WS_FORCE:-0}" != "1" ]; then
+      local _max_manifest="${TPU_STAGE_WS_MAX_MANIFEST_BYTES:-10485760}"
+      _tpu_ws_healthy() {
+        local _g3="$1"
+        local _ws="${_g3%/google3}"
+        [ -d "$_g3" ] && [ -d "$_ws/.citc" ] || return 1
+        local _dr _mf
+        _dr=$(stat -c %s "$_ws/.citc/dropped_resources.ascii" 2>/dev/null || echo 999)
+        [ "$_dr" -le 49 ] 2>/dev/null || return 1
+        _mf=$(stat -c %s "$_ws/.citc/manifest" 2>/dev/null || echo 999999999)
+        [ "$_mf" -lt "$_max_manifest" ] 2>/dev/null || return 1
+        return 0
+      }
+      if ! _tpu_ws_healthy "$STAGE_WS_ROOT"; then
+        local _old_ws="$STAGE_WS_ROOT"
+        local _old_mf=$(stat -c %s "${_old_ws%/google3}/.citc/manifest" 2>/dev/null || echo -1)
+        local _cws _try
+        for _try in 1 2; do
+          for _cws in "${_cand_pool[@]}"; do
+            if _tpu_ws_healthy "$_cws"; then
+              STAGE_WS_ROOT="$_cws"
+              echo -e "\033[33m[$TPU_CMD_NAME queue] [stage-ws] rotated away from bloated/unhealthy workspace ${_old_ws} (manifest=$((_old_mf / 1048576))MB >= $((_max_manifest / 1048576))MB limit) -> ${STAGE_WS_ROOT}\033[0m"
+              break 2
+            fi
+          done
+          { [ "$_try" = "1" ] && _tpu_ws_rotate_sync; } || break
+        done
+      fi
+    fi
+
+    # TORCH-VERSION GUARD (2026-11-09). The staging workspace's baseline CL
+    # decides which //third_party/py/torch a job links, so the rotation above
+    # can silently downgrade torch (it did: 2.15 -> 2.13 on 2026-11-07). For a
+    # non-resume torch job (./BUILD names //third_party/py/torch), log the
+    # workspace's torch version (from METADATA, the only reliable source) and,
+    # when it is below ${TPU_STAGE_WS_MIN_TORCH:-2.15}, move to the first
+    # HEALTHY pool workspace that meets it. If none does (or
+    # TPU_STAGE_WS_FORCE=1 pinned the workspace), WARN and stage anyway: a
+    # refusal here would park every GPU job HELD. Never fails the launch; any
+    # error in the guard only skips it. TPU_STAGE_WS_TORCH_GUARD=0 disables it.
+    if [ -z "$resume_xid" ] && [ "${TPU_STAGE_WS_TORCH_GUARD:-1}" != "0" ] \
+        && grep -qs '//third_party/py/torch' ./BUILD 2>/dev/null; then
+      _tpu_ws_torch_version() {   # <google3 root> -> "2.15.0a0" (empty if unknown)
+        sed -n 's/^ *version: "\([0-9][0-9]*\.[0-9][0-9]*[^"]*\)".*/\1/p' \
+          "$1/third_party/py/torch/METADATA" 2>/dev/null | head -n 1
+      }
+      _tpu_torch_ge() {           # <version> <min major.minor>; unknown -> false
+        local _a _b _ma _mb
+        [[ "$1" =~ ^([0-9]+)\.([0-9]+) ]] || return 1
+        _a=${BASH_REMATCH[1]}; _b=${BASH_REMATCH[2]}
+        [[ "$2" =~ ^([0-9]+)\.([0-9]+) ]] || return 0
+        _ma=${BASH_REMATCH[1]}; _mb=${BASH_REMATCH[2]}
+        [ "$_a" -gt "$_ma" ] || { [ "$_a" -eq "$_ma" ] && [ "$_b" -ge "$_mb" ]; }
+      }
+      local _min_torch="${TPU_STAGE_WS_MIN_TORCH:-2.15}"
+      local _ws_torch
+      _ws_torch=$(_tpu_ws_torch_version "$STAGE_WS_ROOT")
+      if [ -n "$_ws_torch" ] && ! _tpu_torch_ge "$_ws_torch" "$_min_torch" \
+          && [ "${TPU_STAGE_WS_FORCE:-0}" != "1" ]; then
+        local _tws _tws_v _ttry
+        for _ttry in 1 2; do
+          for _tws in "${_cand_pool[@]}"; do
+            _tpu_ws_healthy "$_tws" || continue
+            _tws_v=$(_tpu_ws_torch_version "$_tws")
+            if _tpu_torch_ge "$_tws_v" "$_min_torch"; then
+              echo -e "\033[33m[$TPU_CMD_NAME queue] [stage-ws] torch job: ${STAGE_WS_ROOT} has torch ${_ws_torch} < ${_min_torch}; using healthy ${_tws} (torch ${_tws_v}) instead\033[0m"
+              STAGE_WS_ROOT="$_tws"
+              _ws_torch="$_tws_v"
+              break 2
+            fi
+          done
+          { [ "$_ttry" = "1" ] && _tpu_ws_rotate_sync; } || break
+        done
+      fi
+      if _tpu_torch_ge "$_ws_torch" "$_min_torch"; then
+        echo -e "\033[36m[$TPU_CMD_NAME queue] [stage-ws] torch job: STAGE_WS_ROOT=${STAGE_WS_ROOT} torch=${_ws_torch} (>= ${_min_torch})\033[0m"
+      else
+        echo -e "\033[31m[$TPU_CMD_NAME queue] [stage-ws] WARNING torch job: STAGE_WS_ROOT=${STAGE_WS_ROOT} torch=${_ws_torch:-UNKNOWN} < ${_min_torch} and no healthy pool workspace meets it. Staging anyway; masked GQA SDPA falls back to the MATH kernel on torch < 2.15 (slower, far more memory).\033[0m"
+      fi
+    fi
+
+    # PRE-CREATE HOOK (2026-11-09). When no member of this operator's family
+    # still has headroom (manifest < ${TPU_STAGE_WS_PRECREATE_BYTES:-9437184} B,
+    # ~1 MiB before the 10 MiB limit), stage_ws_rotate.py creates and verifies
+    # the next one in a DETACHED background process, so the rotation finds it
+    # waiting instead of falling back to an older torch. The script decides
+    # (idempotent, flock'd, <= 2 creations/family/day, logged to
+    # ~/.tpu_stage_ws_rotate.log); this call returns in well under a second
+    # and its outcome never affects the launch. A dry run only reports.
+    # Skipped when the blocking path above already ran for this stage.
+    if [ -z "$resume_xid" ] && [ "${TPU_STAGE_WS_FORCE:-0}" != "1" ] \
+        && [ "$_ws_rot_sync_done" != "1" ] \
+        && [ "${TPU_STAGE_WS_AUTOROTATE:-1}" != "0" ] && [ -f "$_ws_rot_py" ]; then
+      local _ws_rot_mode="--background"
+      [ "$dry_run" = "1" ] && _ws_rot_mode="--dry-run"
+      timeout -k 2 20 python3 "$_ws_rot_py" ensure --family "$_ws_family" "$_ws_rot_mode" 2>&1 >/dev/null \
+        | sed "s/^/[$TPU_CMD_NAME queue] [stage-ws]   /"
     fi
 
     # STAGE-SOURCE GUARD, CALL 1 OF 2 -- the EARLIEST point at which both ends
@@ -1133,6 +1333,13 @@ print(d['group'], d['tpu_type'], d['status'],
             "pre-claim, planned destination"; then
         return 1
       fi
+    fi
+    if [ "$dry_run" = "1" ]; then
+      echo -e "\033[36m[$TPU_CMD_NAME queue] [DRY RUN] would stage $PWD into ${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages/eqr_run_${now}_<hash> and launch into group=${group} tpu_type=${tpu_type} tier=${tier:-default} args=(${passthrough_args[*]}).\033[0m"
+      echo -e "\033[36m  [DRY RUN] No files staged and no XManager experiment created. Re-run without --dry_run to launch.\033[0m"
+      return 0
+    fi
+    if [ -z "$resume_xid" ]; then
       # ---- claim a unique stagedir (guard has passed; nothing above created it)
       if _tpu_ca_enabled; then
         # CONTENT-ADDRESSED MODE (opt-in): do NOT pre-claim a random stagedir.
@@ -1145,6 +1352,7 @@ print(d['group'], d['tpu_type'], d['status'],
         [ -n "$_cahash" ] || _cahash=$(printf '%04x%02x' "$RANDOM" "$((RANDOM % 256))")
         now="${now}_${_cahash}"
       else
+      mkdir -p "${STAGE_WS_ROOT}/experimental/qiaos/eqr_jax_final_stages" 2>/dev/null
       local _ts="$now"
       local _tries=0
       while : ; do
@@ -2838,6 +3046,6 @@ npu() {
   # kill sqa's worker. A distinct name gives lyy an independent worker draining
   # lyy's own queue.
   local -x TPU_BUILD_WORKER_SESSION="${NPU_BUILD_WORKER_SESSION:-npu-build-worker}"
-  local -x STAGE_WS_ROOT="${NPU_STAGE_WS_ROOT:-/google/src/cloud/qiaos/lyyprobe_upload/google3}"
+  local -x STAGE_WS_ROOT="${NPU_STAGE_WS_ROOT:-/google/src/cloud/qiaos/a100_80g_probe/google3}"
   tpu "$@"
 }
