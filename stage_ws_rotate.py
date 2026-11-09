@@ -100,6 +100,7 @@ def _cfg() -> dict:
       "log": os.path.join(state_dir, ".tpu_stage_ws_rotate.log"),
       "state": os.path.join(state_dir, ".tpu_stage_ws_rotate_state.json"),
       "bad": os.path.join(state_dir, ".tpu_stage_ws_bad"),
+      "heartbeat": os.path.join(state_dir, ".tpu_stage_ws_rotate.heartbeat"),
   }
 
 
@@ -424,6 +425,20 @@ def _daemonize(cfg: dict) -> bool:
   return True
 
 
+def _heartbeat(cfg: dict, family: str, pref: dict) -> None:
+  """Proof the hook is INVOKED: no-op checks are not logged (one per stage),
+  so overwrite one line per family with the last check instead."""
+  path = f"{cfg['heartbeat']}.{family}"
+  try:
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+      f.write(f"{_now()} pid={os.getpid()} {family} ok {pref['name']} "
+              f"manifest={pref['manifest']}\n")
+    os.replace(tmp, path)
+  except OSError:
+    pass
+
+
 def ensure(cfg: dict, family: str, *, dry_run: bool = False,
            background: bool = False, wait_s: float = 0.0) -> int:
   infos = scan(cfg, family)
@@ -431,6 +446,8 @@ def ensure(cfg: dict, family: str, *, dry_run: bool = False,
     pref = _preferred(infos)
     print(f"[stage-ws-rotate] {family}: ok, {pref['name']} has headroom "
           f"(manifest {pref['manifest']} < {cfg['precreate']})", file=sys.stderr)
+    if not dry_run:
+      _heartbeat(cfg, family, pref)
     print(pref["google3"])
     return 0
   name = next_name(cfg, family)

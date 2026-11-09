@@ -185,6 +185,12 @@ def test_ensure_noop_when_headroom():
     _ck(rc == 0 and out.endswith("tpu_staging_t215_20261109/google3"),
         f"rc=0 and prints the member ({rc}, {out!r})")
     _ck(e.calls() == [], "g4 never called")
+    hb = os.path.join(e.state, ".tpu_stage_ws_rotate.heartbeat.qiaos")
+    _ck(os.path.exists(hb) and "ok tpu_staging_t215_20261109" in open(hb).read(),
+        "no-op check leaves a heartbeat (proof of invocation)")
+    os.remove(hb)
+    _run("ensure", "--family", "qiaos", "--dry-run")
+    _ck(not os.path.exists(hb), "dry run writes no heartbeat")
 
 
 def test_ensure_creates_when_full():
