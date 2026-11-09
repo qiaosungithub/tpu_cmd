@@ -22,9 +22,35 @@ of these hold (an unknown value never counts as holding):
      the newest of the staging parent's mtime, every stagedir's mtime, and every
      provenance record whose `dir` is inside it (a CA re-use leaves no mtime);
   4. no stagedir inside it is referenced by
-       - any local-queue entry of either operator, in any state (directly, or
-         through any XID it lists, resolved via every registry);
-       - any active-registry entry of either operator, in any status;
+       - a local-queue entry or an active-registry entry (either operator)
+         that still BLOCKS. An entry stops blocking only when BOTH its status
+         is terminal AND it ended more than 30 days ago
+         (TPU_STAGE_WS_RETIRE_ENDED_DAYS). Everything else blocks: a live,
+         unknown or missing status, a terminal entry with no end timestamp,
+         and one that ended <= 30 days ago. Terminal values, from the code
+         that writes them:
+           queue `state`      DONE, FAILED -- route_lib.FINISHED_STATES, the
+                              queue's one definition of "the run ended"
+                              (RUNNING is not finished there either);
+           registry `status`  COMPLETED, FAILED (tpu_check_daemon.sh status
+                              pass), CANCELLED (registry_store.cancel, with
+                              cancelled_at), TERMINAL_RECONCILED and
+                              TERMINAL_NOT_RUNNING (~/lyy-work/
+                              reconcile_finished.py). SUBMITTED / RUNNING are
+                              live.
+         End timestamp of a queue entry: the newest *_at in it, and only if
+         its final attempt (submissions[], highest seq) has `ended_at`
+         (route_lib end_attempt). Of a registry row: the newest of its own
+         *_at fields (cancelled_at), the `ended_at` the queue recorded for the
+         same XID, and the time of the newest <registry>.journal line about
+         that XID -- the journal counts only when its newest `status` change
+         for the XID set the row's CURRENT status (a status written by a
+         non-journaling writer, e.g. reconcile_finished.py, happened at an
+         unknown time). Registry rows carry no other timestamp.
+         Every entry, blocking or not, is followed through each XID it lists
+         (xid, prior_xids, submissions[].xid, resolved via every registry),
+         so a running or recent resume keeps its old terminal XIDs' stagedirs
+         blocked;
        - any other registry or provenance record (legacy registries,
          ~/.tpu_ca_provenance.jsonl, ...) younger than 30 days
          (TPU_STAGE_WS_RETIRE_RECORD_DAYS). A record whose age cannot be
@@ -39,7 +65,8 @@ of these hold (an unknown value never counts as holding):
 
 EXECUTE (`retire --execute [--client NAME ...]`; never wired anywhere). Per
 retirable client, in this order, stopping at the first failure:
-  1. tar+gzip every stagedir that an (old) record references, list it back,
+  1. tar+gzip every stagedir that ANY record references (including terminal
+     entries that ended > 30 days ago and no longer block), list it back,
      sha256 it (in ~/tmp, not the RAM /tmp);
   2. copy each tarball to <archive root>/<client>/<stagedir>.tar.gz with
      fileutil, one copy at a time, each call gated by a wait loop that sleeps
@@ -109,6 +136,16 @@ _DEFAULT_ARCHIVE_METRO = "cmh"  # nearest group-storage metro to us-east4 (iad)
 _TS_KEYS_RX = re.compile(r"(_at|_ts)$|^(ts|time|timestamp)$")
 _XID_RX = re.compile(r"^\d{6,}$")
 _STAGE_TOKEN_RX = re.compile(r"[^\s\"'=,;()\[\]{}<>]*eqr_jax_final_stages/[^\s\"'=,;()\[\]{}<>/]+")
+# Terminal values (rule 4; the module docstring names each writer). Anything
+# not listed -- SUBMITTED, RUNNING, QUEUED, a typo, a missing value -- is live.
+QUEUE_TERMINAL = frozenset({"DONE", "FAILED"})  # == route_lib.FINISHED_STATES
+REGISTRY_TERMINAL = frozenset({"COMPLETED", "CANCELLED", "FAILED",
+                               "TERMINAL_RECONCILED", "TERMINAL_NOT_RUNNING"})
+# Entry verdict classes, in report order.
+V_ENDED_OLD = "ended-old"      # terminal and ended > ended_days ago: no block
+V_LIVE = "live"                # live / unknown / missing status: blocks
+V_NO_END = "no-end-ts"         # terminal, end time unknown: blocks
+V_RECENT = "recent"            # terminal, ended <= ended_days ago: blocks
 
 
 # --------------------------------------------------------------------------
@@ -159,6 +196,7 @@ def cfg() -> dict:
       "min_manifest": rot._env_int("TPU_STAGE_WS_RETIRE_MIN_MANIFEST", 9437184),  # pylint: disable=protected-access
       "idle_days": _env_float("TPU_STAGE_WS_RETIRE_IDLE_DAYS", 30.0),
       "record_days": _env_float("TPU_STAGE_WS_RETIRE_RECORD_DAYS", 30.0),
+      "ended_days": _env_float("TPU_STAGE_WS_RETIRE_ENDED_DAYS", 30.0),
       "client_warn": rot._env_int("TPU_STAGE_WS_CLIENT_WARN", 60),  # pylint: disable=protected-access
       "queues": _paths("TPU_STAGE_WS_RETIRE_QUEUES", [
           h(".tpu_local_queue.json"), h("lyy-work/.npu_local_queue.json")]),
@@ -226,23 +264,28 @@ def _parse_ts(v) -> Optional[float]:
 class Ref:
   """One record naming one stagedir."""
 
-  __slots__ = ("base", "client", "kind", "source", "xid", "ts", "blocking")
+  __slots__ = ("base", "client", "kind", "source", "xid", "ts", "blocking",
+               "note")
 
-  def __init__(self, base, client, kind, source, xid, ts, blocking):
+  def __init__(self, base, client, kind, source, xid, ts, blocking, note=""):
     self.base = base          # stagedir basename
     self.client = client      # client name, None (relative: any client), or
                               # "<elsewhere>" (absolute path outside citc_root)
     self.kind = kind          # queue | active | aged | provenance
     self.source = source      # file path
     self.xid = xid
-    self.ts = ts              # record time (epoch) or None
+    self.ts = ts              # record / end time (epoch) or None
     self.blocking = blocking
+    self.note = note          # queue/active: the entry's status and end time
 
   def describe(self) -> str:
     who = ("record" if not self.xid else self.xid if self.xid.startswith("(")
            else f"XID {self.xid}")
-    age = "" if self.kind in ("queue", "active") else f" @{_iso(self.ts)}"
-    return f"{self.kind}:{os.path.basename(self.source)} {who}{age}"
+    if self.kind in ("queue", "active"):
+      tail = f" [{self.note}]" if self.note else ""
+    else:
+      tail = f" @{_iso(self.ts)}"
+    return f"{self.kind}:{os.path.basename(self.source)} {who}{tail}"
 
 
 def _stage_paths(obj) -> Iterable[str]:
@@ -320,6 +363,115 @@ def _xids_in(obj) -> set:
   return out
 
 
+def _all_ts(obj) -> list:
+  """Every timestamp under a *_at / ts key anywhere in a JSON value."""
+  out = []
+  stack = [obj]
+  while stack:
+    o = stack.pop()
+    if isinstance(o, dict):
+      for k, v in o.items():
+        if isinstance(v, (dict, list)):
+          stack.append(v)
+        elif _TS_KEYS_RX.search(str(k)):
+          t = _parse_ts(v)
+          if t is not None:
+            out.append(t)
+    elif isinstance(o, list):
+      stack.extend(o)
+  return out
+
+
+def _queue_end(row: dict) -> Optional[float]:
+  """End time of a queue entry: its newest *_at, but only when its final
+  attempt (highest submissions[].seq) recorded `ended_at`; else None."""
+  subs = row.get("submissions")
+  subs = [s for s in subs if isinstance(s, dict)] if isinstance(subs, list) else []
+  if not subs:
+    return None
+  last = max(enumerate(subs), key=lambda p: (
+      p[1]["seq"] if isinstance(p[1].get("seq"), int) else -1, p[0]))[1]
+  if _parse_ts(last.get("ended_at")) is None:
+    return None
+  return max(_all_ts(row))
+
+
+def _load_journal(reg_path: str, r: "Records") -> dict:
+  """<registry>.journal(.1) -> {xid: [newest line ts, newest status-change ts,
+  the status that change set]}. Unreadable => r.errors (plan INCOMPLETE)."""
+  out = {}
+  for jp in (reg_path + ".journal.1", reg_path + ".journal"):
+    if not os.path.exists(jp):
+      continue
+    try:
+      with open(jp, encoding="utf-8", errors="replace") as f:
+        for ln in f:
+          try:
+            rec = json.loads(ln)
+          except ValueError:
+            continue  # a torn line; the status check below stays strict
+          if not isinstance(rec, dict):
+            continue
+          t = _parse_ts(rec.get("ts"))
+          if t is None:
+            continue
+          ch = rec.get("changed") if isinstance(rec.get("changed"), dict) else {}
+          touched = list(ch)
+          for k in ("added", "removed"):
+            if isinstance(rec.get(k), list):
+              touched.extend(rec[k])
+          for x in touched:
+            e = out.setdefault(str(x), [None, None, None])
+            if e[0] is None or t >= e[0]:
+              e[0] = t
+          for x, fields in ch.items():
+            st = fields.get("status") if isinstance(fields, dict) else None
+            if isinstance(st, list) and len(st) == 2:
+              e = out[str(x)]
+              if e[1] is None or t >= e[1]:
+                e[1], e[2] = t, st[1]
+    except OSError as e:
+      r.errors.append(f"{jp}: {e!r}")
+  return out
+
+
+def _registry_end(xid: str, rec: dict, jrnl: dict, qend: dict) -> Optional[float]:
+  """End / last-update time of an active-registry row (rule 4), or None."""
+  cands = [t for t in (_record_ts(rec), qend.get(xid)) if t is not None]
+  j = jrnl.get(xid)
+  if j and j[2] is not None and j[2] == rec.get("status"):
+    cands.append(j[0])  # the journal saw the move to the current status
+  return max(cands) if cands else None
+
+
+def _verdict(status, terminal: frozenset, end: Optional[float], now: float,
+             ended_s: float) -> str:
+  if not isinstance(status, str) or status not in terminal:
+    return V_LIVE
+  if end is None:
+    return V_NO_END
+  if now - end <= ended_s:
+    return V_RECENT
+  return V_ENDED_OLD
+
+
+def _entry_note(status, verdict: str, end: Optional[float]) -> str:
+  st = status if isinstance(status, str) and status else "no status"
+  if verdict == V_LIVE:
+    return st
+  if verdict == V_NO_END:
+    return f"{st}, no end timestamp"
+  return f"{st}, ended {_iso(end)}"
+
+
+def _counts_note(counts: dict, days: float) -> str:
+  blk = counts.get(V_LIVE, 0) + counts.get(V_NO_END, 0) + counts.get(V_RECENT, 0)
+  return (f"terminal & ended >{days:g}d: {counts.get(V_ENDED_OLD, 0)} (no "
+          f"block); blocking: {blk} = {counts.get(V_LIVE, 0)} live/unknown "
+          f"status + {counts.get(V_NO_END, 0)} terminal without end timestamp "
+          f"+ {counts.get(V_RECENT, 0)} terminal ended <={days:g}d")
+
+
 class Records:
   """Every stagedir reference, by basename, plus per-client provenance times."""
 
@@ -328,6 +480,7 @@ class Records:
     self.prov_last = {}     # client -> newest provenance ts
     self.errors = []        # unreadable sources => plan INCOMPLETE
     self.sources = []       # (path, kind, n_records, n_refs, note)
+    self.entry_counts = {}  # queue/active path -> {verdict class: n entries}
     self.unresolved_queue_xids = 0
 
   def add(self, ref: Ref) -> None:
@@ -353,6 +506,7 @@ def _registry_items(d):
 def load_records(c: dict, now: Optional[float] = None) -> Records:
   now = _now_ts() if now is None else now
   young_s = c["record_days"] * 86400
+  ended_s = c["ended_days"] * 86400
   root = c["citc_root"]
   r = Records()
   xid_map = {}  # xid -> {(base, client)} across every registry
@@ -360,8 +514,9 @@ def load_records(c: dict, now: Optional[float] = None) -> Records:
   def _missing(path, kind):
     r.sources.append((path, kind, 0, 0, "absent"))
 
-  # 1. active registries: every entry blocks, any status.
-  # 2. aged registries: block when younger than record_days or of unknown age.
+  # Pass 1: read every JSON registry and queue; build xid -> stagedirs (all
+  # registries) and xid -> queue-recorded end time, which pass 2 needs.
+  regs = []    # (kind, path, data, file mtime)
   for kind, paths in (("active", c["registries"]), ("aged", c["aged"])):
     for path in paths:
       if path.endswith(".jsonl"):
@@ -375,27 +530,93 @@ def load_records(c: dict, now: Optional[float] = None) -> Records:
       except (OSError, ValueError) as e:
         r.errors.append(f"{path}: {e!r}")
         continue
-      n = nrefs = 0
+      regs.append((kind, path, d, fmt))
       for xid, rec in _registry_items(d):
-        n += 1
         pairs = _record_refs(root, rec)
-        if not pairs:
-          continue
-        if xid:
+        if xid and pairs:
           xid_map.setdefault(xid, set()).update(pairs)
-        if kind == "active":
-          ts, blocking = _record_ts(rec), True
-        else:
-          ts = _record_ts(rec)
-          if ts is None and now - fmt > young_s:
-            ts = fmt  # the file is older than the cut, so every record in it is
-          blocking = ts is None or now - ts < young_s
-        for b, cl in pairs:
-          r.add(Ref(b, cl, kind, path, xid or None, ts, blocking))
-          nrefs += 1
-      r.sources.append((path, kind, n, nrefs, ""))
+  queues = []  # (path, rows)
+  for path in c["queues"]:
+    if not os.path.exists(path):
+      queues.append((path, None))
+      continue
+    try:
+      d = _load_json(path)
+    except (OSError, ValueError) as e:
+      r.errors.append(f"{path}: {e!r}")
+      continue
+    rows = d.get("entries", d) if isinstance(d, dict) else d
+    if isinstance(rows, dict):
+      rows = list(rows.values())
+    if not isinstance(rows, list):
+      r.errors.append(f"{path}: unexpected queue shape {type(rows).__name__}")
+      continue
+    queues.append((path, [x for x in rows if isinstance(x, dict)]))
+  qend = {}  # xid -> newest submissions[].ended_at the queues recorded for it
+  for _, rows in queues:
+    for row in rows or ():
+      subs = row.get("submissions")
+      for s in subs if isinstance(subs, list) else ():
+        if isinstance(s, dict) and s.get("xid") is not None:
+          t = _parse_ts(s.get("ended_at"))
+          x = str(s["xid"])
+          if t is not None and t > qend.get(x, 0):
+            qend[x] = t
 
-  # 3. provenance (JSON lines): per-stage records with an absolute `dir`.
+  def _emit(kind, path, row, own_pairs, own_xid, verdict, end, label):
+    """Refs for one queue/active entry: the stagedirs it names, plus those of
+    every XID it lists (so a live resume keeps its old terminal XIDs' stagedirs
+    blocked). label: '(entry <job_id>)' for a queue entry, None for a row."""
+    blocking = verdict != V_ENDED_OLD
+    note = _entry_note(row.get("state" if kind == "queue" else "status"),
+                       verdict, end)
+    pairs = {(b, cl, own_xid) for b, cl in own_pairs}
+    for x in _xids_in(row):
+      if x == own_xid:
+        continue
+      if x in xid_map:
+        pairs.update((b, cl, x) for b, cl in xid_map[x])
+      elif kind == "queue":
+        r.unresolved_queue_xids += 1
+    for b, cl, x in sorted(pairs, key=str):
+      r.add(Ref(b, cl, kind, path, x or label, end, blocking,
+                note if label is None or x is None
+                else f"{note}; entry {label[7:-1]}"))
+    return len(pairs)
+
+  # Pass 2a: registries. Active: an entry blocks unless terminal AND ended
+  # more than ended_days ago. Aged: block when younger than record_days or of
+  # unknown age.
+  for kind, path, d, fmt in regs:
+    jrnl = _load_journal(path, r) if kind == "active" else {}
+    counts = {}
+    n = nrefs = 0
+    for xid, rec in _registry_items(d):
+      n += 1
+      if kind == "active":
+        end = _registry_end(xid, rec, jrnl, qend)
+        v = _verdict(rec.get("status"), REGISTRY_TERMINAL, end, now, ended_s)
+        counts[v] = counts.get(v, 0) + 1
+        nrefs += _emit(kind, path, rec, _record_refs(root, rec), xid or None,
+                       v, end, None)
+        continue
+      pairs = _record_refs(root, rec)
+      if not pairs:
+        continue
+      ts = _record_ts(rec)
+      if ts is None and now - fmt > young_s:
+        ts = fmt  # the file is older than the cut, so every record in it is
+      blocking = ts is None or now - ts < young_s
+      for b, cl in pairs:
+        r.add(Ref(b, cl, kind, path, xid or None, ts, blocking))
+        nrefs += 1
+    if kind == "active":
+      r.entry_counts[path] = counts
+    r.sources.append((path, kind, n, nrefs,
+                      _counts_note(counts, c["ended_days"])
+                      if kind == "active" else ""))
+
+  # Pass 2b: provenance (JSON lines): per-stage records with an absolute `dir`.
   for path in [p for p in c["aged"] if p.endswith(".jsonl")]:
     if not os.path.exists(path):
       _missing(path, "provenance")
@@ -427,38 +648,24 @@ def load_records(c: dict, now: Optional[float] = None) -> Records:
     r.sources.append((path, "provenance", n, nrefs,
                       f"{bad} unparsable line(s) kept as young" if bad else ""))
 
-  # 4. local queues: every entry blocks, in any state, directly and via XIDs.
-  for path in c["queues"]:
-    if not os.path.exists(path):
+  # Pass 2c: local queues, same rule as the active registries, directly and
+  # through every XID an entry lists.
+  for path, rows in queues:
+    if rows is None:
       _missing(path, "queue")
       continue
-    try:
-      d = _load_json(path)
-    except (OSError, ValueError) as e:
-      r.errors.append(f"{path}: {e!r}")
-      continue
-    rows = d.get("entries", d) if isinstance(d, dict) else d
-    if isinstance(rows, dict):
-      rows = list(rows.values())
-    if not isinstance(rows, list):
-      r.errors.append(f"{path}: unexpected queue shape {type(rows).__name__}")
-      continue
-    n = nrefs = 0
+    counts = {}
+    nrefs = 0
     for row in rows:
-      if not isinstance(row, dict):
-        continue
-      n += 1
-      label = str(row.get("job_id") or row.get("name") or "?")
-      pairs = {(b, cl, None) for b, cl in _record_refs(root, row)}
-      for x in _xids_in(row):
-        if x in xid_map:
-          pairs.update((b, cl, x) for b, cl in xid_map[x])
-        else:
-          r.unresolved_queue_xids += 1
-      for b, cl, x in sorted(pairs, key=str):
-        r.add(Ref(b, cl, "queue", path, x or f"(entry {label})", None, True))
-        nrefs += 1
-    r.sources.append((path, "queue", n, nrefs, ""))
+      end = _queue_end(row)
+      v = _verdict(row.get("state"), QUEUE_TERMINAL, end, now, ended_s)
+      counts[v] = counts.get(v, 0) + 1
+      label = f"(entry {row.get('job_id') or row.get('name') or '?'})"
+      nrefs += _emit("queue", path, row, _record_refs(root, row), None, v, end,
+                     label)
+    r.entry_counts[path] = counts
+    r.sources.append((path, "queue", len(rows), nrefs,
+                      _counts_note(counts, c["ended_days"])))
   return r
 
 
@@ -578,7 +785,8 @@ def plan(c: dict, *, full: bool = True, now: Optional[float] = None,
         for x in refs:
           kinds[x.kind] = kinds.get(x.kind, 0) + 1
       m["reasons"].append(
-          f"{len(m['blocking'])} stagedir(s) referenced by active/young records ("
+          f"{len(m['blocking'])} stagedir(s) referenced by live or recently "
+          f"ended entries / young records ("
           + ", ".join(f"{k} {v}" for k, v in sorted(kinds.items())) + ")")
   for m in out["members"]:
     m["retirable"] = (out["complete"] and not m["reasons"]
@@ -600,8 +808,12 @@ def format_report(c: dict, p: dict, *, verbose: bool = True) -> str:
            f"{c['client_warn']}){warn}")
   L.append(f"rules: not the newest healthy member | manifest >= "
            f"{c['min_manifest']} | last stage > {c['idle_days']:g}d ago | no "
-           f"stagedir referenced by a queue entry, an active-registry entry, or "
-           f"a record younger than {c['record_days']:g}d")
+           f"stagedir referenced by a queue / active-registry entry that is "
+           f"live, of unknown status, without an end timestamp or ended <= "
+           f"{c['ended_days']:g}d ago (terminal = queue "
+           f"{'/'.join(sorted(QUEUE_TERMINAL))}, registry "
+           f"{'/'.join(sorted(REGISTRY_TERMINAL))}), nor by another record "
+           f"younger than {c['record_days']:g}d")
   L.append(f"archive root (used only by --execute): "
            f"{c['archive_root'] or 'UNRESOLVED (execute would refuse)'}")
   rec = p.get("records")

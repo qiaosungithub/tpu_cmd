@@ -694,10 +694,343 @@ def test_default_archive_root():
       "an unknown metro resolves to '' (execute would refuse)")
 
 
+# --------------------------------------------------------------------------
+# rule 4, relaxed (operator 2026-11-09): a queue / active-registry entry stops
+# blocking only when it is terminal AND ended more than 30 days ago.
+# --------------------------------------------------------------------------
+def ago(days):
+  return time.time() - days * DAY
+
+
+def reg_ts(days):
+  """registry_store.cancel's format: local time, naive (the host is UTC)."""
+  return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ago(days)))
+
+
+def qrow(job_id, state, xid=None, prior=(), ended_d=None, start_d=None,
+         stagedir=None, sub_state=None, prior_d=None):
+  """A queue row shaped like route_lib's (schema v2): prior attempts are
+  SUPERSEDED with their own ended_at; the final attempt has ended_at only when
+  ended_d is given."""
+  start = start_d if start_d is not None else (ended_d or 0) + 1
+  pd = prior_d if prior_d is not None else start + 1  # prior attempts ended
+  subs = []
+  for i, x in enumerate(prior):
+    subs.append({"seq": i + 1, "xid": x, "state": "SUPERSEDED",
+                 "created_at": ago(pd + 1), "confirmed_at": ago(pd + 1),
+                 "ended_reason": "rerouted", "ended_at": ago(pd)})
+  if xid:
+    s = {"seq": len(subs) + 1, "xid": xid, "state": sub_state or state,
+         "created_at": ago(start), "confirmed_at": ago(start)}
+    if ended_d is not None:
+      s["ended_at"] = ago(ended_d)
+    subs.append(s)
+  row = {"job_id": job_id, "name": job_id, "state": state, "xid": xid,
+         "prior_xids": list(prior), "submissions": subs,
+         "submitted_at": ago(start), "build_started_at": None,
+         "last_known_checkpoint_checked_at": None,
+         "cooldown_pairs": {"gl|h100": {"until": time.time() + 9 * DAY}},
+         "launch_kwargs": {"exp_name": job_id}}
+  if stagedir:
+    row["launch_kwargs"]["stagedir"] = stagedir
+  return row
+
+
+def write_journal(e, lines):
+  """<registry>.journal lines shaped like registry_store._journal's."""
+  with open(e.jobs + ".journal", "w") as f:
+    for days, who, added, changed in lines:
+      f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
+                                              time.gmtime(ago(days))),
+                          "who": who, "pid": 1, "argv0": "-", "added": added,
+                          "removed": [], "changed": changed},
+                         sort_keys=True) + "\n")
+
+
+U1 = "eqr_run_ca_unref1"
+XQ = "399000001"   # a queue XID no registry knows (the queue names the path)
+X1 = "300000101"   # an old terminal XID (the start of a resume chain)
+X2 = "300000102"   # the live resume of X1
+
+
+def test_relaxed_rule():
+  print("test_relaxed_rule")
+  cases = [
+      # -- queue entries (the entry names the stagedir directly) --
+      ("queue DONE, final attempt ended 31d ago",
+       dict(queue=[qrow("q1", "DONE", XQ, ended_d=31, stagedir=rel(U1))]), True),
+      ("control: queue DONE, final attempt ended 29d ago",
+       dict(queue=[qrow("q1", "DONE", XQ, ended_d=29, stagedir=rel(U1))]), False),
+      ("queue FAILED (a cancel), ended 31d ago",
+       dict(queue=[qrow("q1", "FAILED", XQ, ended_d=31, stagedir=rel(U1),
+                        sub_state="CANCELLED")]), True),
+      ("queue RUNNING, every timestamp 400d old",
+       dict(queue=[qrow("q1", "RUNNING", XQ, start_d=400, stagedir=rel(U1))]),
+       False),
+      ("control: the same entry DONE, ended 400d ago",
+       dict(queue=[qrow("q1", "DONE", XQ, ended_d=400, stagedir=rel(U1))]), True),
+      ("queue SUBMITTED / QUEUED / BUDGET_DEFERRED / HELD, 400d old",
+       dict(queue=[qrow("q1", "SUBMITTED", XQ, start_d=400, stagedir=rel(U1)),
+                   qrow("q2", "QUEUED", None, start_d=400, stagedir=rel(U1)),
+                   qrow("q3", "BUDGET_DEFERRED", None, start_d=400,
+                        stagedir=rel(U1)),
+                   qrow("q4", "HELD", None, start_d=400, stagedir=rel(U1))]),
+       False),
+      ("queue entry of an UNKNOWN state ('FINISHED'), ended 400d ago",
+       dict(queue=[qrow("q1", "FINISHED", XQ, ended_d=400, stagedir=rel(U1))]),
+       False),
+      ("queue entry with NO state, ended 400d ago",
+       dict(queue=[{k: v for k, v in qrow("q1", "DONE", XQ, ended_d=400,
+                                          stagedir=rel(U1)).items()
+                    if k != "state"}]), False),
+      ("queue DONE whose final attempt has no ended_at (older ones do, 400d)",
+       dict(queue=[qrow("q1", "DONE", XQ, prior=["399000002"], start_d=400,
+                        stagedir=rel(U1))]), False),
+      ("queue FAILED with no attempt at all (no timestamp)",
+       dict(queue=[{"job_id": "q1", "state": "FAILED", "submissions": [],
+                    "launch_kwargs": {"stagedir": rel(U1)}}]), False),
+      # -- active-registry rows --
+      ("registry CANCELLED, cancelled_at 31d ago",
+       dict(jobs={"300000201": {"status": "CANCELLED", "stagedir": rel(U1),
+                                "cancelled_at": reg_ts(31)}}), True),
+      ("control: registry CANCELLED, cancelled_at 29d ago",
+       dict(jobs={"300000201": {"status": "CANCELLED", "stagedir": rel(U1),
+                                "cancelled_at": reg_ts(29)}}), False),
+      ("registry SUBMITTED, 400d-old timestamp",
+       dict(jobs={"300000201": {"status": "SUBMITTED", "stagedir": rel(U1),
+                                "cancelled_at": reg_ts(400)}}), False),
+      ("registry RUNNING, 400d-old timestamp",
+       dict(jobs={"300000201": {"status": "RUNNING", "stagedir": rel(U1),
+                                "cancelled_at": reg_ts(400)}}), False),
+      ("registry row of an UNKNOWN status ('STOPPED'), 400d-old timestamp",
+       dict(jobs={"300000201": {"status": "STOPPED", "stagedir": rel(U1),
+                                "cancelled_at": reg_ts(400)}}), False),
+      ("registry COMPLETED with no timestamp anywhere",
+       dict(jobs={"300000201": {"status": "COMPLETED", "stagedir": rel(U1)}}),
+       False),
+      ("registry COMPLETED; the queue recorded its end 31d ago",
+       dict(jobs={"300000201": {"status": "COMPLETED", "stagedir": rel(U1)}},
+            queue=[qrow("q1", "DONE", "300000201", ended_d=31)]), True),
+      ("control: registry COMPLETED; the queue recorded its end 29d ago",
+       dict(jobs={"300000201": {"status": "COMPLETED", "stagedir": rel(U1)}},
+            queue=[qrow("q1", "DONE", "300000201", ended_d=29)]), False),
+      ("registry TERMINAL_RECONCILED / TERMINAL_NOT_RUNNING; queue end 31d",
+       dict(jobs={"300000201": {"status": "TERMINAL_RECONCILED",
+                                "stagedir": rel(U1)},
+                  "300000202": {"status": "TERMINAL_NOT_RUNNING",
+                                "stagedir": rel(U1)}},
+            queue=[qrow("q1", "DONE", "300000201", ended_d=31),
+                   qrow("q2", "DONE", "300000202", ended_d=40)]), True),
+  ]
+  journal_cases = [
+      ("registry COMPLETED; journal saw SUBMITTED->COMPLETED 31d ago",
+       [(35, "xm_launcher", ["300000201"], {}),
+        (35, "tpu queue (register)", [], {"300000201": {"status": [None, "SUBMITTED"]}}),
+        (31, "tpu_check_daemon (status pass)", [],
+         {"300000201": {"status": ["SUBMITTED", "COMPLETED"]}})], True),
+      ("control: ... journal saw it 29d ago",
+       [(35, "xm_launcher", ["300000201"], {}),
+        (29, "tpu_check_daemon (status pass)", [],
+         {"300000201": {"status": ["SUBMITTED", "COMPLETED"]}})], False),
+      ("registry COMPLETED; journal's newest status change is ->SUBMITTED "
+       "(40d): the move to COMPLETED was unjournaled, time unknown",
+       [(40, "xm_launcher", ["300000201"], {}),
+        (40, "tpu queue (register)", [], {"300000201": {"status": [None, "SUBMITTED"]}})],
+       False),
+      ("registry COMPLETED; journal says COMPLETED 40d ago but touched the row "
+       "again 5d ago (newest line counts)",
+       [(40, "tpu_check_daemon (status pass)", [],
+         {"300000201": {"status": ["SUBMITTED", "COMPLETED"]}}),
+        (5, "tpu_check_daemon (status pass)", [],
+         {"300000201": {"error": ["", "x"]}})], False),
+  ]
+  for label, recs, want in cases:
+    with Env() as e:
+      base_family(e)
+      e.write_records(**recs)
+      _, m = verdict(A)
+      _ck(m["retirable"] == want, f"relaxed: {label} -> retirable={want}"
+          + ("" if m["retirable"] == want else f" (reasons {m['reasons']})"))
+  for label, lines, want in journal_cases:
+    with Env() as e:
+      base_family(e)
+      e.write_records(jobs={"300000201": {"status": "COMPLETED",
+                                          "stagedir": rel(U1)}})
+      write_journal(e, lines)
+      _, m = verdict(A)
+      _ck(m["retirable"] == want, f"relaxed: {label} -> retirable={want}"
+          + ("" if m["retirable"] == want else f" (reasons {m['reasons']})"))
+
+  # TPU_STAGE_WS_RETIRE_ENDED_DAYS moves the cut.
+  with Env(TPU_STAGE_WS_RETIRE_ENDED_DAYS="45") as e:
+    base_family(e)
+    e.write_records(queue=[qrow("q1", "DONE", XQ, ended_d=40, stagedir=rel(U1))])
+    _, m = verdict(A)
+    _ck(not m["retirable"], "relaxed: with ENDED_DAYS=45 an entry ended 40d ago blocks")
+
+  # An unreadable journal makes the plan incomplete.
+  with Env() as e:
+    base_family(e)
+    e.write_records(jobs={"300000201": {"status": "CANCELLED", "stagedir": rel(U1),
+                                        "cancelled_at": reg_ts(60)}})
+    p, m = verdict(A)
+    _ck(m["retirable"], "journal control: without a journal the row is old -> retirable")
+    os.makedirs(e.jobs + ".journal")  # exists, cannot be read as a file
+    p, m = verdict(A)
+    _ck(not p["complete"] and not m["retirable"]
+        and any(".journal" in x for x in p["errors"]),
+        "an unreadable registry journal => plan INCOMPLETE, nothing retirable")
+
+
+def test_relaxed_chain():
+  print("test_relaxed_chain")
+  # X1 is old and terminal (its own row does not block); X2 resumes it.
+  old_x1 = {X1: {"status": "CANCELLED", "stagedir": rel("eqr_run_ca_aaa111"),
+                 "cancelled_at": reg_ts(400)}}
+  cases = [
+      ("control: X1 alone (CANCELLED 400d ago) does not block",
+       dict(jobs=old_x1), True),
+      ("a RUNNING queue entry lists X1 in prior_xids",
+       dict(jobs=old_x1, queue=[qrow("r1", "RUNNING", X2, prior=[X1],
+                                     start_d=1, prior_d=400)]), False),
+      ("control: the same entry DONE, ended 400d ago",
+       dict(jobs=old_x1, queue=[qrow("r1", "DONE", X2, prior=[X1],
+                                     ended_d=400, start_d=401,
+                                     prior_d=402)]), True),
+      ("a queue entry DONE only 5d ago lists X1 in prior_xids",
+       dict(jobs=old_x1, queue=[qrow("r1", "DONE", X2, prior=[X1],
+                                     ended_d=5, start_d=6, prior_d=400)]),
+       False),
+      ("a RUNNING entry lists X1 only in submissions[].xid",
+       dict(jobs=old_x1,
+            queue=[{**qrow("r1", "RUNNING", X2, prior=[X1], start_d=1,
+                           prior_d=400),
+                    "prior_xids": []}]), False),
+      ("a RUNNING entry names X1 as its xid (resume re-used the XID's row)",
+       dict(jobs=old_x1, queue=[qrow("r1", "RUNNING", X1, start_d=1)]), False),
+      ("X1 resolved through the LEGACY registry, RUNNING entry lists it",
+       dict(legacy={X1: {"status": "COMPLETED",
+                         "stagedir": rel("eqr_run_ca_aaa111"),
+                         "archived_at": iso_ago(400)}},
+            queue=[qrow("r1", "RUNNING", X2, prior=[X1], start_d=1,
+                        prior_d=400)]), False),
+      ("an active SUBMITTED row lists X1 as resume_xid",
+       dict(jobs={**old_x1, X2: {"status": "SUBMITTED", "resume_xid": X1,
+                                 "stagedir": rel("eqr_run_ca_zzz999")}}), False),
+      ("control: an active CANCELLED-400d row lists X1 as resume_xid",
+       dict(jobs={**old_x1, X2: {"status": "CANCELLED", "resume_xid": X1,
+                                 "cancelled_at": reg_ts(400),
+                                 "stagedir": rel("eqr_run_ca_zzz999")}}), True),
+  ]
+  for label, recs, want in cases:
+    with Env() as e:
+      base_family(e)
+      e.write_records(**recs)
+      _, m = verdict(A)
+      _ck(m["retirable"] == want, f"chain: {label} -> retirable={want}"
+          + ("" if m["retirable"] == want else f" (reasons {m['reasons']})"))
+      if not want:
+        blk = m["blocking"].get("eqr_run_ca_aaa111", [])
+        _ck(any(x.xid == X1 for x in blk),
+            f"chain: ... the blocking reference is X1's ({[x.describe() for x in blk]})")
+
+
+def test_relaxed_counts_and_report():
+  print("test_relaxed_counts_and_report")
+  with Env() as e:
+    base_family(e)
+    e.write_records(
+        queue=[qrow("a", "DONE", "399000011", ended_d=40),
+               qrow("b", "FAILED", "399000012", ended_d=35),
+               qrow("c", "DONE", "399000013", ended_d=3),
+               qrow("d", "RUNNING", "399000014", start_d=50),
+               qrow("e", "DONE", "399000015", start_d=50),   # no ended_at
+               qrow("f", "WEIRD", "399000016", ended_d=50)],
+        jobs={"300000301": {"status": "COMPLETED", "stagedir": rel(U1)},
+              "300000302": {"status": "CANCELLED", "stagedir": rel(U1),
+                            "cancelled_at": reg_ts(60)},
+              "300000303": {"status": "SUBMITTED", "stagedir": rel(U1)}})
+    c = ret.cfg()
+    p = ret.plan(c)
+    rc = p["records"].entry_counts
+    _ck(rc.get(e.queue) == {"ended-old": 2, "recent": 1, "live": 2, "no-end-ts": 1},
+        f"per-file entry counts, queue: {rc.get(e.queue)}")
+    _ck(rc.get(e.jobs) == {"no-end-ts": 1, "ended-old": 1, "live": 1},
+        f"per-file entry counts, registry: {rc.get(e.jobs)}")
+    rep = ret.format_report(c, p)
+    _ck("terminal & ended >30d: 2 (no block); blocking: 4 = 2 live/unknown "
+        "status + 1 terminal without end timestamp + 1 terminal ended <=30d" in rep,
+        "the report prints the per-file terminal-old vs blocking counts")
+    _ck("ended <= 30d ago (terminal = queue DONE/FAILED, registry CANCELLED/"
+        "COMPLETED/FAILED/TERMINAL_NOT_RUNNING/TERMINAL_RECONCILED)" in rep,
+        "the report's rules line states the relaxed rule and the terminal sets")
+    m = next(x for x in p["members"] if x["name"] == A)
+    _ck(any("COMPLETED, no end timestamp" in x.describe()
+            for x in m["blocking"].get(U1, [])),
+        "a blocking reference says why it still blocks")
+  here = os.path.dirname(os.path.abspath(ret.__file__))
+  try:
+    sys.path.insert(0, os.path.join(here, "google3_tpu_utils"))
+    import route_lib  # pylint: disable=import-outside-toplevel
+  except Exception as ex:  # pylint: disable=broad-except
+    print(f"  skip route_lib drift check ({ex!r})")
+  else:
+    _ck({s.value for s in route_lib.FINISHED_STATES} == set(ret.QUEUE_TERMINAL),
+        f"QUEUE_TERMINAL == route_lib.FINISHED_STATES "
+        f"({sorted(s.value for s in route_lib.FINISHED_STATES)})")
+  finally:
+    sys.path.pop(0)
+
+
+def test_relaxed_archive_restore():
+  print("test_relaxed_archive_restore")
+  X3 = "300000401"
+  with Env() as e:
+    base_family(e)
+    e.write_records(
+        jobs={X3: {"status": "CANCELLED", "stagedir": rel("eqr_run_ca_aaa111"),
+                   "cancelled_at": reg_ts(45)}},
+        queue=[qrow("old1", "FAILED", X3, ended_d=45, start_d=46,
+                    sub_state="CANCELLED")])
+    orig = os.path.join(e.root, A, "google3", rel("eqr_run_ca_aaa111"),
+                        "pkg", "main.py")
+    orig_text = open(orig).read()
+    c = ret.cfg()
+    p = ret.plan(c)
+    m = next(x for x in p["members"] if x["name"] == A)
+    _ck(m["retirable"] and sorted(m["archive"]) == ["eqr_run_ca_aaa111"]
+        and {x.xid for x in m["archive"]["eqr_run_ca_aaa111"]} == {X3},
+        "an old terminal stagedir (registry + queue, 45d) is retirable and in "
+        "the archive set under its XID")
+    buf = io.StringIO()
+    rc = ret.execute(c, p, out=lambda s: buf.write(s + "\n"))
+    ev = e.events_list()
+    fu = [i for i, x in enumerate(ev) if x.startswith("fileutil ")]
+    dl = [i for i, x in enumerate(ev) if x.startswith("g4 citc -d")]
+    _ck(rc == 0 and len(dl) == 1 and fu and max(fu) < dl[0],
+        f"execute archives (every fileutil call) before `g4 citc -d` ({buf.getvalue().strip()})")
+    tb = os.path.join(e.cns, "zz-d/home/qiaos/eqr_data/stage_ws_retired", A,
+                      "eqr_run_ca_aaa111.tar.gz")
+    idx = os.path.join(os.path.dirname(tb), "INDEX.jsonl")
+    rows = [json.loads(x) for x in open(idx)] if os.path.isfile(idx) else []
+    sha = hashlib.sha256(open(tb, "rb").read()).hexdigest() if os.path.isfile(tb) else ""
+    _ck([r["xid"] for r in rows] == [X3] and rows[0]["sha256"] == sha
+        and rows[0]["stagedir_rel"] == rel("eqr_run_ca_aaa111"),
+        "CNS INDEX.jsonl maps the old terminal XID -> tarball, sha256 verified")
+    _ck(not os.path.exists(os.path.join(e.root, A)), f"{A} was deleted after archiving")
+    rc = ret.restore(c, xid=X3, out=lambda s: None)
+    got = open(orig).read() if os.path.isfile(orig) else None
+    _ck(rc == 0 and got == orig_text,
+        "restore --xid <old terminal XID> recreates the client and the stagedir "
+        "byte-identically")
+
+
 if __name__ == "__main__":
   for t in (test_rules, test_manual_excluded, test_archive_then_delete_and_restore,
             test_execute_refuses_on_archive_failure, test_fileutil_gate,
-            test_daily_check, test_cli, test_default_archive_root):
+            test_daily_check, test_cli, test_default_archive_root,
+            test_relaxed_rule, test_relaxed_chain, test_relaxed_counts_and_report,
+            test_relaxed_archive_restore):
     t()
   print()
   if _fail:
