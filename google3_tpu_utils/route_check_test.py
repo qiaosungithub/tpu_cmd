@@ -3218,6 +3218,240 @@ class CnsRestartProbeTest(unittest.TestCase):
       self.assertEqual(probe.restarts_since_progress(e, now=latest_mt + 60.0), 3)
 
 
+def _ls_row(size: int, t: float, name: str, xid: str = '111') -> list[str]:
+  """One `fileutil ls -l` row (split) for a file last written at epoch `t`."""
+  lt = time.localtime(t)
+  return ['-rw-rw----', '1', 'qiaos', 'empty', str(size),
+          time.strftime('%Y/%m/%d', lt), time.strftime('%H:%M:%S', lt),
+          f'/cns/si-d/home/qiaos/eqr_data/logs/rr/xid_{xid}_x/logs/{name}']
+
+
+class ThrashGuardLivenessTest(unittest.TestCase):
+  """2026-11-10 thrash-guard fix: the in-place thrash count is zeroed when the
+  CURRENT attempt is visibly alive by ANY of three writers -- the newest rank-0
+  log, the current attempt's launcher heartbeat, or a fresh checkpoint -- not by
+  the rank-0 log alone. Slow step cadences (one line per ~14.6 min) and hour-long
+  silent restores got TRAINING jobs cancelled (310712265 at step 1150). Real
+  thrash -- restarts with short-lived or stale launchers -- must still count."""
+
+  NOW = 1_800_000_000.0   # a whole-second epoch, so ls rows round-trip exactly
+
+  def _count(self, rows, ckpt_rows=None, now=None):
+    """Run CnsRestartProbe over scripted listings: the attempt-log listing,
+    then `checkpoints/`, then `steps/` (the probe's call order)."""
+    probe = RC.CnsRestartProbe()
+    with mock.patch.object(probe, '_ls_l',
+                           side_effect=[rows, None, ckpt_rows]), \
+         mock.patch.object(RC, '_bucket_for_entry',
+                           return_value='/cns/si-d/home/qiaos/eqr_data'):
+      e = _running('j1', '111', 'sm', submitted_at=0.0)
+      n = probe.restarts_since_progress(e, now=self.NOW if now is None else now)
+    return n, probe.alive_note('111')
+
+  def _hbg_like(self, *, launchers=True, cur_launcher_age=20.0,
+                rank0_age=870.0):
+    """310712265's shape: 10 attempts on one cell, no checkpoint; attempts 0-8
+    died within 3-34 min; attempt 9 has trained for ~58 min and its last step
+    line is `rank0_age` s old (14.5 min: inside one 50-update gap)."""
+    n = self.NOW
+    ends = [n - 3500 - 1200 * (8 - k) for k in range(9)]   # attempts 0..8 died
+    rows = []
+    for k, t in enumerate(ends):
+      rows.append(_ls_row(11019, t - 60, f'rank_0_attempt{k}.log'))
+      rows.append(_ls_row(5733, t - 300, f'rank_1_attempt{k}.log'))
+      if launchers:
+        rows.append(_ls_row(12000, t, f'launcher_attempt{k}.log'))
+    rows.append(_ls_row(14355920, n - rank0_age, 'rank_0_attempt9.log'))
+    rows.append(_ls_row(5733, n - 3400, 'rank_1_attempt9.log'))
+    if launchers:
+      rows.append(_ls_row(21910, n - cur_launcher_age, 'launcher_attempt9.log'))
+    return rows
+
+  def test_slow_logger_with_fresh_launcher_is_not_thrash(self):
+    n, note = self._count(self._hbg_like())
+    self.assertEqual(n, 0)
+    self.assertIsNotNone(note)
+    self.assertEqual(note[0], 9)                 # the old rule's count
+    self.assertIn('launcher_attempt9.log written 20s ago', note[1])
+
+  def test_restoring_job_silent_rank0_fresh_launcher_is_not_thrash(self):
+    # 5 attempts since the step_500 checkpoint; the current one has been
+    # restoring for 40 min: rank 0 printed its 'restoring from' line and has
+    # been silent since (10 KB, 39 min old). Its launcher wrote 25 s ago.
+    n0 = self.NOW
+    rows = [
+        _ls_row(10260, n0 - 9000, 'rank_0_attempt0.log'),
+        _ls_row(13195, n0 - 8400, 'launcher_attempt0.log'),
+        _ls_row(10268, n0 - 7600, 'rank_0_attempt1.log'),
+        _ls_row(13322, n0 - 7000, 'launcher_attempt1.log'),
+        _ls_row(10260, n0 - 6000, 'rank_0_attempt2.log'),
+        _ls_row(13300, n0 - 5400, 'launcher_attempt2.log'),
+        _ls_row(10268, n0 - 4400, 'rank_0_attempt3.log'),
+        _ls_row(13400, n0 - 2700, 'launcher_attempt3.log'),
+        _ls_row(10260, n0 - 2340, 'rank_0_attempt4.log'),
+        _ls_row(30000, n0 - 25, 'launcher_attempt4.log'),
+    ]
+    ckpt = [_ls_row(12144252075, n0 - 20000, 'step_500.pt')]
+    n, note = self._count(rows, ckpt_rows=ckpt)
+    self.assertEqual(n, 0)
+    self.assertEqual(note[0], 5)
+    self.assertIn('launcher_attempt4.log', note[1])
+
+  def test_real_thrash_short_lived_launchers_still_thrash(self):
+    # Restarts every ~5 min, never past startup, no checkpoint. The current
+    # launcher is FRESH (written 10 s ago) but its attempt has only been up
+    # ~4 min -- exactly what a fast crash/preemption loop looks like.
+    n0 = self.NOW
+    rows = []
+    for k in range(5):
+      end = n0 - 300 * (5 - k)
+      rows.append(_ls_row(4400, end - 30, f'rank_0_attempt{k}.log'))
+      rows.append(_ls_row(3980, end, f'launcher_attempt{k}.log'))
+    rows.append(_ls_row(4417, n0 - 40, 'rank_0_attempt5.log'))
+    rows.append(_ls_row(3974, n0 - 10, 'launcher_attempt5.log'))
+    n, note = self._count(rows)
+    self.assertEqual(n, 5)
+    self.assertIsNone(note)
+
+  def test_real_thrash_stale_launchers_still_thrash(self):
+    # Same job shape as the slow logger, but every writer has gone quiet:
+    # the newest launcher log is 15 min old (the attempt is dead).
+    n, note = self._count(self._hbg_like(cur_launcher_age=900.0))
+    self.assertEqual(n, 9)
+    self.assertIsNone(note)
+
+  def test_previous_attempts_launcher_does_not_count(self):
+    # Attempt 3 lived 40 min and died 2 min ago (its launcher log is still
+    # 'fresh'); attempt 4 has just booted: a 4 KB rank-0 log, no launcher log of
+    # its own yet. Attempt 3's heartbeat must not vouch for attempt 4.
+    n0 = self.NOW
+    rows = [
+        _ls_row(4400, n0 - 7000, 'rank_0_attempt0.log'),
+        _ls_row(3980, n0 - 6900, 'launcher_attempt0.log'),
+        _ls_row(4400, n0 - 6000, 'rank_0_attempt1.log'),
+        _ls_row(3980, n0 - 5900, 'launcher_attempt1.log'),
+        _ls_row(4400, n0 - 5000, 'rank_0_attempt2.log'),
+        _ls_row(3980, n0 - 4600, 'launcher_attempt2.log'),
+        _ls_row(10268, n0 - 2500, 'rank_0_attempt3.log'),
+        _ls_row(20000, n0 - 120, 'launcher_attempt3.log'),
+        _ls_row(4100, n0 - 30, 'rank_0_attempt4.log'),
+    ]
+    n, note = self._count(rows)
+    self.assertEqual(n, 4)
+    self.assertIsNone(note)
+
+  def test_missing_launcher_logs_fall_back_to_rank0_rule(self):
+    # No launcher mirror at all (TPU/JAX families): exactly the old verdicts.
+    stale, note = self._count(self._hbg_like(launchers=False))
+    self.assertEqual(stale, 9)                     # rank 0 quiet -> counted
+    self.assertIsNone(note)
+    fresh, _ = self._count(self._hbg_like(launchers=False, rank0_age=100.0))
+    self.assertEqual(fresh, 0)                     # rank 0 fresh -> alive
+
+  def test_fresh_checkpoint_is_alive(self):
+    why = RC.inplace_alive_evidence(
+        [(3, 4000, self.NOW - 3000.0)], [], self.NOW - 120.0, self.NOW)
+    self.assertIn('checkpoint written 120s ago', why)
+    self.assertEqual(RC.inplace_alive_evidence(
+        [(3, 4000, self.NOW - 3000.0)], [], self.NOW - 4000.0, self.NOW), '')
+
+  def test_evidence_window_boundaries(self):
+    rank0 = [(2, 10260, self.NOW - 3000.0)]
+    up = [(1, self.NOW - 4000.0), (2, self.NOW - 600.0)]   # up 3400 s
+    self.assertTrue(RC.inplace_alive_evidence(rank0, up, None, self.NOW))
+    stale = [(1, self.NOW - 4000.0), (2, self.NOW - 600.1)]
+    self.assertEqual(RC.inplace_alive_evidence(rank0, stale, None, self.NOW),
+                     '')
+    # rank 0 quiet 479 s before its launcher's newest write: one second too
+    # young for the 480 s gate; 481 s qualifies.
+    r_young = [(2, 4000, self.NOW - 489.0)]
+    young = [(1, self.NOW - 4000.0), (2, self.NOW - 10.0)]
+    self.assertEqual(RC.inplace_alive_evidence(r_young, young, None, self.NOW),
+                     '')
+    self.assertTrue(RC.inplace_alive_evidence(
+        [(2, 4000, self.NOW - 491.0)], young, None, self.NOW))
+    alone = [(2, self.NOW - 10.0)]               # no earlier attempt to compare
+    self.assertEqual(RC.inplace_alive_evidence(rank0, alone, None, self.NOW),
+                     '')
+
+  def test_no_gap_where_the_rank0_guard_hands_over(self):
+    # The handover: rank 0 (10 KB) quiet 601..900 s, launcher written 25 s ago
+    # (one heartbeat). The rank-0 guard has expired; the launcher rule must
+    # already hold at every second of it (310216628 died in a 600 s gap).
+    for quiet in range(601, 901, 7):
+      r0 = [(5, 10260, self.NOW - quiet)]
+      ls = [(4, self.NOW - quiet - 400.0), (5, self.NOW - 25.0)]
+      self.assertTrue(RC.inplace_alive_evidence(r0, ls, None, self.NOW),
+                      quiet)
+
+  def test_booting_attempt_cannot_borrow_previous_attempts_rank0(self):
+    # Attempt 3 restored silently for 25 min and died 3 min ago; attempt 4's
+    # launcher started 1 min ago and its rank 0 has not written yet. The newest
+    # rank-0 log (attempt 3's, quiet 1500 s) must not make attempt 4 look old.
+    n0 = self.NOW
+    rows = [
+        _ls_row(10260, n0 - 6000, 'rank_0_attempt0.log'),
+        _ls_row(13000, n0 - 5800, 'launcher_attempt0.log'),
+        _ls_row(10260, n0 - 5000, 'rank_0_attempt1.log'),
+        _ls_row(13000, n0 - 4800, 'launcher_attempt1.log'),
+        _ls_row(10260, n0 - 4000, 'rank_0_attempt2.log'),
+        _ls_row(13000, n0 - 3600, 'launcher_attempt2.log'),
+        _ls_row(10260, n0 - 1500, 'rank_0_attempt3.log'),
+        _ls_row(16000, n0 - 180, 'launcher_attempt3.log'),
+        _ls_row(2100, n0 - 5, 'launcher_attempt4.log'),
+    ]
+    n, note = self._count(rows)
+    self.assertEqual(n, 3)
+    self.assertIsNone(note)
+
+  def test_long_restart_delay_does_not_age_a_booting_attempt(self):
+    # 309556219 (replay, 2026-11-07 16:34Z): Borg had run the attempt for 75 s,
+    # but the previous launcher died ~632 s earlier (a slow reschedule). The
+    # attempt's own rank-0 log was just written, so it has proven nothing yet.
+    n0 = self.NOW
+    rows = [
+        _ls_row(4400, n0 - 3000, 'rank_0_attempt0.log'),
+        _ls_row(3980, n0 - 2900, 'launcher_attempt0.log'),
+        _ls_row(4400, n0 - 2000, 'rank_0_attempt1.log'),
+        _ls_row(3980, n0 - 1900, 'launcher_attempt1.log'),
+        _ls_row(4400, n0 - 1000, 'rank_0_attempt2.log'),
+        _ls_row(3980, n0 - 641, 'launcher_attempt2.log'),
+        _ls_row(2281, n0 - 5, 'rank_0_attempt3.log'),
+        _ls_row(3500, n0 - 9, 'launcher_attempt3.log'),
+    ]
+    n, note = self._count(rows)
+    self.assertEqual(n, 3)
+    self.assertIsNone(note)
+
+  def test_run_reroute_keeps_alive_slow_job_and_logs_the_trace(self):
+    # End to end through run_reroute with the REAL probe (listings scripted):
+    # the 310712265 shape is promoted, not cancelled, and the log says why.
+    real_now = float(int(time.time()))
+    self.NOW = real_now
+    rows = self._hbg_like()
+    probe = RC.CnsRestartProbe()
+    e = _running('j1', '111', 'sm', submitted_at=0.0)
+    sub = _FakeSubmitter()
+    fh = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
+    fh.write(b'[]')
+    fh.close()
+    self.addCleanup(os.unlink, fh.name)
+    with mock.patch.object(probe, '_ls_l', side_effect=[rows, None, None]), \
+         mock.patch.object(RC, '_bucket_for_entry',
+                           return_value='/cns/si-d/home/qiaos/eqr_data'):
+      _, log = RC.run_reroute(
+          [e], now=real_now, probe=_FakeProbe({'111': RC.STATUS_RUNNING}),
+          submitter=sub, dry_run=False, restart_probe=probe,
+          inplace_reroute=True, inplace_restart_threshold=3,
+          nominal_running_grace_s=3600.0, history_file=fh.name,
+          sleep_fn=lambda _: None)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.RUNNING)
+    self.assertFalse(any('in-place preemption thrash' in l for l in log), log)
+    self.assertTrue(any('thrash guard: 9 restart(s)' in l and 'not thrash' in l
+                        for l in log), log)
+
+
 class RequeueReasonTest(unittest.TestCase):
   """When the worker cannot place a claimed job it must record WHY. It used to
   copy claim_for_build's 'building (worker ...)' into every requeue, so

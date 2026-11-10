@@ -1463,6 +1463,15 @@ def _read_restarts(probe, entry) -> tuple[Optional[int], str]:
   return probe.restarts_since_progress(entry), ''
 
 
+def _restart_alive_note(probe, xid) -> Optional[tuple[int, str]]:
+  """The restart probe's liveness note for `xid` (CnsRestartProbe.alive_note),
+  or None -- also for probes without one (test fakes, older probes)."""
+  reader = getattr(probe, 'alive_note', None)
+  if reader is None or not xid:
+    return None
+  return reader(str(xid))
+
+
 def _read_output_mtime(probe, entry) -> tuple[Optional[float], str]:
   """(newest output mtime or None, read error). Uses the probe's tri-state
   `read_latest_mtime` when it has one; a probe with only `latest_mtime` (the
@@ -1654,6 +1663,108 @@ class CnsOutputProbe:
     return newest, ''
 
 
+# ★THE THRASH GUARD'S "IS IT ALIVE?" READS THREE WRITERS, NOT ONE (2026-11-10,
+# operator-authorised fix). It used to read ONLY the newest rank-0 log (>= 8 KB
+# and written in the last 600 s). Slow runs print one step line per 50 updates
+# (~14.6 min on H100 for the two-stream R=8 runs) and rank 0 is silent for up to
+# an hour while it restores a checkpoint, so a pass that landed in a silent
+# stretch read a TRAINING job as thrashing: 310712265 was cancelled at step
+# 1150, 310263310 at step 1450, and 310168388 mid-save of step_1000 (500 updates
+# lost). The multi-GPU launcher's own mirror (`launcher_attempt<N>.log`) writes
+# a host-memory line every ~25 s for as long as the attempt lives, so it is the
+# liveness signal; a checkpoint just written in the job's own bucket is another.
+#
+# What keeps REAL thrash caught: the launcher heartbeat counts only when
+#   (1) the newest rank-0 log belongs to the SAME attempt as the newest launcher
+#       log: it was written after the previous launcher's last heartbeat (+60 s
+#       slack for a dying attempt's final lines). A previous attempt's launcher,
+#       or a launcher whose own rank 0 has not written yet, vouches for nothing;
+#   (2) that attempt has demonstrably lived >= INPLACE_LAUNCHER_MIN_UPTIME_S:
+#       its launcher wrote that long after its rank 0 last wrote. Rank 0 writes
+#       its boot banner at start, so this is a LOWER bound on the attempt's age.
+#       (Not "time since the previous attempt died": that counts the restart
+#       delay too, and the 3-day replay found a 75 s-old attempt reading 632 s.)
+#       An attempt that dies within ~8 min of its rank-0 banner never qualifies,
+#       so a fast crash or preemption loop is judged exactly as before; a long
+#       restore or a slow step cadence qualifies once rank 0 has been quiet for
+#       8 min. The rank-0 guard covers the first 10 min, so the two overlap by
+#       2 min: the launcher's newest write trails "now" by up to a heartbeat
+#       (~25 s), and at 600 s a pass landing in that gap killed a run whose rank
+#       0 had been quiet 595-620 s (310216628 in the replay).
+# No launcher logs at all (TPU/JAX families) -> the old rank-0-only behaviour.
+INPLACE_FRESH_WINDOW_S = 600.0
+INPLACE_RANK0_ACTIVE_BYTES = 8192
+INPLACE_LAUNCHER_MIN_UPTIME_S = 480.0
+INPLACE_SAME_ATTEMPT_SLACK_S = 60.0
+_LAUNCHER_LOG_RE = re.compile(r'(?:^|/)launcher_attempt(\d+)\.log$')
+
+
+def parse_launcher_rows(rows: list[list[str]]) -> list[tuple[int, float]]:
+  """`(attempt_idx, mtime)` of every `launcher_attempt<N>.log` row of a
+  `fileutil ls -l` listing, sorted by attempt index."""
+  out: list[tuple[int, float]] = []
+  for fields in rows:
+    if len(fields) < 8 or fields[0].startswith('total'):
+      continue
+    m = _LAUNCHER_LOG_RE.search(fields[-1])
+    if not m:
+      continue
+    mt = _parse_fileutil_mtime(fields)
+    if mt is not None:
+      out.append((int(m.group(1)), mt))
+  out.sort()
+  return out
+
+
+def inplace_alive_evidence(
+    rank0: Sequence[tuple[int, int, float]],
+    launchers: Sequence[tuple[int, float]],
+    ckpt_mtime: Optional[float],
+    now: float,
+    window_s: float = INPLACE_FRESH_WINDOW_S,
+    rank0_active_bytes: int = INPLACE_RANK0_ACTIVE_BYTES,
+    launcher_min_uptime_s: float = INPLACE_LAUNCHER_MIN_UPTIME_S,
+    same_attempt_slack_s: float = INPLACE_SAME_ATTEMPT_SLACK_S,
+) -> str:
+  """Pure. Why the job's CURRENT attempt is alive right now, or '' when
+  nothing shows it (then the restart count stands).
+
+  `rank0` is CnsRestartProbe._parse_attempt_rows output `(idx, size, mtime)`,
+  `launchers` is parse_launcher_rows output, `ckpt_mtime` the newest complete
+  checkpoint in the job's own bucket (None if none). Any ONE of these is life:
+    * the newest rank-0 log is >= rank0_active_bytes and written within
+      window_s (the original guard, unchanged);
+    * a checkpoint was written within window_s;
+    * the newest launcher log was written within window_s, the newest rank-0
+      log belongs to that same attempt, and the launcher wrote at least
+      launcher_min_uptime_s after rank 0 last did (see the comment above
+      INPLACE_FRESH_WINDOW_S for why both conditions).
+  """
+  if rank0:
+    r_idx, r_sz, r_mt = rank0[-1]
+    if r_sz >= rank0_active_bytes and (now - r_mt) <= window_s:
+      return f'rank_0_attempt{r_idx}.log written {int(now - r_mt)}s ago'
+  if ckpt_mtime is not None and (now - ckpt_mtime) <= window_s:
+    return f'checkpoint written {int(now - ckpt_mtime)}s ago'
+  if not launchers or not rank0:
+    return ''
+  l_idx, l_mt = launchers[-1]
+  if (now - l_mt) > window_s:
+    return ''     # the launcher has stopped too: the attempt is dead
+  earlier = [mt for i, mt in launchers if i < l_idx]
+  if not earlier:
+    return ''     # no previous attempt to tell this one's rank-0 log apart by
+  r_idx, _, r_mt = rank0[-1]
+  if r_mt <= max(earlier) + same_attempt_slack_s:
+    return ''     # newest rank-0 log is a previous attempt's (or none yet)
+  up = l_mt - r_mt
+  if up < launcher_min_uptime_s:
+    return ''     # young attempt: a fast crash/preemption loop looks like this
+  return (f'launcher_attempt{l_idx}.log written {int(now - l_mt)}s ago; '
+          f'its rank_0_attempt{r_idx}.log has been quiet {int(now - r_mt)}s, '
+          f'attempt up >= {int(up)}s')
+
+
 class CnsRestartProbe:
   """How many times Borg has restarted a job IN PLACE since it last made durable
   progress -- the signal `route_lib.decide_inplace_reroute` acts on.
@@ -1682,10 +1793,16 @@ class CnsRestartProbe:
   it wrongly. An incomplete orbax checkpoint (`<N>.orbax-checkpoint-tmp-<uuid>`)
   has a non-bare-int leaf and is skipped, so a half-written save never reads as
   progress.
+
+  A count >= 1 is reported as 0 when the CURRENT attempt is visibly alive
+  (inplace_alive_evidence: fresh rank-0 log, fresh launcher heartbeat of a
+  long-enough-lived current attempt, or a fresh checkpoint).
   """
 
   def __init__(self, timeout_s: float = CNS_READ_TIMEOUT_S):
     self._timeout_s = timeout_s
+    self._notes_lock = threading.Lock()
+    self._alive_notes: dict[str, tuple[int, str]] = {}
 
   def _ls_l(self, pattern: str) -> Optional[list[list[str]]]:
     """`fileutil ls -l <pattern>` -> list of split-field rows, or None when
@@ -1807,8 +1924,10 @@ class CnsRestartProbe:
     bucket = _bucket_for_entry(entry)
     if not xid or not bucket:
       return None
+    # ONE listing serves both the rank-0 attempt logs (the restart count) and
+    # the launcher's heartbeat logs (liveness); other ranks' rows are ignored.
     rows = self._ls_l(
-        f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*/logs/rank_0_attempt*.log')
+        f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*/logs/*_attempt*.log')
     if rows is None:
       return None
     deduped = self._parse_attempt_rows(rows)
@@ -1821,14 +1940,34 @@ class CnsRestartProbe:
     # in a preemption loop.
     now_ts = time.time() if now is None else now
     _, latest_sz, latest_mt = deduped[-1]
-    if latest_sz >= 8192 and (now_ts - latest_mt) <= 600.0:
+    if (latest_sz >= INPLACE_RANK0_ACTIVE_BYTES
+        and (now_ts - latest_mt) <= INPLACE_FRESH_WINDOW_S):
       return 0
     mtimes = [mt for _, _, mt in deduped]
     ckpt = self._newest_checkpoint_mtime(bucket, xid)
     if ckpt is None:
       # Attempt 0 is the initial launch; only subsequent attempts are restarts.
-      return max(0, len(mtimes) - 1)
-    return sum(1 for m in mtimes if m > ckpt)
+      n = max(0, len(mtimes) - 1)
+    else:
+      n = sum(1 for m in mtimes if m > ckpt)
+    if n <= 0:
+      return n
+    # Rank 0 is quiet (slow step cadence, a long restore): ask the other two
+    # writers before calling it a restart loop (see INPLACE_FRESH_WINDOW_S).
+    why = inplace_alive_evidence(deduped, parse_launcher_rows(rows), ckpt,
+                                 now_ts)
+    if why:
+      with self._notes_lock:
+        self._alive_notes[str(xid)] = (n, why)
+      return 0
+    return n
+
+  def alive_note(self, xid: str) -> Optional[tuple[int, str]]:
+    """(restarts it would have counted, why the current attempt is alive) when
+    the last read of `xid` was zeroed by launcher / checkpoint evidence, else
+    None. Feeds run_reroute's decision trace only."""
+    with self._notes_lock:
+      return self._alive_notes.get(str(xid))
 
 
 # --- Attempt-end evidence: the CNS I/O that feeds route_lib.end_attempt ------
@@ -2907,6 +3046,13 @@ def run_reroute(
       act = route_lib.decide_reroute(e, o, now, params, view, view_error)
     for note in act.notes:
       log.append(f'[reroute] {tag}: {note}')
+    alive = _restart_alive_note(restart_probe, xid)
+    if alive is not None and alive[0] >= inplace_restart_threshold:
+      # Decision trace of the 2026-11-10 thrash-guard fix: the old rank-0-only
+      # guard would have cancelled this row here.
+      log.append(f'[reroute] {tag}: thrash guard: {alive[0]} restart(s) since '
+                 f'the last checkpoint, but the current attempt is alive '
+                 f'({alive[1]}) -> not thrash')
     if act.kind == route_lib.ACT_CANCEL and xid:
       if not dry_run and route_lib.global_reroute_brake(hist, time.time()):
         if not braked:
